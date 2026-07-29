@@ -1,5 +1,6 @@
 mod channel_model;
 mod channel_session;
+mod cohort;
 mod scaffold;
 mod xmltv;
 
@@ -173,6 +174,7 @@ async fn run() -> Result<(), LineupError> {
 
 async fn stream(
     Path(filename): Path<String>,
+    axum::extract::Query(query_pairs): axum::extract::Query<Vec<(String, String)>>,
     State(state): State<Arc<LineupState>>,
     request: axum::extract::Request,
 ) -> Result<impl IntoResponse, LineupError> {
@@ -206,7 +208,14 @@ async fn stream(
         Err(_) => return Err(LineupError::ChannelNotReady),     // 30s deadline
     }
 
-    let content = get_multi_variant(channel, request.headers());
+    // only parameters the channel's playout actually references identify a
+    // cohort; the cohort's canonical query string travels on the media
+    // playlist urls so playlist reloads keep their identity
+    let recognized = cohort::read_recognized_params(channel.output_folder()).await;
+    let cohort_parameters = cohort::cohort_parameters(&query_pairs, &recognized);
+    let cohort_query = cohort::to_query_string(&cohort_parameters);
+
+    let content = get_multi_variant(channel, request.headers(), &cohort_query);
 
     Ok((
         [(
@@ -237,23 +246,31 @@ async fn fix_content_types(
     response
 }
 
-fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> String {
+fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap, cohort_query: &str) -> String {
+    let query_suffix = if cohort_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{cohort_query}")
+    };
+
     let mut result = String::new();
     result.push_str("#EXTM3U\n");
     result.push_str("#EXT-X-VERSION:6\n");
     result.push_str(&format!(
-        "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"en\",URI=\"{}/session/{}/live_sub.m3u8\"\n",
+        "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"en\",URI=\"{}/session/{}/live_sub.m3u8{}\"\n",
         get_scheme_host(headers),
-        channel.number()
+        channel.number(),
+        query_suffix
     ));
     result.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={},SUBTITLES=\"subs\"\n",
         channel.bandwidth_bps()
     ));
     result.push_str(&format!(
-        "{}/session/{}/live.m3u8",
+        "{}/session/{}/live.m3u8{}",
         get_scheme_host(headers),
-        channel.number()
+        channel.number(),
+        query_suffix
     ));
 
     result

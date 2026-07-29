@@ -93,6 +93,8 @@ pub struct ChannelSession {
 
     cached_subtitles: Option<(String, Arc<Vec<Cue>>)>,
     dynamic_http_client: reqwest::Client,
+
+    published_recognized_params: Option<Vec<String>>,
 }
 
 impl ChannelSession {
@@ -187,6 +189,7 @@ impl ChannelSession {
             timeout_notify: Arc::new(tokio::sync::Notify::new()),
             cached_subtitles: None,
             dynamic_http_client,
+            published_recognized_params: None,
         })
     }
 
@@ -264,6 +267,40 @@ impl ChannelSession {
         }
     }
 
+    /// Publishes the `{query:}` variable names the current playout references
+    /// (the parameters that identify a viewer cohort) next to the ready file,
+    /// rewriting only when the set changes.
+    async fn publish_recognized_params(&mut self) {
+        let names = match self
+            .playout_loader
+            .query_variable_names(&self.transcoded_until)
+            .await
+        {
+            Ok(names) => names.into_iter().collect::<Vec<_>>(),
+            Err(e) => {
+                log::debug!("failed to collect recognized params: {e}");
+                return;
+            }
+        };
+
+        if self.published_recognized_params.as_ref() == Some(&names) {
+            return;
+        }
+
+        let path = self
+            .channel_config
+            .expanded_output_folder()
+            .join(ersatztv_core::RECOGNIZED_PARAMS_FILE_NAME);
+
+        match serde_json::to_string(&names) {
+            Ok(json) => match tokio::fs::write(&path, json).await {
+                Ok(()) => self.published_recognized_params = Some(names),
+                Err(e) => log::warn!("failed to publish recognized params: {e}"),
+            },
+            Err(e) => log::warn!("failed to serialize recognized params: {e}"),
+        }
+    }
+
     async fn prep_output_folder(&self) -> Result<(), ChannelError> {
         let output_folder = self.channel_config.expanded_output_folder();
 
@@ -330,6 +367,8 @@ impl ChannelSession {
             Ok(scanned_pts_time) => pts_time = Some(scanned_pts_time),
             Err(e) => log::debug!("failed to scan pts time: {e}"),
         }
+
+        self.publish_recognized_params().await;
 
         let mut current_item_result = self
             .playout_loader

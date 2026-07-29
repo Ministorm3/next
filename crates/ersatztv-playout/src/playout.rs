@@ -103,6 +103,25 @@ impl PlayoutItem {
     pub fn finish(&self) -> OffsetDateTime {
         self.finish
     }
+
+    /// The `{query:}` variable names any of this item's sources reference,
+    /// lowercased.
+    pub fn query_variable_names(&self) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+
+        let track_sources = self.tracks.iter().flat_map(|t| {
+            [t.audio.as_ref(), t.video.as_ref(), t.subtitle.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.source.as_ref())
+        });
+
+        for source in self.source.iter().chain(track_sources) {
+            names.append(&mut source.query_variable_names());
+        }
+
+        names
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -280,6 +299,16 @@ pub enum PlayoutItemSource {
 }
 
 impl PlayoutItemSource {
+    /// The `{query:}` variable names this source's URI references, lowercased.
+    pub fn query_variable_names(&self) -> std::collections::BTreeSet<String> {
+        match self {
+            PlayoutItemSource::Http { uri, .. } | PlayoutItemSource::Rtsp { uri, .. } => {
+                crate::stream_variables::query_variable_names(uri)
+            }
+            _ => std::collections::BTreeSet::new(),
+        }
+    }
+
     pub fn probe_hint(&self) -> Option<&ProbeHint> {
         match self {
             PlayoutItemSource::Local { probe_hint, .. }

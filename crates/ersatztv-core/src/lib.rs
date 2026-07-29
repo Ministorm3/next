@@ -14,6 +14,12 @@ pub const READY_FILE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_FILE_NAME: &str = ".heartbeat";
 pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// JSON array of `{query:}` variable names the channel's current playout
+/// references, published by the worker next to its ready file. The server
+/// only treats request parameters with these names as cohort identity;
+/// anything else (player cache busters, proxy additions) is ignored.
+pub const RECOGNIZED_PARAMS_FILE_NAME: &str = ".recognized-params.json";
+
 pub const VERSION: &str = env!("ETV_VERSION_STRING");
 
 pub async fn empty_folder(output_folder: &std::path::Path) -> Result<(), std::io::Error> {
