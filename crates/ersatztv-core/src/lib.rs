@@ -4,6 +4,7 @@ use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
 
 mod merge;
 mod path_resolve;
+pub mod sidecar;
 
 pub use merge::deep_merge;
 pub use path_resolve::resolve_relative_paths;

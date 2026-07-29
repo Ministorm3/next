@@ -68,7 +68,7 @@ impl ChannelSession {
     }
 }
 
-fn channel_binary_path() -> Result<PathBuf, LineupError> {
+pub fn channel_binary_path() -> Result<PathBuf, LineupError> {
     let mut path = std::env::current_exe()?
         .parent()
         .ok_or(LineupError::ChannelBinaryNotFound)?

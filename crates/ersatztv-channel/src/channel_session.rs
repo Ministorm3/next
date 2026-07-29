@@ -625,6 +625,8 @@ impl ChannelSession {
         // live sources can never seek or work ahead
         let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
 
+        let is_templated = source_is_templated(&video_source) || source_is_templated(&audio_source);
+
         // generate pipeline
         let output_settings = OutputSettings {
             audio: AudioOutputSettings {
@@ -659,12 +661,11 @@ impl ChannelSession {
                 segment_template: self.output_segment_template.clone(),
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
-            // a templated item may be transcoded more than once with
-            // different query values; padding every transcode to the -t clamp
-            // keeps the PTS envelopes identical, so one can be substituted
-            // for another at the playlist layer
-            pad_to_duration: source_is_templated(&video_source)
-                || source_is_templated(&audio_source),
+            // a templated item may be transcoded in parallel by variant
+            // sessions with different query values; padding both transcodes to
+            // the -t clamp keeps their PTS envelopes identical, so one can be
+            // substituted for the other at the playlist layer
+            pad_to_duration: is_templated,
             realtime,
             is_live,
             frame_rate: if video_probe_result.is_still_image() {
@@ -811,7 +812,7 @@ impl ChannelSession {
         self.playlist_manager
             .lock()
             .await
-            .before_new_pipeline(pts_offset, subtitle_source, &current_item.id)
+            .before_new_pipeline(pts_offset, subtitle_source, &current_item.id, is_templated)
             .await?;
 
         // stream current item

@@ -1,7 +1,9 @@
 mod channel_model;
 mod channel_session;
 mod cohort;
+mod composer;
 mod scaffold;
+mod variant_manager;
 mod xmltv;
 
 use std::collections::HashMap;
@@ -137,6 +139,7 @@ async fn run() -> Result<(), LineupError> {
                 channels,
                 xmltv_folder: lineup_config.xmltv.map(|c| c.folder),
                 active: Arc::new(Mutex::new(HashMap::new())),
+                variants: variant_manager::VariantManager::new(),
             });
 
             let addr = format!(
@@ -230,6 +233,7 @@ struct LineupState {
     channels: Vec<ChannelModel>,
     xmltv_folder: Option<String>,
     active: Arc<Mutex<HashMap<String, ChannelSession>>>,
+    variants: variant_manager::VariantManager,
 }
 
 async fn fix_content_types(
@@ -397,5 +401,72 @@ async fn session_middleware(
         }
     }
 
+    // a playlist request carrying recognized cohort parameters is answered
+    // with a composed playlist; everything else falls through to the shared
+    // static files
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or_default().to_owned();
+    if let Some(response) = maybe_composed_playlist(&state, &path, &query).await {
+        return response;
+    }
+
     next.run(request).await
+}
+
+/// Serves a composed per-cohort playlist for `/{channel}/live.m3u8` and
+/// `/{channel}/live_sub.m3u8` requests whose query contains recognized cohort
+/// parameters. Returns None to fall through to the shared playlist.
+async fn maybe_composed_playlist(
+    state: &Arc<LineupState>,
+    path: &str,
+    query: &str,
+) -> Option<axum::response::Response> {
+    let split: Vec<&str> = path.split('/').collect();
+    let (channel_number, file) = match split.as_slice() {
+        ["", channel, file] => (*channel, *file),
+        _ => return None,
+    };
+
+    let subtitles = match file {
+        "live.m3u8" => false,
+        "live_sub.m3u8" => true,
+        _ => return None,
+    };
+
+    if query.is_empty() {
+        return None;
+    }
+
+    let channel = state
+        .channels
+        .iter()
+        .find(|c| c.number() == channel_number)?;
+
+    let query_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect();
+
+    let recognized = cohort::read_recognized_params(channel.output_folder()).await;
+    let cohort_parameters = cohort::cohort_parameters(&query_pairs, &recognized);
+    if cohort_parameters.is_empty() {
+        return None;
+    }
+
+    let cohort_query = cohort::to_query_string(&cohort_parameters);
+
+    let playlist = state
+        .variants
+        .handle_playlist_request(channel, &cohort_query, subtitles)
+        .await?;
+
+    Some(
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.apple.mpegurl",
+            )],
+            playlist,
+        )
+            .into_response(),
+    )
 }

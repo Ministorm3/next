@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_channel::error::ChannelError;
+use ersatztv_core::sidecar::{PlaylistSidecar, SidecarPipeline, SidecarSegment};
 use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT};
 use ffpipeline::pipeline::PtsOffset;
 use ffpipeline::web_vtt::{Cue, format_vtt_ts};
@@ -55,31 +56,6 @@ struct Segment {
     duration: f64,
     program_date_time: OffsetDateTime,
     item_id: String,
-}
-
-/// Machine-readable description of the generated playlist, published next to
-/// it. This is how other processes learn which playout item produced each
-/// segment and which PTS offset each pipeline was started with, without
-/// inferring either from timestamps.
-#[derive(serde::Serialize)]
-struct PlaylistSidecar<'a> {
-    segments: Vec<SidecarSegment<'a>>,
-    pipelines: &'a [SidecarPipeline],
-}
-
-#[derive(serde::Serialize)]
-struct SidecarSegment<'a> {
-    path: &'a str,
-    duration: f64,
-    program_date_time: String,
-    item_id: &'a str,
-    discontinuity: bool,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct SidecarPipeline {
-    pub item_id: String,
-    pub pts_offset_ms: u64,
 }
 
 pub struct PlaylistManagerOutputFiles {
@@ -137,6 +113,7 @@ impl PlaylistManager {
         new_pts_offset: Option<PtsOffset>,
         new_subtitle_source: Option<SubtitleSource>,
         item_id: &str,
+        templated: bool,
     ) -> Result<(), ChannelError> {
         self.update().await?;
         self.pts_offset = new_pts_offset;
@@ -147,6 +124,7 @@ impl PlaylistManager {
         self.pipelines.push(SidecarPipeline {
             item_id: item_id.to_owned(),
             pts_offset_ms: new_pts_offset.unwrap_or_default().duration.as_millis() as u64,
+            templated,
         });
 
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
@@ -283,7 +261,11 @@ impl PlaylistManager {
         tokio::fs::write(temp.path(), sidecar).await?;
         tokio::fs::rename(
             temp.path(),
-            format!("{}.meta.json", self.generated_playlist_file),
+            format!(
+                "{}{}",
+                self.generated_playlist_file,
+                ersatztv_core::sidecar::SIDECAR_SUFFIX
+            ),
         )
         .await?;
 
@@ -320,10 +302,10 @@ impl PlaylistManager {
             .iter()
             .map(|s| {
                 Ok(SidecarSegment {
-                    path: &s.path,
+                    path: s.path.clone(),
                     duration: s.duration,
                     program_date_time: s.program_date_time.format(format)?,
-                    item_id: &s.item_id,
+                    item_id: s.item_id.clone(),
                     discontinuity: self.discontinuity_before.contains(&s.path),
                 })
             })
@@ -331,7 +313,7 @@ impl PlaylistManager {
 
         let sidecar = PlaylistSidecar {
             segments,
-            pipelines: &self.pipelines,
+            pipelines: self.pipelines.clone(),
         };
 
         Ok(serde_json::to_string(&sidecar)?)
@@ -518,10 +500,12 @@ mod tests {
             SidecarPipeline {
                 item_id: String::from("item-a"),
                 pts_offset_ms: 0,
+                templated: false,
             },
             SidecarPipeline {
                 item_id: String::from("item-b"),
                 pts_offset_ms: 8000,
+                templated: true,
             },
         ];
         m.segments.push_back(segment("seg0.ts", "item-a", 0));
@@ -560,10 +544,12 @@ mod tests {
             SidecarPipeline {
                 item_id: String::from("item-a"),
                 pts_offset_ms: 0,
+                templated: false,
             },
             SidecarPipeline {
                 item_id: String::from("item-b"),
                 pts_offset_ms: 8000,
+                templated: true,
             },
         ];
         // item-a segments have been trimmed from the window already
