@@ -211,7 +211,10 @@ pub enum PlayoutItemSource {
         probe_hint: Option<ProbeHint>,
     },
     Http {
-        /// URI template, e.g. "https://example.com/file.mkv?token={{MY_SECRET}}"
+        /// URI template, e.g. "https://example.com/file.mkv?token={{MY_SECRET}}".
+        /// Also supports single-brace stream variables resolved at playback
+        /// time: {channel_number} and {query:name}, each with an optional
+        /// |default (see [`crate::stream_variables`]).
         uri: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         in_point_ms: Option<u64>,
@@ -240,6 +243,9 @@ pub enum PlayoutItemSource {
         probe_hint: Option<ProbeHint>,
     },
     Rtsp {
+        /// RTSP URI template; supports the same single-brace stream variables
+        /// as Http uri: {channel_number} and {query:name}, each with an
+        /// optional |default.
         uri: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timeout_us: Option<u64>,
