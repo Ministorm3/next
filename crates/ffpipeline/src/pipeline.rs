@@ -27,7 +27,7 @@ use crate::video_decoder::VideoDecoder;
 use crate::video_filter::{
     ColorChannelMixerFilter, CropFilter, DeinterlaceFilter, FadeFilter, FormatFilter, LoopFilter,
     PadFilter, ScaleFilter, SoftwareDeinterlaceFilter, SoftwareDeinterlaceOptions,
-    SubtitleImageScaleFilter, SubtitlesFilter, ToneMapFilter, VideoFilter,
+    SubtitleImageScaleFilter, SubtitlesFilter, TPadFilter, ToneMapFilter, VideoFilter,
 };
 
 pub const KEYFRAME_INTERVAL_SECONDS: u32 = 2;
@@ -370,6 +370,13 @@ impl Pipeline {
             PipelineFilter::Audio(AudioFilter::Resample),
             PipelineFilter::Audio(AudioFilter::Pad),
         ];
+
+        if final_output_settings.pad_to_duration {
+            // pad an under-running source to the output -t clamp by cloning
+            // its last frame, so the item still fills its scheduled duration
+            // (audio is always padded; see AudioFilter::Pad)
+            filters.push(PipelineFilter::Video(TPadFilter.into()));
+        }
 
         filters.extend([
             PipelineFilter::Video(LoopFilter { is_still_image }.into()),

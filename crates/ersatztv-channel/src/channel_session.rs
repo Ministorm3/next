@@ -521,6 +521,12 @@ impl ChannelSession {
                 segment_template: self.output_segment_template.clone(),
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
+            // a templated item may be transcoded more than once with
+            // different query values; padding every transcode to the -t clamp
+            // keeps the PTS envelopes identical, so one can be substituted
+            // for another at the playlist layer
+            pad_to_duration: source_is_templated(&video_source)
+                || source_is_templated(&audio_source),
             realtime,
             is_live,
             frame_rate: if video_probe_result.is_still_image() {
@@ -1271,6 +1277,18 @@ fn playout_timing_to_pipeline(
 
         ffpipeline::input::WatermarkTiming::Periodic(periodic_timing)
     })
+}
+
+/// Whether a source's URI references `{query:}` variables, meaning the item
+/// may be transcoded more than once with different values and its PTS
+/// envelope must be exact.
+fn source_is_templated(source: &PlayoutItemSource) -> bool {
+    match source {
+        PlayoutItemSource::Http { uri, .. } | PlayoutItemSource::Rtsp { uri, .. } => {
+            ersatztv_playout::stream_variables::has_query_variables(uri)
+        }
+        _ => false,
+    }
 }
 
 fn source_is_live(source: &PlayoutItemSource) -> bool {

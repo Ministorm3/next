@@ -283,6 +283,7 @@ pub fn build_output(dir: &Path, params: TestOutputParams) -> OutputSettings {
             segment_template: dir.join("segment_%03d.ts").to_string_lossy().into_owned(),
         },
         pts_offset: None,
+        pad_to_duration: false,
         realtime: false,
         is_live: false,
         frame_rate: params.frame_rate,

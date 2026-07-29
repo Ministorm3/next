@@ -703,7 +703,8 @@ mod tests {
     use crate::output_settings::ScalingMode;
     use crate::pipeline::HwPixelFormat;
     use crate::video_filter::{
-        FormatFilter, HwMapFilter, HwUploadFilter, PadFilter, ScaleFilter, ToneMapFilter,
+        FormatFilter, HwMapFilter, HwUploadFilter, PadFilter, ScaleFilter, TPadFilter,
+        ToneMapFilter,
     };
 
     fn vaapi_accel() -> HardwareAccel {
@@ -1837,6 +1838,47 @@ mod tests {
                 })
             ),
             "encoder format hint (NV12) should win over bit-depth canonical (P010le)",
+        );
+    }
+    #[test]
+    fn tpad_renders_in_software_chain_without_hw_roundtrip() {
+        let initial_state = FrameState {
+            size: FrameSize {
+                width: 1920,
+                height: 1080,
+            },
+            is_anamorphic: false,
+            is_interlaced: false,
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            surface: FrameSurface::System,
+            pixel_format: PixelFormat::Yuv420p,
+            is_hdr: false,
+        };
+        let ffmpeg_info = FfmpegInfo::default();
+        let filter_options = VideoFilterOptions::default();
+
+        let mut chain = FilterChain::new(vec![PipelineFilter::Video(TPadFilter.into())]);
+
+        chain.resolve(
+            &ffmpeg_info,
+            &None,
+            &filter_options,
+            &initial_state,
+            &FrameSurface::System,
+            &Some(PixelFormat::Yuv420p),
+        );
+        chain.build("0:a", "0:v", None, None);
+
+        let args = chain.as_arg();
+        let filter_complex = &args[1];
+        assert!(
+            filter_complex.contains("tpad=stop=-1:stop_mode=clone"),
+            "filter_complex should contain tpad: {filter_complex}"
+        );
+        assert!(
+            !filter_complex.contains("hwupload") && !filter_complex.contains("hwdownload"),
+            "software tpad must not force a hardware roundtrip: {filter_complex}"
         );
     }
 }
