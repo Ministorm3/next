@@ -472,11 +472,13 @@ dependencies = [
 name = "ersatztv-playout"
 version = "0.1.0"
 dependencies = [
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror",
  "time",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -39,6 +39,7 @@ libvpl-sys = { path = "crates/libvpl-sys" }
 libvt-sys = { path = "crates/libvt-sys" }
 libvulkan-sys = { path = "crates/libvulkan-sys" }
 log = "0.4"
+percent-encoding = "2.3"
 quick-xml = "0.40.0"
 rand = { version = "0.10", features = ["thread_rng"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
@@ -55,6 +56,7 @@ tokio = { version = "1.50", features = ["fs", "io-std", "io-util", "macros", "pr
 tokio-util = {  version = "0.7.18", features = ["io-util"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
+url = "2.5"
 uuid = { version = "1.23", features = ["v4"] }
 walkdir = "2.5"
 which = "8.0.2"
