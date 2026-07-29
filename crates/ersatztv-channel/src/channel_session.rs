@@ -95,6 +95,10 @@ pub struct ChannelSession {
     dynamic_http_client: reqwest::Client,
 
     published_recognized_params: Option<Vec<String>>,
+
+    /// Caller-supplied values for `{query:}` variables. Empty for the shared
+    /// channel session; a variant session carries its cohort's values.
+    query_parameters: std::collections::HashMap<String, String>,
 }
 
 impl ChannelSession {
@@ -190,7 +194,17 @@ impl ChannelSession {
             cached_subtitles: None,
             dynamic_http_client,
             published_recognized_params: None,
+            query_parameters: std::collections::HashMap::new(),
         })
+    }
+
+    /// Sets the cohort's `{query:}` values for a variant session.
+    pub fn with_query_parameters(
+        mut self,
+        query_parameters: std::collections::HashMap<String, String>,
+    ) -> ChannelSession {
+        self.query_parameters = query_parameters;
+        self
     }
 
     pub async fn run(&mut self) -> Result<(), ChannelError> {
@@ -265,6 +279,91 @@ impl ChannelSession {
                 }
             }
         }
+    }
+
+    /// Transcodes a single playout item as a stream variant: the cohort's
+    /// `{query:}` values steer the item's templated URL, the PTS envelope is
+    /// anchored to the shared session's offset for the same item, and the
+    /// session exits when the item is fully transcoded (or reaps on heartbeat
+    /// staleness like any session).
+    pub async fn run_variant(
+        &mut self,
+        item_id: &str,
+        pts_offset_ms: u64,
+    ) -> Result<(), ChannelError> {
+        self.prep_output_folder().await?;
+
+        self.ffmpeg_info = FfmpegInfo::load(
+            &self.ffmpeg_path,
+            &self.channel_config.ffmpeg.disabled_filters,
+            &self.channel_config.ffmpeg.preferred_filters,
+        )
+        .await?;
+
+        self.hw_accel = self
+            .channel_config
+            .normalization
+            .video
+            .accel
+            .as_ref()
+            .and_then(|a| a.to_pipeline(&self.channel_config));
+
+        let pm = self.playlist_manager.clone();
+        let tn = self.timeout_notify.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let mut playlist_manager = pm.lock().await;
+                let _ = playlist_manager.update().await;
+                if *playlist_manager.timeout() {
+                    tn.notify_one();
+                    break;
+                }
+                drop(playlist_manager);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        let item = self
+            .playout_loader
+            .get_item_by_id(item_id, &self.transcoded_until)
+            .await?;
+
+        // the variant covers the item from its beginning when spawned with
+        // lead time; a variant spawned mid-item covers the remainder, and its
+        // segments slot into the envelope at the matching offset
+        if self.transcoded_until < item.start {
+            self.transcoded_until = item.start;
+            self.state = ChannelSessionState::ZeroAndRealtime;
+        } else {
+            self.state = ChannelSessionState::SeekAndRealtime;
+        }
+
+        let base_offset = Duration::from_millis(pts_offset_ms);
+
+        while self.transcoded_until < item.finish {
+            let progress = self.transcoded_until - item.start;
+            let pts =
+                base_offset + Duration::from_millis(progress.whole_milliseconds().max(0) as u64);
+
+            // a variant failure is terminal: the consumer falls back to the
+            // shared feed, which is strictly better than substituted filler
+            let (finish, _is_complete) = self.transcode_item(&item, true, Some(pts)).await?;
+
+            if finish <= self.transcoded_until {
+                return Err(ChannelError::StreamFailure(String::from(
+                    "variant transcode made no progress",
+                )));
+            }
+
+            self.transcoded_until = finish;
+            self.state = ChannelSessionState::SeekAndRealtime;
+        }
+
+        // let the playlist manager pick up the final segments before exiting
+        self.playlist_manager.lock().await.update().await?;
+
+        Ok(())
     }
 
     /// Publishes the `{query:}` variable names the current playout references
@@ -860,13 +959,13 @@ impl ChannelSession {
     }
 
     /// Expands `{channel_number}` and `{query:name|default}` variables in a
-    /// source URL. The channel session supplies no caller query values, so
-    /// every `query:` variable resolves to its default.
+    /// source URL. Query values arrive only in variant sessions; the shared
+    /// channel session resolves every `query:` variable to its default.
     fn expand_stream_variables_url(&self, uri: &str) -> String {
         ersatztv_playout::stream_variables::expand_url(
             uri,
             Some(self.channel_config.number()),
-            &std::collections::HashMap::new(),
+            &self.query_parameters,
         )
     }
 

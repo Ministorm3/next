@@ -37,6 +37,27 @@ enum Commands {
         #[arg(short, long)]
         number: String,
     },
+    /// Transcode a single playout item as a stream variant, with cohort
+    /// query values steering its templated URL
+    Variant {
+        #[arg(required = true, num_args = 1..)]
+        config_paths: Vec<PathBuf>,
+        #[arg(short, long)]
+        output_folder: PathBuf,
+        #[arg(short, long)]
+        number: String,
+        /// Id of the playout item to transcode
+        #[arg(long)]
+        item_id: String,
+        /// The -output_ts_offset the shared session used for this item, so
+        /// both transcodes occupy the same PTS envelope
+        #[arg(long)]
+        pts_offset_ms: u64,
+        /// Cohort query values as a url-encoded query string,
+        /// e.g. "region=west&lang=en"
+        #[arg(long, default_value = "")]
+        params: String,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +89,27 @@ async fn run() -> Result<(), ChannelError> {
             // start channel session
             let mut channel_session = ChannelSession::new(channel_config).await?;
             channel_session.run().await
+        }
+        Commands::Variant {
+            config_paths,
+            output_folder,
+            number,
+            item_id,
+            pts_offset_ms,
+            params,
+        } => {
+            let channel_config =
+                ChannelConfig::from_sources(&config_paths, &output_folder, &number).await?;
+
+            let query_parameters: std::collections::HashMap<String, String> =
+                url::form_urlencoded::parse(params.as_bytes())
+                    .into_owned()
+                    .collect();
+
+            let mut channel_session = ChannelSession::new(channel_config)
+                .await?
+                .with_query_parameters(query_parameters);
+            channel_session.run_variant(&item_id, pts_offset_ms).await
         }
         Commands::Debug { config_paths } => {
             let channel_config =
