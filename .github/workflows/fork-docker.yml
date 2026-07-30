@@ -1,0 +1,53 @@
+name: Build & Publish Fork Image
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/per-cohort-stream-variants
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build_image:
+    name: Build amd64 image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate version
+        shell: bash
+        run: |
+          tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          short=$(git rev-parse --short HEAD)
+          echo "INFO_VERSION=${tag:1}-${short}" >> $GITHUB_ENV
+
+      - name: Set image name
+        shell: bash
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ersatztv-next" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: true
+          provenance: false
+          platforms: linux/amd64
+          build-args: |
+            INFO_VERSION=${{ env.INFO_VERSION }}-fork
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ env.INFO_VERSION }}
