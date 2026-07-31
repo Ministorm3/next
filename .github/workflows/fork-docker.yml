@@ -43,7 +43,6 @@ jobs:
         with:
           context: .
           file: ./docker/Dockerfile
-          push: true
           provenance: false
           platforms: linux/amd64
           build-args: |
@@ -51,3 +50,8 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ env.INFO_VERSION }}
+          # docker (not oci) media types so registry update checkers that only
+          # send docker accept headers can still resolve the manifest
+          outputs: type=image,push=true,oci-mediatypes=false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
