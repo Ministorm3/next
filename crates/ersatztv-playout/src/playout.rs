@@ -235,6 +235,10 @@ pub enum PlayoutItemSource {
         /// time: {channel_number} and {query:name}, each with an optional
         /// |default (see [`crate::stream_variables`]).
         uri: String,
+        /// Whether the content is live and therefore cannot seek or work
+        /// ahead (default: false)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_live: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         in_point_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]

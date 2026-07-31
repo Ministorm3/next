@@ -428,6 +428,13 @@
           "type": "string",
           "description": "URI template, e.g. \"https://example.com/file.mkv?token={{MY_SECRET}}\". Besides {{ENV_VAR}} expansion, supports single-brace stream variables resolved at playback time: {channel_number} (or {channel_number|default}) expands to the channel number, and {query:name} (or {query:name|default}) expands to a caller-supplied request parameter, where name matches [A-Za-z0-9_.-]+. A variable resolves to its default (or an empty string) when no value is available; unrecognized braced text is left untouched. Caller-supplied values are percent-encoded and cannot change the scheme, host or port the template resolves to without them. The defaults-only form of a templated URI must itself be playable, since playback uses it whenever no caller-supplied values are available."
         },
+        "is_live": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Whether the content is live and therefore cannot seek or work ahead. Default: false."
+        },
         "in_point_ms": {
           "type": [
             "integer",
