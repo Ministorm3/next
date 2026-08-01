@@ -667,7 +667,7 @@ impl ChannelSession {
         self.playlist_manager
             .lock()
             .await
-            .before_new_pipeline(pts_offset, subtitle_source)
+            .before_new_pipeline(pts_offset, subtitle_source, &current_item.id)
             .await?;
 
         // stream current item

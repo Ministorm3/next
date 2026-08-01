@@ -43,6 +43,9 @@ pub struct PlaylistManager {
     pts_offset: Option<PtsOffset>,
     subtitle_source: Option<SubtitleSource>,
 
+    current_item_id: String,
+    pipelines: Vec<SidecarPipeline>,
+
     timeout: bool,
 }
 
@@ -51,6 +54,32 @@ struct Segment {
     path: String,
     duration: f64,
     program_date_time: OffsetDateTime,
+    item_id: String,
+}
+
+/// Machine-readable description of the generated playlist, published next to
+/// it. This is how other processes learn which playout item produced each
+/// segment and which PTS offset each pipeline was started with, without
+/// inferring either from timestamps.
+#[derive(serde::Serialize)]
+struct PlaylistSidecar<'a> {
+    segments: Vec<SidecarSegment<'a>>,
+    pipelines: &'a [SidecarPipeline],
+}
+
+#[derive(serde::Serialize)]
+struct SidecarSegment<'a> {
+    path: &'a str,
+    duration: f64,
+    program_date_time: String,
+    item_id: &'a str,
+    discontinuity: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SidecarPipeline {
+    pub item_id: String,
+    pub pts_offset_ms: u64,
 }
 
 pub struct PlaylistManagerOutputFiles {
@@ -92,6 +121,9 @@ impl PlaylistManager {
             pts_offset: None,
             subtitle_source: None,
 
+            current_item_id: String::new(),
+            pipelines: Vec::new(),
+
             timeout: false,
         }
     }
@@ -104,12 +136,18 @@ impl PlaylistManager {
         &mut self,
         new_pts_offset: Option<PtsOffset>,
         new_subtitle_source: Option<SubtitleSource>,
+        item_id: &str,
     ) -> Result<(), ChannelError> {
         self.update().await?;
         self.pts_offset = new_pts_offset;
         self.subtitle_source = new_subtitle_source;
         self.pending_discontinuity = true;
         self.current_session_start = self.last_segment_end;
+        self.current_item_id = item_id.to_owned();
+        self.pipelines.push(SidecarPipeline {
+            item_id: item_id.to_owned(),
+            pts_offset_ms: new_pts_offset.unwrap_or_default().duration.as_millis() as u64,
+        });
 
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
         if Path::new(&self.generated_playlist_file).exists() {
@@ -169,6 +207,7 @@ impl PlaylistManager {
                 path: file.clone(),
                 program_date_time,
                 duration,
+                item_id: self.current_item_id.clone(),
             });
 
             self.last_segment_end += Duration::from_secs_f64(duration);
@@ -224,11 +263,29 @@ impl PlaylistManager {
             }
         }
 
+        // drop pipeline records once no remaining segment references their
+        // item; the current pipeline's record always survives, even before its
+        // first segment lands
+        self.pipelines.retain(|p| {
+            p.item_id == self.current_item_id
+                || self.segments.iter().any(|s| s.item_id == p.item_id)
+        });
+
         // generate and atomically save playlist
         let generated_playlist = self.generate_playlist(|s| s.to_owned(), Some(10))?;
         let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
         tokio::fs::write(temp.path(), generated_playlist).await?;
         tokio::fs::rename(temp.path(), &self.generated_playlist_file).await?;
+
+        // publish the machine-readable sidecar alongside the playlist
+        let sidecar = self.generate_sidecar()?;
+        let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
+        tokio::fs::write(temp.path(), sidecar).await?;
+        tokio::fs::rename(
+            temp.path(),
+            format!("{}.meta.json", self.generated_playlist_file),
+        )
+        .await?;
 
         // generate and atomically save subtitle playlist
         let generated_subtitle_playlist = self.generate_playlist(
@@ -251,6 +308,33 @@ impl PlaylistManager {
         }
 
         Ok(())
+    }
+
+    fn generate_sidecar(&self) -> Result<String, ChannelError> {
+        let format = format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
+        );
+
+        let segments = self
+            .segments
+            .iter()
+            .map(|s| {
+                Ok(SidecarSegment {
+                    path: &s.path,
+                    duration: s.duration,
+                    program_date_time: s.program_date_time.format(format)?,
+                    item_id: &s.item_id,
+                    discontinuity: self.discontinuity_before.contains(&s.path),
+                })
+            })
+            .collect::<Result<Vec<_>, time::error::Format>>()?;
+
+        let sidecar = PlaylistSidecar {
+            segments,
+            pipelines: &self.pipelines,
+        };
+
+        Ok(serde_json::to_string(&sidecar)?)
     }
 
     fn generate_playlist(
@@ -395,4 +479,101 @@ fn render_subtitle_segment(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> PlaylistManager {
+        let folder = std::env::temp_dir();
+        PlaylistManager::new(
+            OffsetDateTime::UNIX_EPOCH,
+            4,
+            folder.clone(),
+            folder.join(".ready-test"),
+            PlaylistManagerOutputFiles {
+                generated_playlist_file: String::from("live.m3u8"),
+                ffmpeg_playlist_file: String::from("ffmpeg.m3u8"),
+                generated_subtitle_playlist_file: String::from("live_sub.m3u8"),
+            },
+        )
+    }
+
+    fn segment(path: &str, item_id: &str, start_offset_secs: i64) -> Segment {
+        Segment {
+            path: path.to_owned(),
+            duration: 4.0,
+            program_date_time: OffsetDateTime::UNIX_EPOCH
+                + Duration::from_secs(start_offset_secs as u64),
+            item_id: item_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn sidecar_maps_segments_to_items_and_pipelines_to_offsets() {
+        let mut m = manager();
+        m.current_item_id = String::from("item-b");
+        m.pipelines = vec![
+            SidecarPipeline {
+                item_id: String::from("item-a"),
+                pts_offset_ms: 0,
+            },
+            SidecarPipeline {
+                item_id: String::from("item-b"),
+                pts_offset_ms: 8000,
+            },
+        ];
+        m.segments.push_back(segment("seg0.ts", "item-a", 0));
+        m.segments.push_back(segment("seg1.ts", "item-a", 4));
+        m.segments.push_back(segment("seg2.ts", "item-b", 8));
+        m.discontinuity_before.insert(String::from("seg2.ts"));
+
+        let json = m.generate_sidecar().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let segments = value["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0]["item_id"], "item-a");
+        assert_eq!(segments[0]["discontinuity"], false);
+        assert_eq!(segments[2]["item_id"], "item-b");
+        assert_eq!(segments[2]["discontinuity"], true);
+        assert_eq!(segments[2]["duration"], 4.0);
+        assert!(
+            segments[2]["program_date_time"]
+                .as_str()
+                .unwrap()
+                .starts_with("1970-01-01T00:00:08.000")
+        );
+
+        let pipelines = value["pipelines"].as_array().unwrap();
+        assert_eq!(pipelines.len(), 2);
+        assert_eq!(pipelines[1]["item_id"], "item-b");
+        assert_eq!(pipelines[1]["pts_offset_ms"], 8000);
+    }
+
+    #[test]
+    fn pipeline_records_prune_with_their_segments() {
+        let mut m = manager();
+        m.current_item_id = String::from("item-b");
+        m.pipelines = vec![
+            SidecarPipeline {
+                item_id: String::from("item-a"),
+                pts_offset_ms: 0,
+            },
+            SidecarPipeline {
+                item_id: String::from("item-b"),
+                pts_offset_ms: 8000,
+            },
+        ];
+        // item-a segments have been trimmed from the window already
+        m.segments.push_back(segment("seg2.ts", "item-b", 8));
+
+        m.pipelines.retain(|p| {
+            p.item_id == m.current_item_id || m.segments.iter().any(|s| s.item_id == p.item_id)
+        });
+
+        assert_eq!(m.pipelines.len(), 1);
+        assert_eq!(m.pipelines[0].item_id, "item-b");
+    }
 }

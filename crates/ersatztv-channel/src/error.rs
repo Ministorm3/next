@@ -26,6 +26,9 @@ pub enum ChannelError {
     #[error("date formatting error: {0}")]
     ChannelDateFormatError(#[from] time::error::Format),
 
+    #[error("json serialization error: {0}")]
+    JsonError(#[from] serde_json::Error),
+
     #[error("Indeterminate local time offset: {0}")]
     DateOffsetError(#[from] time::error::IndeterminateOffset),
 
