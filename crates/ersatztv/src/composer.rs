@@ -131,9 +131,12 @@ impl SessionPlaylist {
                     .insert(pipeline.item_id.clone(), ItemDecision::Variant);
             } else {
                 // hold the decision open while there is still time for the
-                // variant to produce output; force shared at the window edge
+                // variant to produce output. viewers play a full serve window
+                // behind the live edge, so the decision can stay open until
+                // shortly AFTER the item's first segment pdt and still be
+                // pinned before any viewer's playlist reaches the boundary
                 let deadline = item_start
-                    - time::Duration::seconds(
+                    + time::Duration::seconds(
                         (SEGMENT_SECONDS * 5) as i64 - DECISION_LEAD_SECONDS as i64,
                     );
                 if now >= deadline {
@@ -533,9 +536,15 @@ mod tests {
         session.decide_items(&shared, None, early);
         assert!(session.decisions.is_empty());
 
-        // item start pdt is +8s; the serve window trails now by ~20s, so by
-        // now = item start the decision must be forced
-        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+        // shortly after the item start pdt (+8s) the decision is still open,
+        // because viewers play a full serve window behind the live edge
+        let at_start = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+        session.decide_items(&shared, None, at_start);
+        assert!(session.decisions.is_empty());
+
+        // by the time any viewer's playlist could reach the boundary, the
+        // decision must be forced
+        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
         session.decide_items(&shared, None, late);
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
     }
@@ -547,7 +556,7 @@ mod tests {
         let mut variant = variant_for_game();
         variant.pipelines[0].pts_offset_ms = 9_999;
 
-        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
         session.decide_items(&shared, Some(&variant), late);
 
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
