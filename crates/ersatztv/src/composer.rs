@@ -29,7 +29,13 @@ const DECISION_LEAD_SECONDS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemDecision {
-    Variant,
+    /// Substitute variant segments from `join_ms` into the item onward
+    /// (0 = the whole item). Envelope equality makes a mid-item join safe:
+    /// variant segments occupy the same PTS grid as the shared ones they
+    /// replace. Final once made.
+    Variant { join_ms: u64 },
+    /// Serve the shared feed. Soft: upgrades to a late `Variant` join if the
+    /// cohort's variant starts producing anchored output mid-item.
     Shared,
 }
 
@@ -90,10 +96,12 @@ impl SessionPlaylist {
         self.render(now, target_duration, map_path)
     }
 
-    /// Pins a decision for each templated item approaching the serve window.
-    /// The variant wins if it has produced output covering the item's start;
-    /// once the item is about to be served with no variant output, the shared
-    /// feed wins. Either way the decision never changes afterwards.
+    /// Decides each templated item's fate. A variant whose recorded anchor
+    /// lands inside the item wins from that offset onward: at the start when
+    /// it was spawned with lead time, or as a late join when it wasn't. A
+    /// `Shared` decision is only a soft pin: it upgrades to a late join the
+    /// moment anchored variant output appears, because envelope equality
+    /// makes the mid-item switch timestamp-continuous.
     fn decide_items(
         &mut self,
         shared: &PlaylistSidecar,
@@ -101,16 +109,32 @@ impl SessionPlaylist {
         now: OffsetDateTime,
     ) {
         for pipeline in shared.pipelines.iter().filter(|p| p.templated) {
-            if self.decisions.contains_key(&pipeline.item_id) {
+            if let Some(ItemDecision::Variant { .. }) = self.decisions.get(&pipeline.item_id) {
                 continue;
             }
 
-            let variant_covers_start = variant.is_some_and(|v| {
-                !v.segments.is_empty()
-                    && v.pipelines.first().is_some_and(|vp| {
-                        vp.item_id == pipeline.item_id && vp.pts_offset_ms == pipeline.pts_offset_ms
+            let anchored_join = variant.and_then(|v| {
+                if v.segments.is_empty() {
+                    return None;
+                }
+                v.pipelines
+                    .first()
+                    .filter(|vp| {
+                        vp.item_id == pipeline.item_id && vp.pts_offset_ms >= pipeline.pts_offset_ms
                     })
+                    .map(|vp| vp.pts_offset_ms - pipeline.pts_offset_ms)
             });
+
+            if let Some(join_ms) = anchored_join {
+                self.decisions
+                    .insert(pipeline.item_id.clone(), ItemDecision::Variant { join_ms });
+                continue;
+            }
+
+            if self.decisions.contains_key(&pipeline.item_id) {
+                // already soft-pinned shared; keep waiting for a late join
+                continue;
+            }
 
             // the item's first segment (the first shared segment recorded for
             // it) tells us when the item reaches viewers
@@ -126,23 +150,18 @@ impl SessionPlaylist {
                 continue;
             };
 
-            if variant_covers_start {
+            // hold the decision open while there is still time for the
+            // variant to produce output. viewers play a full serve window
+            // behind the live edge, so the decision can stay open until
+            // shortly AFTER the item's first segment pdt and still be
+            // pinned before any viewer's playlist reaches the boundary
+            let deadline = item_start
+                + time::Duration::seconds(
+                    (SEGMENT_SECONDS * 5) as i64 - DECISION_LEAD_SECONDS as i64,
+                );
+            if now >= deadline {
                 self.decisions
-                    .insert(pipeline.item_id.clone(), ItemDecision::Variant);
-            } else {
-                // hold the decision open while there is still time for the
-                // variant to produce output. viewers play a full serve window
-                // behind the live edge, so the decision can stay open until
-                // shortly AFTER the item's first segment pdt and still be
-                // pinned before any viewer's playlist reaches the boundary
-                let deadline = item_start
-                    + time::Duration::seconds(
-                        (SEGMENT_SECONDS * 5) as i64 - DECISION_LEAD_SECONDS as i64,
-                    );
-                if now >= deadline {
-                    self.decisions
-                        .insert(pipeline.item_id.clone(), ItemDecision::Shared);
-                }
+                    .insert(pipeline.item_id.clone(), ItemDecision::Shared);
             }
         }
     }
@@ -240,14 +259,22 @@ impl SessionPlaylist {
     }
 }
 
+/// After this much shared coverage exists beyond the variant's produced edge,
+/// the missing positions fall back to shared segments instead of holding, so
+/// a stalled variant degrades to the shared feed rather than stalling the
+/// cohort's playlist. Envelope equality keeps the per-position fallback
+/// timestamp-continuous.
+const VARIANT_STALL_SECONDS: f64 = 16.0;
+
 /// Builds the cohort's timeline from the two sidecars: shared segments pass
-/// through, and each item decided `Variant` has its shared segments replaced
-/// by the variant's, with program date times synthesized from the item start
-/// and the variant's own recorded durations.
+/// through, and each item decided `Variant { join_ms }` has its shared
+/// segments from that offset onward replaced position-for-position by the
+/// variant's. Both transcodes occupy the same PTS envelope and segment grid,
+/// so the substituted entries reuse the shared segment's program date time.
 ///
-/// Segments of items *after* an undecided templated item, or after a variant
-/// substitution that has not yet caught up to the shared feed's coverage of
-/// the item, are held back so the timeline never emits around a hole.
+/// Segments of an undecided templated item are held back; a position the
+/// variant has not produced yet holds the timeline at that edge (up to the
+/// stall threshold) so the timeline never emits around a hole.
 pub fn compose_timeline(
     shared: &PlaylistSidecar,
     variant: Option<&PlaylistSidecar>,
@@ -261,9 +288,10 @@ pub fn compose_timeline(
         .collect();
 
     let mut result: Vec<ComposedEntry> = Vec::new();
-    let mut substituted: Option<&str> = None;
-    let mut shared_item_coverage = 0f64;
-    let mut variant_coverage = 0f64;
+    let mut current_item: Option<&str> = None;
+    let mut item_position_ms = 0u64;
+    let mut variant_index = 0usize;
+    let mut substituting = false;
 
     for segment in &shared.segments {
         let Some(pdt) = parse_pdt(&segment.program_date_time) else {
@@ -273,31 +301,68 @@ pub fn compose_timeline(
         let is_templated = templated.get(segment.item_id.as_str()).copied() == Some(true);
 
         if is_templated {
-            match decisions.get(&segment.item_id) {
-                Some(ItemDecision::Variant) => {
-                    if substituted != Some(segment.item_id.as_str()) {
-                        // first shared segment of the item: splice in every
-                        // variant segment produced so far, anchored here
-                        substituted = Some(segment.item_id.as_str());
-                        shared_item_coverage = 0f64;
-                        variant_coverage = 0f64;
+            if current_item != Some(segment.item_id.as_str()) {
+                current_item = Some(segment.item_id.as_str());
+                item_position_ms = 0;
+                variant_index = 0;
+                substituting = false;
+            }
 
-                        let mut cursor = pdt;
-                        for (index, vseg) in variant.iter().flat_map(|v| &v.segments).enumerate() {
+            let position_ms = item_position_ms;
+            item_position_ms += (segment.duration.max(0f64) * 1000.0) as u64;
+
+            match decisions.get(&segment.item_id) {
+                Some(ItemDecision::Variant { join_ms }) => {
+                    // positions before the join stay shared; from the join
+                    // onward the variant's segments substitute one-for-one on
+                    // the shared grid
+                    if position_ms + 750 >= *join_ms {
+                        let vseg = variant.and_then(|v| v.segments.get(variant_index));
+
+                        if let Some(vseg) = vseg {
                             result.push(ComposedEntry {
                                 path: format!("{variant_prefix}{}", vseg.path),
                                 duration: vseg.duration,
-                                program_date_time: cursor,
-                                discontinuity: index == 0 || vseg.discontinuity,
+                                program_date_time: pdt,
+                                discontinuity: variant_index == 0
+                                    || vseg.discontinuity
+                                    || segment.discontinuity,
                                 item_id: segment.item_id.clone(),
                             });
-                            cursor += std::time::Duration::from_secs_f64(vseg.duration.max(0f64));
-                            variant_coverage += vseg.duration;
+                            variant_index += 1;
+                            substituting = true;
+                            continue;
                         }
-                    }
 
-                    shared_item_coverage += segment.duration;
-                    continue;
+                        // the variant has not produced this position yet:
+                        // hold the timeline here unless it has fallen so far
+                        // behind that holding would stall viewers
+                        let variant_edge_ms =
+                            *join_ms + (variant_index as u64 * 1000 * SEGMENT_SECONDS);
+                        let behind_ms = item_position_ms.saturating_sub(variant_edge_ms);
+                        if (behind_ms as f64) < VARIANT_STALL_SECONDS * 1000.0 {
+                            return result;
+                        }
+
+                        log::debug!(
+                            "variant for item {} stalled {}ms behind; serving shared position {}",
+                            segment.item_id,
+                            behind_ms,
+                            position_ms
+                        );
+                        // fall through to emit the shared segment, marking the
+                        // source switch for players that honor discontinuities
+                        result.push(ComposedEntry {
+                            path: segment.path.clone(),
+                            duration: segment.duration,
+                            program_date_time: pdt,
+                            discontinuity: substituting || segment.discontinuity,
+                            item_id: segment.item_id.clone(),
+                        });
+                        substituting = false;
+                        continue;
+                    }
+                    // before the join: shared passes through below
                 }
                 Some(ItemDecision::Shared) => {
                     // fall through: the shared segment passes into the
@@ -308,16 +373,8 @@ pub fn compose_timeline(
                     return result;
                 }
             }
-        } else if let Some(item) = substituted.take() {
-            // first segment after a substituted item: only proceed once the
-            // variant covered what the shared feed covered, else the timeline
-            // would emit around a hole the variant still has to fill
-            if variant_coverage + 0.5 < shared_item_coverage {
-                log::debug!(
-                    "holding timeline after item {item}: variant covered {variant_coverage:.1}s of {shared_item_coverage:.1}s"
-                );
-                return result;
-            }
+        } else {
+            current_item = None;
         }
 
         result.push(ComposedEntry {
@@ -400,7 +457,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant),
+            &decided("game", ItemDecision::Variant { join_ms: 0 }),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -425,7 +482,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant),
+            &decided("game", ItemDecision::Variant { join_ms: 0 }),
         );
 
         let expected_first = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
@@ -443,7 +500,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant),
+            &decided("game", ItemDecision::Variant { join_ms: 0 }),
         );
 
         // splice in: first variant segment; splice out: first segment of the
@@ -500,7 +557,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant),
+            &decided("game", ItemDecision::Variant { join_ms: 0 }),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -523,7 +580,10 @@ mod tests {
 
         session.decide_items(&shared, Some(&variant), now);
 
-        assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Variant));
+        assert_eq!(
+            session.decisions.get("game"),
+            Some(&ItemDecision::Variant { join_ms: 0 })
+        );
     }
 
     #[test]
@@ -550,16 +610,84 @@ mod tests {
     }
 
     #[test]
-    fn variant_with_mismatched_offset_is_not_chosen() {
+    fn variant_anchored_before_the_item_is_not_chosen() {
         let mut session = SessionPlaylist::default();
         let shared = shared_with_templated_item();
         let mut variant = variant_for_game();
-        variant.pipelines[0].pts_offset_ms = 9_999;
+        variant.pipelines[0].pts_offset_ms = 7_000;
 
         let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
         session.decide_items(&shared, Some(&variant), late);
 
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+    }
+
+    #[test]
+    fn variant_anchored_mid_item_becomes_a_late_join() {
+        let mut session = SessionPlaylist::default();
+        let shared = shared_with_templated_item();
+        let mut variant = variant_for_game();
+        // anchored one grid position into the item
+        variant.pipelines[0].pts_offset_ms = 12_000;
+
+        let now = OffsetDateTime::UNIX_EPOCH;
+        session.decide_items(&shared, Some(&variant), now);
+
+        assert_eq!(
+            session.decisions.get("game"),
+            Some(&ItemDecision::Variant { join_ms: 4_000 })
+        );
+    }
+
+    #[test]
+    fn shared_soft_pin_upgrades_when_anchored_output_appears() {
+        let mut session = SessionPlaylist::default();
+        let shared = shared_with_templated_item();
+
+        // deadline passes with no variant: soft-pinned shared
+        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
+        session.decide_items(&shared, None, late);
+        assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+
+        // anchored variant output appears mid-item: upgrade to a late join
+        let mut variant = variant_for_game();
+        variant.pipelines[0].pts_offset_ms = 12_000;
+        session.decide_items(&shared, Some(&variant), late);
+        assert_eq!(
+            session.decisions.get("game"),
+            Some(&ItemDecision::Variant { join_ms: 4_000 })
+        );
+    }
+
+    #[test]
+    fn late_join_substitutes_only_from_the_join_position() {
+        let shared = shared_with_templated_item();
+        // variant anchored at the second game position, one segment produced
+        let variant = PlaylistSidecar {
+            segments: vec![seg("live000000.ts", "game", 0, true)],
+            pipelines: vec![pipeline("game", 12_000, true)],
+        };
+
+        let timeline = compose_timeline(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            &decided("game", ItemDecision::Variant { join_ms: 4_000 }),
+        );
+
+        let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "live000000.ts",
+                "live000001.ts",
+                "live000002.ts",
+                "variants/abc/live000000.ts",
+                "live000004.ts",
+            ]
+        );
+        // the join carries a discontinuity for players that honor them
+        assert!(timeline[3].discontinuity);
     }
 
     #[test]

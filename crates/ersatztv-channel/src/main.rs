@@ -53,6 +53,11 @@ enum Commands {
         /// both transcodes occupy the same PTS envelope
         #[arg(long)]
         pts_offset_ms: u64,
+        /// How far into the item the shared session's published coverage
+        /// already extends; the variant anchors just past it on the same
+        /// segment grid
+        #[arg(long, default_value_t = 0)]
+        progress_ms: u64,
         /// Cohort query values as a url-encoded query string,
         /// e.g. "region=west&lang=en"
         #[arg(long, default_value = "")]
@@ -96,6 +101,7 @@ async fn run() -> Result<(), ChannelError> {
             number,
             item_id,
             pts_offset_ms,
+            progress_ms,
             params,
         } => {
             let channel_config =
@@ -109,7 +115,9 @@ async fn run() -> Result<(), ChannelError> {
             let mut channel_session = ChannelSession::new(channel_config)
                 .await?
                 .with_query_parameters(query_parameters);
-            channel_session.run_variant(&item_id, pts_offset_ms).await
+            channel_session
+                .run_variant(&item_id, pts_offset_ms, progress_ms)
+                .await
         }
         Commands::Debug { config_paths } => {
             let channel_config =

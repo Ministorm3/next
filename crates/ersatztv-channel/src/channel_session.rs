@@ -290,6 +290,7 @@ impl ChannelSession {
         &mut self,
         item_id: &str,
         pts_offset_ms: u64,
+        progress_ms: u64,
     ) -> Result<(), ChannelError> {
         self.prep_output_folder().await?;
 
@@ -329,15 +330,17 @@ impl ChannelSession {
             .get_item_by_id(item_id, &self.transcoded_until)
             .await?;
 
-        // the variant covers the item from its beginning when spawned with
-        // lead time; a variant spawned mid-item covers the remainder, and its
-        // segments slot into the envelope at the matching offset
-        if self.transcoded_until < item.start {
-            self.transcoded_until = item.start;
-            self.state = ChannelSessionState::ZeroAndRealtime;
+        // the variant's position in the item comes from the shared session's
+        // published coverage, not the wall clock: both transcodes must sit on
+        // the same envelope grid even when the channel runs behind schedule.
+        // progress 0 covers the whole item; a later anchor covers the
+        // remainder from the matching grid position
+        self.transcoded_until = item.start + time::Duration::milliseconds(progress_ms as i64);
+        self.state = if progress_ms == 0 {
+            ChannelSessionState::ZeroAndRealtime
         } else {
-            self.state = ChannelSessionState::SeekAndRealtime;
-        }
+            ChannelSessionState::SeekAndRealtime
+        };
 
         let base_offset = Duration::from_millis(pts_offset_ms);
 
@@ -1068,11 +1071,20 @@ impl ChannelSession {
             _ => item_in_point_base_ms + item_duration.whole_milliseconds() as u64,
         };
 
-        // live content never seeks and is always a complete transcode
+        // live content never seeks and is always a complete transcode; a
+        // session joining mid-item covers only the remainder, so its output
+        // stays inside the item's PTS envelope
         if is_live {
+            let live_now = if start_at_zero {
+                item_start
+            } else {
+                self.transcoded_until.clamp(item_start, item_finish)
+            };
+            let remaining = item_finish - live_now;
+
             return TimingResult {
                 in_point: Duration::ZERO,
-                out_point: Duration::from_millis(item_duration.whole_milliseconds() as u64),
+                out_point: Duration::from_millis(remaining.whole_milliseconds().max(0) as u64),
                 finish: item_finish,
                 is_complete: true,
             };

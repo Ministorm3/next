@@ -161,11 +161,23 @@ async fn spawn_missing_variants(
             continue;
         }
 
+        // anchor the variant where the shared session's PUBLISHED coverage of
+        // the item ends, not at the wall clock: a channel running behind
+        // schedule would otherwise anchor the variant deep into the envelope
+        // and never line up with the shared grid
+        let progress_ms: u64 = shared
+            .segments
+            .iter()
+            .filter(|s| s.item_id == pipeline.item_id)
+            .map(|s| (s.duration.max(0f64) * 1000.0) as u64)
+            .sum();
+
         log::info!(
-            "spawning variant for item {} on channel {} (cohort '{}')",
+            "spawning variant for item {} on channel {} (cohort '{}', progress {}ms)",
             pipeline.item_id,
             channel.number(),
-            session.cohort_query
+            session.cohort_query,
+            progress_ms
         );
 
         let spawned = tokio::process::Command::new(binary)
@@ -178,6 +190,8 @@ async fn spawn_missing_variants(
             .arg(&pipeline.item_id)
             .arg("--pts-offset-ms")
             .arg(pipeline.pts_offset_ms.to_string())
+            .arg("--progress-ms")
+            .arg(progress_ms.to_string())
             .arg("--params")
             .arg(&session.cohort_query)
             .arg(channel.config_path())
