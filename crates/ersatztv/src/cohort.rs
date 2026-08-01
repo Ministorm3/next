@@ -58,6 +58,22 @@ pub fn cohort_parameters(
     result
 }
 
+/// The query string to forward from a channels.m3u request onto every channel
+/// url: reserved names are dropped, everything else passes through. Per-
+/// channel recognition happens later, at the channel request, since each
+/// channel's playout recognizes different names.
+pub fn forward_query_string(query_pairs: &[(String, String)]) -> String {
+    let mut result = BTreeMap::new();
+    for (key, value) in query_pairs {
+        let key = key.to_ascii_lowercase();
+        if RESERVED_PARAMETERS.contains(&key.as_str()) {
+            continue;
+        }
+        result.insert(key, value.clone());
+    }
+    to_query_string(&result)
+}
+
 /// The canonical query-string form of a cohort: ordinal-sorted, url-encoded
 /// pairs. Equal cohorts always produce equal strings, so this is also the
 /// cohort's identity key.

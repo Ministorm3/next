@@ -277,9 +277,21 @@ fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap, cohort_query: 
 }
 
 async fn channel_playlist(
+    axum::extract::Query(query_pairs): axum::extract::Query<Vec<(String, String)>>,
     State(state): State<Arc<LineupState>>,
     request: axum::extract::Request,
 ) -> Result<impl IntoResponse, LineupError> {
+    // custom parameters on the playlist request travel onto every channel
+    // url, so one m3u url per location carries its cohort identity (e.g.
+    // channels.m3u?zip=90210); each channel later keeps only the names its
+    // own playout recognizes
+    let forwarded = cohort::forward_query_string(&query_pairs);
+    let query_suffix = if forwarded.is_empty() {
+        String::new()
+    } else {
+        format!("?{forwarded}")
+    };
+
     let mut content = String::new();
     let scheme_host = get_scheme_host(request.headers());
     let xmltv_url = format!("{}/xmltv.xml", scheme_host);
@@ -307,9 +319,10 @@ async fn channel_playlist(
             channel.name()
         ));
         content.push_str(&format!(
-            "{}/channel/{}.m3u8\n",
+            "{}/channel/{}.m3u8{}\n",
             scheme_host,
-            channel.number()
+            channel.number(),
+            query_suffix
         ));
     }
 
