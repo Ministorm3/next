@@ -916,7 +916,12 @@ impl ChannelSession {
         if is_live {
             return TimingResult {
                 in_point: Duration::ZERO,
-                out_point: Duration::from_millis(item_duration.whole_milliseconds() as u64),
+                out_point: live_out_point(
+                    start_at_zero,
+                    self.transcoded_until,
+                    item_start,
+                    item_finish,
+                ),
                 finish: item_finish,
                 is_complete: true,
             };
@@ -1262,6 +1267,30 @@ fn playout_timing_to_pipeline(
     })
 }
 
+/// How much output a live item's pipeline should produce.
+///
+/// Live content is never seeked into: a pipeline always reads from whatever
+/// the source is sending now. That makes the amount to produce the only part
+/// of the timing that can vary, and it is the part of the item's slot that is
+/// still ahead. A session starting the item covers the whole slot, while one
+/// that joins partway through covers only the remainder, so the pipeline stops
+/// when the item does instead of running past it and into the next item's
+/// slot.
+fn live_out_point(
+    start_at_zero: bool,
+    transcoded_until: OffsetDateTime,
+    item_start: OffsetDateTime,
+    item_finish: OffsetDateTime,
+) -> Duration {
+    let live_now = if start_at_zero {
+        item_start
+    } else {
+        transcoded_until.clamp(item_start, item_finish)
+    };
+
+    Duration::from_millis((item_finish - live_now).whole_milliseconds().max(0) as u64)
+}
+
 fn source_is_live(source: &PlayoutItemSource) -> bool {
     matches!(
         source,
@@ -1332,5 +1361,58 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    #[test]
+    fn a_live_item_started_from_its_beginning_covers_the_whole_slot() {
+        let out_point = live_out_point(true, at(0), at(100), at(160));
+
+        assert_eq!(out_point, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_live_item_joined_partway_through_covers_only_the_remainder() {
+        // the session came up 20s into the item's slot, so 40s are left
+        let out_point = live_out_point(false, at(120), at(100), at(160));
+
+        assert_eq!(out_point, Duration::from_secs(40));
+    }
+
+    #[test]
+    fn a_fresh_start_ignores_where_the_session_had_reached() {
+        // start_at_zero means the item begins here, whatever the clock says
+        let out_point = live_out_point(true, at(120), at(100), at(160));
+
+        assert_eq!(out_point, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_live_item_joined_at_its_finish_covers_nothing() {
+        let out_point = live_out_point(false, at(160), at(100), at(160));
+
+        assert_eq!(out_point, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_join_past_the_finish_is_clamped_rather_than_going_negative() {
+        let out_point = live_out_point(false, at(500), at(100), at(160));
+
+        assert_eq!(out_point, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_join_before_the_item_starts_covers_the_whole_slot() {
+        let out_point = live_out_point(false, at(40), at(100), at(160));
+
+        assert_eq!(out_point, Duration::from_secs(60));
     }
 }
