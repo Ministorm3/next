@@ -241,6 +241,8 @@ async fn fix_content_types(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = request.uri().path();
+    let is_playlist = path.ends_with(".m3u8") || path.ends_with(".m3u");
+
     // mime_guess maps .ts to a dlna vendor type that describes 192-byte
     // timestamped packets; these segments are plain mpeg-2 transport streams,
     // which iana registers as video/MP2T
@@ -260,6 +262,18 @@ async fn fix_content_types(
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, value);
     }
+
+    // a live playlist is rewritten every few seconds, and a response with no
+    // freshness information can still be cached: rfc9111 4.2.2 lets a cache
+    // assign a heuristic lifetime, and proxies commonly apply a flat default
+    // instead. A client served a stale playlist sees it stop changing, which
+    // rfc8216bis 6.3.4 tells it to treat as server impairment
+    if is_playlist && let Ok(value) = "no-cache".parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CACHE_CONTROL, value);
+    }
+
     response
 }
 
