@@ -362,8 +362,14 @@ fn render_subtitle_segment(
 ) -> String {
     let seg_end_src = seg_start_src + Duration::from_secs_f64(duration);
 
+    // cue times are written on the source timeline, with X-TIMESTAMP-MAP
+    // anchoring that timeline to this segment's pts. rfc8216bis 3.1.4
+    // requires each cue to carry its total display time even where the range
+    // extends outside the segment, and a segment-relative timeline cannot
+    // express that for a cue that started before the segment did
     let mut out = format!(
-        "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:{}\n\n",
+        "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:{},MPEGTS:{}\n\n",
+        format_vtt_ts(seg_start_src),
         mpegts_90khz
     );
 
@@ -373,15 +379,10 @@ fn render_subtitle_segment(
         && cue.start < seg_end_src
     {
         if cue.end > seg_start_src {
-            let local_start = cue.start.saturating_sub(seg_start_src);
-            let local_end = cue
-                .end
-                .saturating_sub(seg_start_src)
-                .min(Duration::from_secs_f64(duration));
             out.push_str(&format!(
                 "{} --> {}\n{}\n\n",
-                format_vtt_ts(local_start),
-                format_vtt_ts(local_end),
+                format_vtt_ts(cue.start),
+                format_vtt_ts(cue.end),
                 cue.text
             ));
         }
@@ -395,4 +396,67 @@ fn render_subtitle_segment(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(cues: Vec<Cue>) -> SubtitleSource {
+        SubtitleSource {
+            cues: Arc::new(cues),
+            cursor: 0,
+            next_segment_source_offset: Duration::ZERO,
+        }
+    }
+
+    fn cue(start: f64, end: f64, text: &str) -> Cue {
+        Cue {
+            start: Duration::from_secs_f64(start),
+            end: Duration::from_secs_f64(end),
+            text: String::from(text),
+        }
+    }
+
+    #[test]
+    fn spanning_cue_keeps_its_full_range_in_every_segment() {
+        // a cue from 2s to 10s covers all of the second segment and part of
+        // the first and third
+        let mut src = source(vec![cue(2.0, 10.0, "spanning")]);
+
+        let first = render_subtitle_segment(&mut src, Duration::ZERO, 4.0, 0);
+        let second = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+        let third = render_subtitle_segment(&mut src, Duration::from_secs(8), 4.0, 720_000);
+
+        for segment in [&first, &second, &third] {
+            assert!(
+                segment.contains("00:00:02.000 --> 00:00:10.000"),
+                "expected the full cue range, got:\n{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_map_anchors_the_source_timeline_to_the_segment() {
+        let mut src = source(vec![cue(6.0, 7.0, "later")]);
+
+        let segment = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+
+        assert!(
+            segment.starts_with("WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:04.000,MPEGTS:360000\n\n")
+        );
+        assert!(segment.contains("00:00:06.000 --> 00:00:07.000"));
+    }
+
+    #[test]
+    fn cue_that_ended_before_the_segment_is_not_emitted() {
+        let mut src = source(vec![cue(0.5, 1.5, "early"), cue(5.0, 6.0, "later")]);
+
+        let first = render_subtitle_segment(&mut src, Duration::ZERO, 4.0, 0);
+        let second = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+
+        assert!(first.contains("early"));
+        assert!(!second.contains("early"));
+        assert!(second.contains("later"));
+    }
 }
