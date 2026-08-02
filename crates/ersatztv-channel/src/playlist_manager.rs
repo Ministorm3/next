@@ -375,12 +375,13 @@ impl PlaylistManager {
             "#EXT-X-MEDIA-SEQUENCE:{}\n",
             effective_media_sequence
         ));
-        if effective_discontinuity_sequence > 0 {
-            playlist.push_str(&format!(
-                "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
-                effective_discontinuity_sequence
-            ));
-        }
+        // rfc8216bis 6.2.2 requires this tag in any playlist that removes
+        // segments and contains EXT-X-DISCONTINUITY, with no exemption while
+        // the value is still zero
+        playlist.push_str(&format!(
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+            effective_discontinuity_sequence
+        ));
         playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
         let format = format_description!(
