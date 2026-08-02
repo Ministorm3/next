@@ -408,6 +408,7 @@ mod tests {
         SidecarPipeline {
             item_id: item.to_owned(),
             pts_offset_ms: offset_ms,
+            duration_ms: 0,
             templated,
         }
     }

@@ -58,6 +58,11 @@ enum Commands {
         /// segment grid
         #[arg(long, default_value_t = 0)]
         progress_ms: u64,
+        /// How much output the shared session declared for this item. The
+        /// variant fills the same envelope, which is shorter than the item
+        /// whenever the shared session joined the item partway through
+        #[arg(long, default_value_t = 0)]
+        shared_duration_ms: u64,
         /// Cohort query values as a url-encoded query string,
         /// e.g. "region=west&lang=en"
         #[arg(long, default_value = "")]
@@ -102,6 +107,7 @@ async fn run() -> Result<(), ChannelError> {
             item_id,
             pts_offset_ms,
             progress_ms,
+            shared_duration_ms,
             params,
         } => {
             let channel_config =
@@ -116,7 +122,7 @@ async fn run() -> Result<(), ChannelError> {
                 .await?
                 .with_query_parameters(query_parameters);
             channel_session
-                .run_variant(&item_id, pts_offset_ms, progress_ms)
+                .run_variant(&item_id, pts_offset_ms, progress_ms, shared_duration_ms)
                 .await
         }
         Commands::Debug { config_paths } => {

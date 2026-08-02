@@ -172,12 +172,24 @@ async fn spawn_missing_variants(
             .map(|s| (s.duration.max(0f64) * 1000.0) as u64)
             .sum();
 
+        // the shared session has already covered everything it declared for
+        // this item, so there is nothing left for a variant to substitute
+        if progress_ms >= pipeline.duration_ms {
+            log::debug!(
+                "not spawning variant for item {}: shared coverage {progress_ms}ms already fills its {}ms envelope",
+                pipeline.item_id,
+                pipeline.duration_ms
+            );
+            continue;
+        }
+
         log::info!(
-            "spawning variant for item {} on channel {} (cohort '{}', progress {}ms)",
+            "spawning variant for item {} on channel {} (cohort '{}', progress {}ms of a {}ms envelope)",
             pipeline.item_id,
             channel.number(),
             session.cohort_query,
-            progress_ms
+            progress_ms,
+            pipeline.duration_ms
         );
 
         let spawned = tokio::process::Command::new(binary)
@@ -192,6 +204,8 @@ async fn spawn_missing_variants(
             .arg(pipeline.pts_offset_ms.to_string())
             .arg("--progress-ms")
             .arg(progress_ms.to_string())
+            .arg("--shared-duration-ms")
+            .arg(pipeline.duration_ms.to_string())
             .arg("--params")
             .arg(&session.cohort_query)
             .arg(channel.config_path())

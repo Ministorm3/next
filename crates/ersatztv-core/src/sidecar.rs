@@ -31,6 +31,13 @@ pub struct SidecarSegment {
 pub struct SidecarPipeline {
     pub item_id: String,
     pub pts_offset_ms: u64,
+    /// How much output this pipeline will produce, so it covers pts
+    /// `pts_offset_ms` through `pts_offset_ms + duration_ms`. A session that
+    /// joined the item partway through covers only the remainder, so this is
+    /// the only way a variant can learn where the shared envelope actually
+    /// ends. The item's own duration does not say.
+    #[serde(default)]
+    pub duration_ms: u64,
     /// Whether the item's source URI references `{query:}` variables, so
     /// variant sessions may transcode it with different values.
     #[serde(default)]

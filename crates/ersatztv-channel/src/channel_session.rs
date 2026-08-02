@@ -291,6 +291,7 @@ impl ChannelSession {
         item_id: &str,
         pts_offset_ms: u64,
         progress_ms: u64,
+        shared_duration_ms: u64,
     ) -> Result<(), ChannelError> {
         self.prep_output_folder().await?;
 
@@ -333,9 +334,20 @@ impl ChannelSession {
         // the variant's position in the item comes from the shared session's
         // published coverage, not the wall clock: both transcodes must sit on
         // the same envelope grid even when the channel runs behind schedule.
-        // progress 0 covers the whole item; a later anchor covers the
-        // remainder from the matching grid position
-        self.transcoded_until = item.start + time::Duration::milliseconds(progress_ms as i64);
+        //
+        // that coverage is measured from wherever the shared session started
+        // reading, which is not the item's start when the session joined the
+        // item partway through. `shared_duration_ms` is the envelope the
+        // shared session declared, so the distance from the item's end back
+        // to it gives the point its pts offset corresponds to. anchoring at
+        // the item's start instead would push the variant's envelope past
+        // the shared one by exactly that join distance
+        let item_duration_ms = (item.finish - item.start).whole_milliseconds().max(0) as u64;
+        let join_offset_ms = shared_join_offset_ms(item_duration_ms, shared_duration_ms);
+        let anchor = item.start + time::Duration::milliseconds(join_offset_ms as i64);
+
+        self.transcoded_until =
+            (anchor + time::Duration::milliseconds(progress_ms as i64)).min(item.finish);
         self.state = if progress_ms == 0 {
             ChannelSessionState::ZeroAndRealtime
         } else {
@@ -345,7 +357,7 @@ impl ChannelSession {
         let base_offset = Duration::from_millis(pts_offset_ms);
 
         while self.transcoded_until < item.finish {
-            let progress = self.transcoded_until - item.start;
+            let progress = self.transcoded_until - anchor;
             let pts =
                 base_offset + Duration::from_millis(progress.whole_milliseconds().max(0) as u64);
 
@@ -827,10 +839,26 @@ impl ChannelSession {
         let envs = pipeline_result.envs();
         log::debug!("optimized pipeline: {}", args.join(" "));
 
+        // the envelope this pipeline will fill, computed the same way the
+        // pipeline computes its own -t. A variant of this item has to fill
+        // the same range, and cannot work it out from the item alone once
+        // this session has joined the item partway through
+        let pipeline_duration_ms = std::cmp::min(
+            audio_timing.out_point.saturating_sub(audio_timing.in_point),
+            video_timing.out_point.saturating_sub(video_timing.in_point),
+        )
+        .as_millis() as u64;
+
         self.playlist_manager
             .lock()
             .await
-            .before_new_pipeline(pts_offset, subtitle_source, &current_item.id, is_templated)
+            .before_new_pipeline(
+                pts_offset,
+                subtitle_source,
+                &current_item.id,
+                pipeline_duration_ms,
+                is_templated,
+            )
             .await?;
 
         // stream current item
@@ -1457,6 +1485,21 @@ fn source_is_templated(source: &PlayoutItemSource) -> bool {
     }
 }
 
+/// How far into an item the shared session began reading, derived from the
+/// envelope it declared for that item.
+///
+/// A session that starts an item from its beginning declares the item's whole
+/// duration, giving an offset of zero. One that joins the item partway through
+/// declares only the remainder, and the shortfall is how far in it started.
+///
+/// This is what makes a variant's `progress_ms` usable. That value counts the
+/// shared session's published output, measured from wherever it began reading
+/// rather than from the item's start, so it is an item offset only when the
+/// two coincide.
+fn shared_join_offset_ms(item_duration_ms: u64, shared_duration_ms: u64) -> u64 {
+    item_duration_ms.saturating_sub(shared_duration_ms)
+}
+
 fn source_is_live(source: &PlayoutItemSource) -> bool {
     matches!(
         source,
@@ -1527,5 +1570,89 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a variant ends up producing, given the item and what the shared
+    /// session declared and has published so far. Mirrors what `run_variant`
+    /// derives and what `input_timing` then computes for a live source.
+    fn variant_envelope(
+        item_duration_ms: u64,
+        shared_duration_ms: u64,
+        progress_ms: u64,
+    ) -> (u64, u64) {
+        let join = shared_join_offset_ms(item_duration_ms, shared_duration_ms);
+        let position = (join + progress_ms).min(item_duration_ms);
+        (progress_ms, item_duration_ms - position)
+    }
+
+    #[test]
+    fn a_shared_session_that_started_the_item_has_no_join_offset() {
+        assert_eq!(shared_join_offset_ms(113_000, 113_000), 0);
+    }
+
+    #[test]
+    fn a_shared_session_that_joined_late_reports_how_far_in_it_started() {
+        // channel 32, item 11866757: the item's slot is 113s and the shared
+        // session declared 58.58s, so it began 54.42s into the item
+        assert_eq!(shared_join_offset_ms(113_000, 58_580), 54_420);
+    }
+
+    #[test]
+    fn a_variant_of_an_item_started_from_zero_fills_the_whole_remainder() {
+        // channel 11, item 11866490: shared declared the full 113s at
+        // progress 0, and the variant matched it exactly
+        let (pts_from, duration) = variant_envelope(113_000, 113_000, 0);
+
+        assert_eq!(pts_from, 0);
+        assert_eq!(duration, 113_000);
+    }
+
+    #[test]
+    fn a_variant_of_a_late_joined_item_stops_where_the_shared_envelope_stops() {
+        // channel 32: the variant used to be given the item's whole remaining
+        // slot (97s) against a shared envelope of only 58.58s. It must fill
+        // the 42.58s the shared session has left instead
+        let (pts_from, duration) = variant_envelope(113_000, 58_580, 16_000);
+
+        assert_eq!(pts_from, 16_000);
+        assert_eq!(duration, 42_580);
+        assert_eq!(
+            pts_from + duration,
+            58_580,
+            "must end with the shared envelope"
+        );
+    }
+
+    #[test]
+    fn a_variant_produces_nothing_once_the_shared_envelope_is_covered() {
+        // channel 13, item 11865804: the shared session joined 4.755s before
+        // the item ended and had already published past that, yet the variant
+        // was handed 131s of work
+        let (_, duration) = variant_envelope(136_000, 4_755, 4_766);
+
+        assert_eq!(duration, 0);
+    }
+
+    #[test]
+    fn a_variant_envelope_always_ends_with_the_shared_one() {
+        // the invariant the whole substitution rests on, over a spread of
+        // join distances and coverage points
+        for shared_duration in [1_000u64, 4_755, 58_580, 112_999, 113_000] {
+            for progress in [0u64, 1, 4_000, 16_000, 58_000] {
+                let (pts_from, duration) = variant_envelope(113_000, shared_duration, progress);
+                if progress <= shared_duration {
+                    assert_eq!(
+                        pts_from + duration,
+                        shared_duration,
+                        "shared={shared_duration} progress={progress}"
+                    );
+                }
+            }
+        }
     }
 }

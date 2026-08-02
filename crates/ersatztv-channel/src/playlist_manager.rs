@@ -117,6 +117,7 @@ impl PlaylistManager {
         new_pts_offset: Option<PtsOffset>,
         new_subtitle_source: Option<SubtitleSource>,
         item_id: &str,
+        duration_ms: u64,
         templated: bool,
     ) -> Result<(), ChannelError> {
         self.update().await?;
@@ -128,6 +129,7 @@ impl PlaylistManager {
         self.pipelines.push(SidecarPipeline {
             item_id: item_id.to_owned(),
             pts_offset_ms: new_pts_offset.unwrap_or_default().duration.as_millis() as u64,
+            duration_ms,
             templated,
         });
 
@@ -587,11 +589,13 @@ mod tests {
             SidecarPipeline {
                 item_id: String::from("item-a"),
                 pts_offset_ms: 0,
+                duration_ms: 8000,
                 templated: false,
             },
             SidecarPipeline {
                 item_id: String::from("item-b"),
                 pts_offset_ms: 8000,
+                duration_ms: 8000,
                 templated: true,
             },
         ];
@@ -631,11 +635,13 @@ mod tests {
             SidecarPipeline {
                 item_id: String::from("item-a"),
                 pts_offset_ms: 0,
+                duration_ms: 8000,
                 templated: false,
             },
             SidecarPipeline {
                 item_id: String::from("item-b"),
                 pts_offset_ms: 8000,
+                duration_ms: 8000,
                 templated: true,
             },
         ];
