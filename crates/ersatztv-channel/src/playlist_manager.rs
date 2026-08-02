@@ -331,7 +331,13 @@ impl PlaylistManager {
     ) -> Result<String, ChannelError> {
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
-        playlist.push_str("#EXT-X-VERSION:7\n");
+        // version 6 is the lowest that carries the semantics this playlist
+        // relies on: rfc8216bis 8 notes that from version 6 on,
+        // EXT-X-TARGETDURATION is the maximum segment duration rounded to the
+        // nearest integer. Nothing here needs 7 (no EXT-X-MAP, no INSTREAM-ID
+        // SERVICE values), and 6.2.1 asks servers not to declare more than the
+        // playlist requires
+        playlist.push_str("#EXT-X-VERSION:6\n");
         playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", self.target_duration));
 
         let (skip, limit) = match max_segments {
