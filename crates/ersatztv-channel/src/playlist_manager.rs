@@ -13,6 +13,10 @@ use time::macros::format_description;
 
 const MIN_SEGMENTS: usize = 4;
 
+/// How much media is kept behind the live edge before segments are trimmed
+/// and their files deleted. Two minutes.
+const HISTORY_DURATION: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct SubtitleSource {
     pub cues: Arc<Vec<Cue>>,
@@ -224,7 +228,7 @@ impl PlaylistManager {
         }
 
         // trim old segments
-        let cutoff = OffsetDateTime::now_utc() - Duration::from_mins(2);
+        let cutoff = self.trim_cutoff();
         while !self.segments.is_empty() && self.segments[0].program_date_time < cutoff {
             if let Some(removed) = self.segments.remove(0) {
                 self.media_sequence += 1;
@@ -342,6 +346,22 @@ impl PlaylistManager {
         }
 
         skip
+    }
+
+    /// The program date time before which segments have aged out of the
+    /// history window, measured from this playlist's own live edge.
+    ///
+    /// Program date times advance with produced media, not with the wall
+    /// clock: `last_segment_end` is seeded from the channel start time and
+    /// only ever moves by a segment duration. A channel that cannot sustain
+    /// realtime, because a source underdelivers or the transcode is too slow
+    /// for the hardware, therefore falls behind the wall clock and stays
+    /// behind until it catches up. Measuring the cutoff against the wall
+    /// clock in that state keeps only `HISTORY_DURATION` minus the lag, and
+    /// keeps nothing at all once the lag reaches `HISTORY_DURATION`, which
+    /// deletes segment files that playlists being served still reference.
+    fn trim_cutoff(&self) -> OffsetDateTime {
+        self.last_segment_end - HISTORY_DURATION
     }
 
     fn generate_playlist(
@@ -694,5 +714,66 @@ mod tests {
         assert!(first.contains("early"));
         assert!(!second.contains("early"));
         assert!(second.contains("later"));
+    }
+
+    /// A window of `segment_count` four-second segments starting at
+    /// `channel_start`, with the live edge advanced exactly as `update`
+    /// advances it when it appends a segment.
+    fn window_anchored_at(channel_start: OffsetDateTime, segment_count: u64) -> PlaylistManager {
+        let mut m = manager();
+        for i in 0..segment_count {
+            m.segments.push_back(Segment {
+                path: format!("live{i:06}.ts"),
+                duration: 4.0,
+                program_date_time: channel_start + Duration::from_secs(i * 4),
+                item_id: String::from("item-a"),
+            });
+        }
+        m.last_segment_end = channel_start + Duration::from_secs(segment_count * 4);
+        m
+    }
+
+    /// The leading segments `update` would trim and delete.
+    fn expired(m: &PlaylistManager) -> usize {
+        let cutoff = m.trim_cutoff();
+        m.segments
+            .iter()
+            .take_while(|s| s.program_date_time < cutoff)
+            .count()
+    }
+
+    #[test]
+    fn keeps_two_minutes_of_media_behind_the_live_edge() {
+        // 40 four-second segments is 160s of media, so 40s of it has aged out
+        let m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
+
+        assert_eq!(expired(&m), 10);
+        assert_eq!(
+            (m.segments.len() - expired(&m)) as u64 * 4,
+            HISTORY_DURATION.as_secs()
+        );
+    }
+
+    #[test]
+    fn history_survives_a_channel_running_behind_the_wall_clock() {
+        // a channel whose source underdelivers falls behind the wall clock,
+        // and its program date times fall behind with it. the retained window
+        // must not shrink by the lag, because these files are still
+        // referenced by the playlists being served
+        let on_time = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
+        let behind = window_anchored_at(
+            OffsetDateTime::now_utc() - Duration::from_secs(97 + 160),
+            40,
+        );
+
+        assert_eq!(expired(&behind), expired(&on_time));
+    }
+
+    #[test]
+    fn nothing_is_trimmed_before_the_window_fills() {
+        // 10 segments is 40s of media, well inside the history window
+        let m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 10);
+
+        assert_eq!(expired(&m), 0);
     }
 }
