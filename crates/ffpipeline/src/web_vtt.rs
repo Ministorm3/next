@@ -115,16 +115,16 @@ fn parse_internal(body: &str) -> Result<Vec<Cue>, FFPipelineError> {
                 }
             }
             ParseState::Body => {
-                if line.contains(" --> ") {
-                    let split: Vec<&str> = line.split(" --> ").collect();
-                    if split.len() == 2
-                        && let Some(parsed_start) = parse_timestamp(split[0])
-                        && let Some(parsed_end) = parse_timestamp(split[1])
-                    {
-                        parse_state = ParseState::Cue;
-                        start = parsed_start;
-                        end = parsed_end;
-                    }
+                // the webvtt grammar separates the timestamps from the arrow
+                // with any run of spaces or tabs, and allows a cue settings
+                // list after the end timestamp
+                if let Some((raw_start, raw_end)) = line.split_once("-->")
+                    && let Some(parsed_start) = parse_timestamp(raw_start.trim())
+                    && let Some(parsed_end) = parse_timestamp(first_token(raw_end))
+                {
+                    parse_state = ParseState::Cue;
+                    start = parsed_start;
+                    end = parsed_end;
                 }
             }
             ParseState::Cue => {
@@ -157,6 +157,12 @@ fn parse_internal(body: &str) -> Result<Vec<Cue>, FFPipelineError> {
     Ok(result)
 }
 
+/// The first whitespace-delimited token, which for the right half of a cue
+/// timing line is the end timestamp, dropping any cue settings list after it.
+fn first_token(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or_default()
+}
+
 fn parse_timestamp(s: &str) -> Option<Duration> {
     let mut parts: Vec<&str> = s.split(':').collect();
 
@@ -180,6 +186,54 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn vtt_should_parse_cue_settings() {
+        let vtt_text = r"WEBVTT
+
+00:00:00.500 --> 00:00:02.000 line:85% align:middle
+positioned cue
+
+00:00:02.500 --> 00:00:04.300 position:50%
+second positioned cue
+";
+
+        let parsed = parse_internal(vtt_text).unwrap_or_default();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].start, Duration::from_secs_f64(0.5));
+        assert_eq!(parsed[0].end, Duration::from_secs(2));
+        assert_eq!(parsed[0].text, "positioned cue");
+        assert_eq!(parsed[1].end, Duration::from_secs_f64(4.3));
+        assert_eq!(parsed[1].text, "second positioned cue");
+    }
+
+    #[test]
+    fn vtt_should_parse_tab_and_multi_space_separators() {
+        let vtt_text = "WEBVTT\n\n00:00:00.500\t-->\t00:00:02.000\ntab separated\n\n00:00:02.500  -->  00:00:04.300\ntwo spaces\n";
+
+        let parsed = parse_internal(vtt_text).unwrap_or_default();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].text, "tab separated");
+        assert_eq!(parsed[0].end, Duration::from_secs(2));
+        assert_eq!(parsed[1].text, "two spaces");
+        assert_eq!(parsed[1].start, Duration::from_secs_f64(2.5));
+    }
+
+    #[test]
+    fn vtt_should_ignore_arrow_in_cue_text() {
+        let vtt_text = r"WEBVTT
+
+00:00:00.500 --> 00:00:02.000
+an arrow --> in the payload
+";
+
+        let parsed = parse_internal(vtt_text).unwrap_or_default();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, "an arrow --> in the payload");
+    }
 
     #[test]
     fn vtt_should_parse() {
