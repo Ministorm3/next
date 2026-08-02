@@ -240,9 +240,22 @@ async fn fix_content_types(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let is_m3u8 = request.uri().path().ends_with(".m3u8");
+    let path = request.uri().path();
+    // mime_guess maps .ts to a dlna vendor type that describes 192-byte
+    // timestamped packets; these segments are plain mpeg-2 transport streams,
+    // which iana registers as video/MP2T
+    let content_type = if path.ends_with(".m3u8") {
+        Some("application/vnd.apple.mpegurl")
+    } else if path.ends_with(".ts") {
+        Some("video/MP2T")
+    } else {
+        None
+    };
+
     let mut response = next.run(request).await;
-    if is_m3u8 && let Ok(value) = "application/vnd.apple.mpegurl".parse() {
+    if let Some(content_type) = content_type
+        && let Ok(value) = content_type.parse()
+    {
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, value);
