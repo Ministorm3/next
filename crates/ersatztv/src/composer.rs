@@ -45,7 +45,6 @@ pub struct ComposedEntry {
     pub duration: f64,
     pub program_date_time: OffsetDateTime,
     pub discontinuity: bool,
-    pub item_id: String,
 }
 
 /// Per-cohort-session playlist state. Entries are append-only; the head trims
@@ -327,7 +326,6 @@ pub fn compose_timeline(
                                 discontinuity: variant_index == 0
                                     || vseg.discontinuity
                                     || segment.discontinuity,
-                                item_id: segment.item_id.clone(),
                             });
                             variant_index += 1;
                             substituting = true;
@@ -357,7 +355,6 @@ pub fn compose_timeline(
                             duration: segment.duration,
                             program_date_time: pdt,
                             discontinuity: substituting || segment.discontinuity,
-                            item_id: segment.item_id.clone(),
                         });
                         substituting = false;
                         continue;
@@ -382,7 +379,6 @@ pub fn compose_timeline(
             duration: segment.duration,
             program_date_time: pdt,
             discontinuity: segment.discontinuity,
-            item_id: segment.item_id.clone(),
         });
     }
 
