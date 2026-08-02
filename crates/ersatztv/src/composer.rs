@@ -235,12 +235,13 @@ impl SessionPlaylist {
 
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
-        playlist.push_str("#EXT-X-VERSION:7\n");
+        // the composed playlist follows the shared playlist's declarations:
+        // version 6 for the rounded EXT-X-TARGETDURATION semantics, and the
+        // discontinuity sequence present even at zero
+        playlist.push_str("#EXT-X-VERSION:6\n");
         playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{clamped_ms}\n"));
-        if effective_ds > 0 {
-            playlist.push_str(&format!("#EXT-X-DISCONTINUITY-SEQUENCE:{effective_ds}\n"));
-        }
+        playlist.push_str(&format!("#EXT-X-DISCONTINUITY-SEQUENCE:{effective_ds}\n"));
         playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
         for entry in self.entries.iter().skip(skip).take(SERVED_SEGMENTS) {
