@@ -253,6 +253,26 @@ impl PlaylistManager {
         Ok(())
     }
 
+    /// The largest number of leading segments that can be dropped from the
+    /// served window while keeping at least three target durations of media,
+    /// per rfc8216bis 6.2.2. Returns 0 when the manager does not yet hold
+    /// that much, which is only true during channel startup.
+    fn max_skip_for_window(&self) -> usize {
+        let minimum = (self.target_duration * 3) as f64;
+
+        let mut kept = 0.0;
+        let mut skip = self.segments.len();
+        for segment in self.segments.iter().rev() {
+            if kept >= minimum {
+                break;
+            }
+            kept += segment.duration;
+            skip -= 1;
+        }
+
+        skip
+    }
+
     fn generate_playlist(
         &mut self,
         path_map: fn(&str) -> String,
@@ -273,6 +293,15 @@ impl PlaylistManager {
                     .iter()
                     .position(|s| s.program_date_time >= anchor)
                     .unwrap_or_else(|| self.segments.len().saturating_sub(max));
+
+                // rfc8216bis 6.2.2 forbids trimming a playlist without an
+                // EXT-X-ENDLIST tag below three times the target duration.
+                // The anchor alone can cross that floor whenever segment
+                // production pauses, e.g. while a pipeline restarts at an
+                // item boundary, so hold back enough of the tail to stay
+                // above it. Applied before the monotonic clamp, since the
+                // media sequence must never move backwards to obey this.
+                let candidate_skip = candidate_skip.min(self.max_skip_for_window());
 
                 // monotonic clamp
                 let candidate_ms = self.media_sequence + candidate_skip as u64;
@@ -395,4 +424,58 @@ fn render_subtitle_segment(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager(segment_count: usize) -> PlaylistManager {
+        let folder = std::env::temp_dir();
+        let mut m = PlaylistManager::new(
+            OffsetDateTime::UNIX_EPOCH,
+            4,
+            folder.clone(),
+            folder.join(".ready-test"),
+            PlaylistManagerOutputFiles {
+                generated_playlist_file: String::from("live.m3u8"),
+                ffmpeg_playlist_file: String::from("ffmpeg.m3u8"),
+                generated_subtitle_playlist_file: String::from("live_sub.m3u8"),
+            },
+        );
+
+        for i in 0..segment_count {
+            m.segments.push_back(Segment {
+                path: format!("live{i:06}.ts"),
+                duration: 4.0,
+                program_date_time: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(i as u64 * 4),
+            });
+        }
+
+        m
+    }
+
+    #[test]
+    fn window_keeps_three_target_durations() {
+        // 10 segments of 4s against a target of 4: three target durations is
+        // 12s, so the last 3 segments can never be skipped past
+        let m = manager(10);
+        assert_eq!(m.max_skip_for_window(), 7);
+    }
+
+    #[test]
+    fn window_skip_is_zero_before_three_target_durations_exist() {
+        let m = manager(2);
+        assert_eq!(m.max_skip_for_window(), 0);
+    }
+
+    #[test]
+    fn window_accounts_for_actual_segment_durations() {
+        // one 12s segment already covers three target durations on its own
+        let mut m = manager(4);
+        if let Some(last) = m.segments.back_mut() {
+            last.duration = 12.0;
+        }
+        assert_eq!(m.max_skip_for_window(), 3);
+    }
 }
