@@ -22,6 +22,7 @@ use crate::output_settings::{
     OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions, YadifOptions,
 };
 use crate::overlay_filter::{OverlayFilter, OverlaySource, SoftwareOverlay};
+use crate::probe::ProbeResultVideoStream;
 use crate::video_codec::VideoCodec;
 use crate::video_decoder::VideoDecoder;
 use crate::video_filter::{
@@ -504,30 +505,11 @@ impl Pipeline {
             && let Some(height) = watermark_stream.height
             && let Some(width) = watermark_stream.width
         {
-            let extra_input_args = if watermark_stream.is_still_image() {
-                args![
-                    "-loop",
-                    "1",
-                    "-framerate",
-                    output_context.media_frame_rate.r_frame_rate.clone(),
-                    "-t",
-                    format!("{}ms", duration.as_millis())
-                ]
-            } else if watermark_stream.codec == "gif" || watermark_stream.codec == "apng" {
-                args![
-                    "-ignore_loop",
-                    "0",
-                    "-t",
-                    format!("{}ms", duration.as_millis())
-                ]
-            } else {
-                args![
-                    "-stream_loop",
-                    "-1",
-                    "-t",
-                    format!("{}ms", duration.as_millis())
-                ]
-            };
+            let extra_input_args = watermark_input_args(
+                watermark_stream,
+                &output_context.media_frame_rate.r_frame_rate,
+                duration,
+            );
 
             inputs.push(PipelineInput::Watermark {
                 input: watermark_input.clone(),
@@ -920,9 +902,118 @@ pub fn generate_pipeline(
     Pipeline::full(ffmpeg_info, input_settings, output_settings)
 }
 
+/// Input arguments for a watermark, chosen by how the watermark decodes.
+///
+/// Still images pin `-f image2`. Without it ffmpeg probes the file and picks a
+/// `*_pipe` demuxer, which reads the input as a stream of concatenated images
+/// rather than one image. Anything the decoder cannot consume as a complete
+/// image is then treated as the start of the next one, and under `-loop 1` that
+/// is retried forever, so the watermark input never yields a frame and the
+/// filter graph starves. Legacy stores channel artwork hash-named with no
+/// extension, so there is no filename for ffmpeg to infer the format from.
+fn watermark_input_args(
+    watermark_stream: &ProbeResultVideoStream,
+    frame_rate: &str,
+    duration: Duration,
+) -> ArgVec {
+    if watermark_stream.is_still_image() {
+        args![
+            "-f",
+            "image2",
+            "-loop",
+            "1",
+            "-framerate",
+            frame_rate.to_owned(),
+            "-t",
+            format!("{}ms", duration.as_millis())
+        ]
+    } else if watermark_stream.codec == "gif" || watermark_stream.codec == "apng" {
+        args![
+            "-ignore_loop",
+            "0",
+            "-t",
+            format!("{}ms", duration.as_millis())
+        ]
+    } else {
+        args![
+            "-stream_loop",
+            "-1",
+            "-t",
+            format!("{}ms", duration.as_millis())
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::{CodecType, ProbeResultColorParams};
+
+    fn watermark_stream(codec: &str) -> ProbeResultVideoStream {
+        ProbeResultVideoStream {
+            stream_index: 0,
+            codec: String::from(codec),
+            codec_type: CodecType::Video,
+            profile: String::new(),
+            height: Some(64),
+            width: Some(64),
+            frame_rate: FrameRate::parse("25"),
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            pix_fmt: String::from("rgba"),
+            color_params: ProbeResultColorParams::default(),
+            field_order: None,
+        }
+    }
+
+    fn has_pair(args: &ArgVec, flag: &str, value: &str) -> bool {
+        args.windows(2)
+            .any(|w| w[0].as_ref() == flag && w[1].as_ref() == value)
+    }
+
+    #[test]
+    fn still_image_watermark_pins_the_image2_demuxer() {
+        for codec in ["png", "mjpeg", "bmp", "tiff"] {
+            let args = watermark_input_args(
+                &watermark_stream(codec),
+                "24000/1001",
+                Duration::from_secs(44),
+            );
+
+            assert!(
+                has_pair(&args, "-f", "image2"),
+                "{codec} watermark must pin -f image2, got {args:?}"
+            );
+            assert!(has_pair(&args, "-loop", "1"), "{codec} must loop");
+            assert!(
+                has_pair(&args, "-framerate", "24000/1001"),
+                "{codec} must carry the output frame rate"
+            );
+            assert!(has_pair(&args, "-t", "44000ms"), "{codec} must be bounded");
+        }
+    }
+
+    #[test]
+    fn animated_and_video_watermarks_do_not_pin_a_demuxer() {
+        for codec in ["gif", "apng", "h264"] {
+            let args =
+                watermark_input_args(&watermark_stream(codec), "25", Duration::from_secs(10));
+
+            assert!(
+                !args.iter().any(|a| a.as_ref() == "image2"),
+                "{codec} is not a still image and must not pin image2, got {args:?}"
+            );
+            assert!(has_pair(&args, "-t", "10000ms"), "{codec} must be bounded");
+        }
+    }
+
+    #[test]
+    fn animated_watermarks_loop_without_reopening_the_input() {
+        for codec in ["gif", "apng"] {
+            let args = watermark_input_args(&watermark_stream(codec), "25", Duration::from_secs(1));
+            assert!(has_pair(&args, "-ignore_loop", "0"), "{codec} must loop");
+        }
+    }
 
     #[test]
     fn device_name_returns_correct_ffmpeg_device_strings() {
