@@ -3,7 +3,7 @@
 //! A viewer cohort is identified by the custom query parameters a request
 //! carries, restricted to the `{query:}` variable names the channel's playout
 //! actually references (published by the worker; see
-//! [`ersatztv_core::RECOGNIZED_PARAMS_FILE_NAME`]). Restricting matters
+//! [`crate::RECOGNIZED_PARAMS_FILE_NAME`]). Restricting matters
 //! because players and proxies routinely append parameters of their own, and
 //! a parameter that cannot change what is played must not mint a cohort.
 
@@ -26,7 +26,7 @@ const ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// empty set when the worker has not published any (no templated items, or
 /// the worker has not started).
 pub async fn read_recognized_params(output_folder: &Path) -> BTreeSet<String> {
-    let path = output_folder.join(ersatztv_core::RECOGNIZED_PARAMS_FILE_NAME);
+    let path = output_folder.join(crate::RECOGNIZED_PARAMS_FILE_NAME);
     match tokio::fs::read_to_string(&path).await {
         Ok(json) => serde_json::from_str::<Vec<String>>(&json)
             .map(|names| names.into_iter().collect())

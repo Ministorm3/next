@@ -15,8 +15,6 @@ use ersatztv_core::sidecar::{PlaylistSidecar, SIDECAR_SUFFIX};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
-use crate::channel_model::ChannelModel;
-use crate::channel_session::channel_binary_path;
 use crate::composer::SessionPlaylist;
 
 const MAX_SESSIONS_PER_CHANNEL: usize = 4;
@@ -28,6 +26,25 @@ const SESSION_IDLE_SECONDS: u64 = 60;
 
 const VARIANTS_FOLDER: &str = "variants";
 
+/// The channel a variant session belongs to: where its shared session writes,
+/// and how to launch a variant worker for it. Held by value so a caller in
+/// either process can describe its own channel; the standalone server builds
+/// this from its channel model, a worker from its own arguments.
+pub struct VariantChannel {
+    /// Channel number, passed to the variant worker as `--number`.
+    pub number: String,
+    /// The shared session's output folder. Variants transcode into
+    /// `variants/{cohort}` beneath it, so they are served by the same static
+    /// file handler that serves the shared session.
+    pub output_folder: PathBuf,
+    /// The `ersatztv-channel` binary that transcodes a variant.
+    pub channel_binary: PathBuf,
+    /// Config sources for the variant worker, in merge order: the channel's
+    /// own config first, then any overlays.
+    pub config_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
 pub struct VariantManager {
     sessions: Mutex<HashMap<String, VariantSession>>,
 }
@@ -45,9 +62,7 @@ struct VariantSession {
 
 impl VariantManager {
     pub fn new() -> VariantManager {
-        VariantManager {
-            sessions: Mutex::new(HashMap::new()),
-        }
+        VariantManager::default()
     }
 
     /// Serves a cohort's composed playlist, spawning variant workers as
@@ -56,13 +71,13 @@ impl VariantManager {
     /// in which case the caller falls through to the shared playlist.
     pub async fn handle_playlist_request(
         &self,
-        channel: &ChannelModel,
+        channel: &VariantChannel,
         cohort_query: &str,
         subtitles: bool,
     ) -> Option<String> {
-        let shared = read_sidecar(&channel.output_folder().join("live.m3u8")).await?;
+        let shared = read_sidecar(&channel.output_folder.join("live.m3u8")).await?;
 
-        let key = format!("{}|{}", channel.number(), cohort_query);
+        let key = format!("{}|{}", channel.number, cohort_query);
         let mut sessions = self.sessions.lock().await;
 
         reap_idle(&mut sessions);
@@ -70,26 +85,26 @@ impl VariantManager {
         if !sessions.contains_key(&key) {
             let per_channel = sessions
                 .values()
-                .filter(|s| s.channel_number == channel.number())
+                .filter(|s| s.channel_number == channel.number)
                 .count();
             if per_channel >= MAX_SESSIONS_PER_CHANNEL || sessions.len() >= MAX_SESSIONS_TOTAL {
                 log::warn!(
                     "variant session cap reached; serving shared content to cohort '{cohort_query}' on channel {}",
-                    channel.number()
+                    channel.number
                 );
                 return None;
             }
 
             let folder_name = cohort_folder_name(cohort_query);
             let folder = channel
-                .output_folder()
+                .output_folder
                 .join(VARIANTS_FOLDER)
                 .join(&folder_name);
 
             sessions.insert(
                 key.clone(),
                 VariantSession {
-                    channel_number: channel.number().to_owned(),
+                    channel_number: channel.number.clone(),
                     cohort_query: cohort_query.to_owned(),
                     folder,
                     variant_prefix: format!("{VARIANTS_FOLDER}/{folder_name}/"),
@@ -142,7 +157,7 @@ impl VariantManager {
 /// pts offset so both transcodes occupy the same envelope.
 async fn spawn_missing_variants(
     session: &mut VariantSession,
-    channel: &ChannelModel,
+    channel: &VariantChannel,
     shared: &PlaylistSidecar,
 ) {
     for pipeline in shared.pipelines.iter().filter(|p| p.templated) {
@@ -150,11 +165,6 @@ async fn spawn_missing_variants(
             continue;
         }
         session.spawned_items.insert(pipeline.item_id.clone());
-
-        let Ok(binary) = channel_binary_path() else {
-            log::error!("cannot spawn variant: channel binary not found");
-            continue;
-        };
 
         if let Err(e) = tokio::fs::create_dir_all(&session.folder).await {
             log::error!("cannot create variant folder: {e}");
@@ -186,18 +196,18 @@ async fn spawn_missing_variants(
         log::info!(
             "spawning variant for item {} on channel {} (cohort '{}', progress {}ms of a {}ms envelope)",
             pipeline.item_id,
-            channel.number(),
+            channel.number,
             session.cohort_query,
             progress_ms,
             pipeline.duration_ms
         );
 
-        let spawned = tokio::process::Command::new(binary)
+        let spawned = tokio::process::Command::new(&channel.channel_binary)
             .arg("variant")
             .arg("--output-folder")
             .arg(&session.folder)
             .arg("--number")
-            .arg(channel.number())
+            .arg(&channel.number)
             .arg("--item-id")
             .arg(&pipeline.item_id)
             .arg("--pts-offset-ms")
@@ -208,8 +218,7 @@ async fn spawn_missing_variants(
             .arg(pipeline.duration_ms.to_string())
             .arg("--params")
             .arg(&session.cohort_query)
-            .arg(channel.config_path())
-            .args(channel.overlay_paths())
+            .args(&channel.config_paths)
             .spawn();
 
         match spawned {

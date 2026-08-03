@@ -10,6 +10,7 @@ env_logger = { workspace = true }
 ersatztv-core = { workspace = true }
 ersatztv-playout = { workspace = true }
 ffpipeline = { workspace = true }
+filetime = { workspace = true }
 futures-core = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }

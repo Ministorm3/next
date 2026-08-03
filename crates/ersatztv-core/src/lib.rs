@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
 
+pub mod cohort;
 mod merge;
 mod path_resolve;
 pub mod sidecar;

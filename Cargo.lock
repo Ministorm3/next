@@ -419,10 +419,10 @@ dependencies = [
  "axum",
  "clap",
  "env_logger",
+ "ersatztv-channel",
  "ersatztv-core",
  "filetime",
  "log",
- "percent-encoding",
  "quick-xml",
  "schemars",
  "serde",
@@ -446,6 +446,7 @@ dependencies = [
  "ersatztv-core",
  "ersatztv-playout",
  "ffpipeline",
+ "filetime",
  "futures-core",
  "log",
  "reqwest",
@@ -466,6 +467,7 @@ dependencies = [
 name = "ersatztv-core"
 version = "0.1.0"
 dependencies = [
+ "percent-encoding",
  "serde",
  "serde_json",
  "simple-expand-tilde",

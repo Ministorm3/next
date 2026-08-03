@@ -1,9 +1,6 @@
 mod channel_model;
 mod channel_session;
-mod cohort;
-mod composer;
 mod scaffold;
-mod variant_manager;
 mod xmltv;
 
 use std::collections::HashMap;
@@ -16,6 +13,8 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
 use ersatztv::error::LineupError;
+use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
+use ersatztv_core::cohort;
 use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder};
 use tokio::signal;
 use tokio::sync::Mutex;
@@ -139,7 +138,7 @@ async fn run() -> Result<(), LineupError> {
                 channels,
                 xmltv_folder: lineup_config.xmltv.map(|c| c.folder),
                 active: Arc::new(Mutex::new(HashMap::new())),
-                variants: variant_manager::VariantManager::new(),
+                variants: VariantManager::new(),
             });
 
             let addr = format!(
@@ -233,7 +232,7 @@ struct LineupState {
     channels: Vec<ChannelModel>,
     xmltv_folder: Option<String>,
     active: Arc<Mutex<HashMap<String, ChannelSession>>>,
-    variants: variant_manager::VariantManager,
+    variants: VariantManager,
 }
 
 async fn fix_content_types(
@@ -481,9 +480,22 @@ async fn maybe_composed_playlist(
 
     let cohort_query = cohort::to_query_string(&cohort_parameters);
 
+    // a variant transcode is the channel binary run against the same config
+    // sources as the shared session; without it there is nothing to compose,
+    // so the cohort falls through to shared content
+    let mut config_paths = vec![channel.config_path().to_path_buf()];
+    config_paths.extend(channel.overlay_paths().iter().cloned());
+
+    let variant_channel = VariantChannel {
+        number: channel.number().to_owned(),
+        output_folder: channel.output_folder().to_path_buf(),
+        channel_binary: channel_session::channel_binary_path().ok()?,
+        config_paths,
+    };
+
     let playlist = state
         .variants
-        .handle_playlist_request(channel, &cohort_query, subtitles)
+        .handle_playlist_request(&variant_channel, &cohort_query, subtitles)
         .await?;
 
     Some(
