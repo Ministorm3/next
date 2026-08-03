@@ -419,7 +419,6 @@ dependencies = [
  "axum",
  "clap",
  "env_logger",
- "ersatztv-channel",
  "ersatztv-core",
  "filetime",
  "log",
@@ -471,6 +470,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simple-expand-tilde",
+ "tempfile",
  "tokio",
 ]
 

@@ -13,8 +13,8 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
 use ersatztv::error::LineupError;
-use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
 use ersatztv_core::cohort;
+use ersatztv_core::variant_request;
 use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder};
 use tokio::signal;
 use tokio::sync::Mutex;
@@ -138,7 +138,6 @@ async fn run() -> Result<(), LineupError> {
                 channels,
                 xmltv_folder: lineup_config.xmltv.map(|c| c.folder),
                 active: Arc::new(Mutex::new(HashMap::new())),
-                variants: VariantManager::new(),
             });
 
             let addr = format!(
@@ -232,7 +231,6 @@ struct LineupState {
     channels: Vec<ChannelModel>,
     xmltv_folder: Option<String>,
     active: Arc<Mutex<HashMap<String, ChannelSession>>>,
-    variants: VariantManager,
 }
 
 async fn fix_content_types(
@@ -440,8 +438,12 @@ async fn session_middleware(
 }
 
 /// Serves a composed per-cohort playlist for `/{channel}/live.m3u8` and
-/// `/{channel}/live_sub.m3u8` requests whose query contains recognized cohort
-/// parameters. Returns None to fall through to the shared playlist.
+/// `/{channel}/live_sub.m3u8` requests carrying a query.
+///
+/// The query is handed to the channel's worker rather than interpreted here:
+/// recognizing a cohort parameter depends on the playout the worker is
+/// running. Returns None whenever the worker has not published a playlist for
+/// this query, which falls the request through to the shared playlist.
 async fn maybe_composed_playlist(
     state: &Arc<LineupState>,
     path: &str,
@@ -468,35 +470,19 @@ async fn maybe_composed_playlist(
         .iter()
         .find(|c| c.number() == channel_number)?;
 
-    let query_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect();
+    // publishing the query both asks the worker to resolve it and keeps the
+    // resulting cohort's transcode alive; the worker owns the resolution
+    // because only it knows what the current playout recognizes
+    let _ = variant_request::publish_request(channel.output_folder(), query).await;
+    let cohort = variant_request::read_answer(channel.output_folder(), query).await?;
 
-    let recognized = cohort::read_recognized_params(channel.output_folder()).await;
-    let cohort_parameters = cohort::cohort_parameters(&query_pairs, &recognized);
-    if cohort_parameters.is_empty() {
-        return None;
-    }
-
-    let cohort_query = cohort::to_query_string(&cohort_parameters);
-
-    // a variant transcode is the channel binary run against the same config
-    // sources as the shared session; without it there is nothing to compose,
-    // so the cohort falls through to shared content
-    let mut config_paths = vec![channel.config_path().to_path_buf()];
-    config_paths.extend(channel.overlay_paths().iter().cloned());
-
-    let variant_channel = VariantChannel {
-        number: channel.number().to_owned(),
-        output_folder: channel.output_folder().to_path_buf(),
-        channel_binary: channel_session::channel_binary_path().ok()?,
-        config_paths,
-    };
-
-    let playlist = state
-        .variants
-        .handle_playlist_request(&variant_channel, &cohort_query, subtitles)
-        .await?;
+    let playlist = tokio::fs::read_to_string(
+        channel
+            .output_folder()
+            .join(variant_request::composed_playlist_name(&cohort, subtitles)),
+    )
+    .await
+    .ok()?;
 
     Some(
         (

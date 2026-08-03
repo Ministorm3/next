@@ -7,7 +7,6 @@ edition = "2024"
 axum = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
-ersatztv-channel = { workspace = true }
 ersatztv-core = { workspace = true }
 filetime = { workspace = true }
 log = { workspace = true }

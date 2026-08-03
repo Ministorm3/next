@@ -6,6 +6,7 @@ pub mod cohort;
 mod merge;
 mod path_resolve;
 pub mod sidecar;
+pub mod variant_request;
 
 pub use merge::deep_merge;
 pub use path_resolve::resolve_relative_paths;

@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::ChannelError;
+use ersatztv_channel::variant_manager;
+use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
 use ersatztv_core::{READY_FILE_NAME, empty_folder};
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -243,6 +245,8 @@ impl ChannelSession {
             }
         });
 
+        self.spawn_variant_loop();
+
         // always work ahead initially
         let realtime = false;
         self.transcode(realtime).await?;
@@ -379,6 +383,39 @@ impl ChannelSession {
         self.playlist_manager.lock().await.update().await?;
 
         Ok(())
+    }
+
+    /// Serves cohort requests for the lifetime of this session: answering
+    /// which cohort a viewer's query resolves to, spawning variant transcodes,
+    /// and publishing each cohort's composed playlists.
+    ///
+    /// Only a shared session does this. A variant session is itself the
+    /// product of one, and must never spawn further variants.
+    fn spawn_variant_loop(&self) {
+        let channel_binary = match std::env::current_exe() {
+            Ok(binary) => binary,
+            Err(e) => {
+                // without our own path there is nothing to spawn variants
+                // with, so cohorts quietly keep receiving shared content
+                log::warn!("cannot locate the channel binary, disabling stream variants: {e}");
+                return;
+            }
+        };
+
+        let channel = VariantChannel {
+            number: self.channel_config.number().to_owned(),
+            output_folder: self.channel_config.expanded_output_folder().clone(),
+            channel_binary,
+            config_json: self.channel_config.merged_source_json(),
+        };
+
+        tokio::spawn(async move {
+            let variants = VariantManager::new();
+            loop {
+                variants.tick(&channel).await;
+                tokio::time::sleep(variant_manager::TICK_INTERVAL).await;
+            }
+        });
     }
 
     /// Publishes the `{query:}` variable names the current playout references
