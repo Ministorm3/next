@@ -410,11 +410,22 @@ impl ChannelSession {
         };
 
         tokio::spawn(async move {
-            let variants = VariantManager::new();
-            loop {
-                variants.tick(&channel).await;
-                tokio::time::sleep(variant_manager::TICK_INTERVAL).await;
-            }
+            let variant_loop = tokio::spawn(async move {
+                let variants = VariantManager::new();
+                loop {
+                    variants.tick(&channel).await;
+                    tokio::time::sleep(variant_manager::TICK_INTERVAL).await;
+                }
+            });
+
+            // the loop never returns on its own, so reaching here means it
+            // panicked. cohorts stop being served the moment their playlists
+            // go stale, but the channel keeps streaming shared content, so
+            // nothing else would reveal that this happened
+            let Err(e) = variant_loop.await;
+            log::error!(
+                "stream variant loop stopped: {e}. cohorts on this channel now fall back to shared content"
+            );
         });
     }
 

@@ -41,8 +41,11 @@ const SESSION_IDLE_SECONDS: u64 = 60;
 const FOLDER_CLEANUP_SECONDS: u64 = 120;
 
 /// How often the worker answers requests and re-renders composed playlists.
-/// Well inside a segment duration, so a reloading client never waits on it.
-pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
+///
+/// Comfortably inside a segment duration, so a reloading client never waits on
+/// it, without sampling the composer's monotonic media-sequence clamp more
+/// often than the content can actually change.
+pub const TICK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The channel a variant session belongs to: where its shared session writes,
 /// and how to launch a variant worker for it.

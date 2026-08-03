@@ -466,6 +466,7 @@ dependencies = [
 name = "ersatztv-core"
 version = "0.1.0"
 dependencies = [
+ "filetime",
  "percent-encoding",
  "serde",
  "serde_json",

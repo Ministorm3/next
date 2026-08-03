@@ -476,13 +476,9 @@ async fn maybe_composed_playlist(
     let _ = variant_request::publish_request(channel.output_folder(), query).await;
     let cohort = variant_request::read_answer(channel.output_folder(), query).await?;
 
-    let playlist = tokio::fs::read_to_string(
-        channel
-            .output_folder()
-            .join(variant_request::composed_playlist_name(&cohort, subtitles)),
-    )
-    .await
-    .ok()?;
+    let playlist =
+        variant_request::read_composed_playlist(channel.output_folder(), &cohort, subtitles)
+            .await?;
 
     Some(
         (

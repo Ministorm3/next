@@ -15,9 +15,20 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Folder beneath a channel's output folder holding every cohort's transcode.
 pub const VARIANTS_FOLDER: &str = "variants";
+
+/// How old a composed playlist may be and still be served.
+///
+/// The worker republishes every live cohort's playlists on each tick, so the
+/// modified time is a liveness signal for the loop that produces them. Without
+/// this check a worker whose variant loop stopped, while its transcode kept
+/// running, would leave a frozen playlist on disk that requesters happily
+/// served forever. It is the one failure that would otherwise not degrade to
+/// shared content.
+pub const PLAYLIST_FRESHNESS: Duration = Duration::from_secs(15);
 
 const REQUESTS_FOLDER: &str = ".requests";
 const ANSWERS_FOLDER: &str = ".answers";
@@ -86,6 +97,34 @@ pub fn composed_playlist_name(cohort: &str, subtitles: bool) -> String {
     }
 }
 
+/// Reads a cohort's composed playlist, but only while its worker is still
+/// republishing it.
+///
+/// Reading and checking freshness are one operation on purpose: a requester
+/// that reads the file directly would serve frozen content without noticing.
+/// `None` means serve shared content, like every other miss in this protocol.
+pub async fn read_composed_playlist(
+    output_folder: &Path,
+    cohort: &str,
+    subtitles: bool,
+) -> Option<String> {
+    let path = output_folder.join(composed_playlist_name(cohort, subtitles));
+    let modified = tokio::fs::metadata(&path).await.ok()?.modified().ok()?;
+
+    let fresh = match modified.elapsed() {
+        Ok(age) => age <= PLAYLIST_FRESHNESS,
+        // a modified time in the future is a clock that ran ahead of ours,
+        // never a playlist that stopped being written
+        Err(_) => true,
+    };
+
+    if !fresh {
+        return None;
+    }
+
+    tokio::fs::read_to_string(&path).await.ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +182,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(read_answer(output, "cachebust=1").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_freshly_published_playlist_is_served() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder
+            .path()
+            .join(composed_playlist_name("cafe1234", false));
+        tokio::fs::write(&path, "#EXTM3U\n").await.unwrap();
+
+        assert_eq!(
+            read_composed_playlist(folder.path(), "cafe1234", false).await,
+            Some(String::from("#EXTM3U\n"))
+        );
+    }
+
+    /// The failure this exists for: a worker still transcoding, but no longer
+    /// republishing composed playlists. The stale file must not be served.
+    #[tokio::test]
+    async fn a_playlist_the_worker_stopped_republishing_is_not_served() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder
+            .path()
+            .join(composed_playlist_name("cafe1234", false));
+        tokio::fs::write(&path, "#EXTM3U\n").await.unwrap();
+
+        let frozen = filetime::FileTime::from_unix_time(
+            filetime::FileTime::now().unix_seconds() - (PLAYLIST_FRESHNESS.as_secs() as i64 + 5),
+            0,
+        );
+        filetime::set_file_mtime(&path, frozen).unwrap();
+
+        assert_eq!(
+            read_composed_playlist(folder.path(), "cafe1234", false).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_that_was_never_published_is_not_served() {
+        let folder = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            read_composed_playlist(folder.path(), "cafe1234", false).await,
+            None
+        );
     }
 
     #[tokio::test]

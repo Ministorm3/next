@@ -440,6 +440,81 @@ mod tests {
         }
     }
 
+    /// A channel producing continuously, with a templated item in the middle
+    /// whose variant never appears. Long enough that the served window always
+    /// has content ahead of it, as a working channel does.
+    fn continuous_shared_with_templated_item() -> PlaylistSidecar {
+        let segments = (0..16i64)
+            .map(|i| {
+                let at = i * 4;
+                let item = match at {
+                    at if at < 24 => "before",
+                    at if at < 44 => "game",
+                    _ => "after",
+                };
+                seg(
+                    &format!("live{i:06}.ts"),
+                    item,
+                    at,
+                    at == 0 || at == 24 || at == 44,
+                )
+            })
+            .collect();
+
+        PlaylistSidecar {
+            segments,
+            pipelines: vec![
+                pipeline("before", 0, false),
+                pipeline("game", 24_000, true),
+                pipeline("after", 44_000, false),
+            ],
+        }
+    }
+
+    /// Composition used to advance once per playlist request and now advances
+    /// on a timer, so it is sampled several times more often. The media
+    /// sequence is clamped to a running maximum, which means a denser sampler
+    /// can only ever ratchet further forward, never back. Two samplers walking
+    /// the same span must still leave a client at the same place, including
+    /// across the hold-back while a templated item waits for its decision.
+    ///
+    /// The clamp only binds once the serve anchor has passed every entry,
+    /// which takes a full serve window of no new output. A channel still
+    /// producing always has entries ahead of the anchor, so the candidate
+    /// sequence rises monotonically and the cadence cannot matter. On a
+    /// timeline that has genuinely stopped, a denser sampler settles one
+    /// segment further into the dead tail; both remain monotonic, and only one
+    /// renderer exists per cohort, so no client observes the difference.
+    #[test]
+    fn render_cadence_does_not_change_what_is_served() {
+        let shared = continuous_shared_with_templated_item();
+        let base = OffsetDateTime::UNIX_EPOCH;
+
+        let mut fine = SessionPlaylist::default();
+        let mut coarse = SessionPlaylist::default();
+
+        for step in 0..=20i64 {
+            let elapsed = 20 + step * 2;
+            let now = base + time::Duration::seconds(elapsed);
+
+            let from_fine =
+                fine.advance_and_render(&shared, None, "variants/x/", now, 4, |s| s.to_owned());
+
+            // the coarse sampler skips three quarters of those instants, as a
+            // client polling once per segment would
+            if step % 4 == 0 {
+                let from_coarse =
+                    coarse
+                        .advance_and_render(&shared, None, "variants/x/", now, 4, |s| s.to_owned());
+
+                assert_eq!(
+                    from_fine, from_coarse,
+                    "cadence changed the served playlist at {elapsed}s"
+                );
+            }
+        }
+    }
+
     fn decided(item: &str, decision: ItemDecision) -> HashMap<String, ItemDecision> {
         let mut map = HashMap::new();
         map.insert(item.to_owned(), decision);
