@@ -97,6 +97,12 @@ pub struct SessionPlaylist {
     serve_head: Option<u64>,
     head_advanced_at: Option<OffsetDateTime>,
     decisions: HashMap<String, ItemDecision>,
+    /// The sequence number of the first segment ever observed for each
+    /// templated item, recorded once and never recomputed. Positions inside
+    /// an item derive from this: the sidecar trims its history, so anything
+    /// measured from "the first segment still listed" shifts as the item
+    /// ages, and every position-based decision would shift with it.
+    item_bases: HashMap<String, u64>,
 }
 
 fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
@@ -144,7 +150,13 @@ impl SessionPlaylist {
         map_path: fn(&str) -> String,
     ) -> String {
         self.decide_items(shared, variant, now);
-        let timeline = compose_timeline(shared, variant, variant_prefix, &self.decisions);
+        let timeline = compose_timeline(
+            shared,
+            variant,
+            variant_prefix,
+            &self.decisions,
+            &self.item_bases,
+        );
         self.reconcile(timeline);
         self.trim(now);
         self.render(shared_head, now, target_duration, map_path)
@@ -167,6 +179,16 @@ impl SessionPlaylist {
         let emitted: HashSet<u64> = self.entries.iter().map(|e| e.sequence).collect();
 
         for pipeline in shared.pipelines.iter().filter(|p| p.templated) {
+            if !self.item_bases.contains_key(&pipeline.item_id)
+                && let Some(first) = shared
+                    .segments
+                    .iter()
+                    .find(|s| s.item_id == pipeline.item_id)
+                    .and_then(|s| sequence_of(&s.path))
+            {
+                self.item_bases.insert(pipeline.item_id.clone(), first);
+            }
+
             if let Some(ItemDecision::Variant { .. }) = self.decisions.get(&pipeline.item_id) {
                 continue;
             }
@@ -186,19 +208,21 @@ impl SessionPlaylist {
             if let Some(anchor_ms) = anchored {
                 // the first position of the item this session has not served
                 // yet; substitution must not start before it
-                let mut position_ms = 0u64;
+                let base = self.item_bases.get(&pipeline.item_id).copied().unwrap_or(0);
                 let mut first_unserved_ms = 0u64;
                 for segment in shared
                     .segments
                     .iter()
                     .filter(|s| s.item_id == pipeline.item_id)
                 {
-                    let served = sequence_of(&segment.path).is_some_and(|s| emitted.contains(&s));
-                    if !served {
+                    let Some(seq) = sequence_of(&segment.path) else {
+                        continue;
+                    };
+                    if !emitted.contains(&seq) {
                         break;
                     }
-                    position_ms += (segment.duration.max(0f64) * 1000.0) as u64;
-                    first_unserved_ms = position_ms;
+                    first_unserved_ms =
+                        seq.saturating_sub(base).saturating_add(1) * 1000 * SEGMENT_SECONDS;
                 }
 
                 self.decisions.insert(
@@ -257,6 +281,25 @@ impl SessionPlaylist {
             && newest.sequence < front.sequence
         {
             log::warn!("shared playlist numbering moved backwards; resetting composed session");
+            self.entries.clear();
+            self.serve_head = None;
+            self.head_advanced_at = None;
+            self.head_discontinuity_sequence = 0;
+        }
+
+        // a sequence this session still needs but the timeline can no longer
+        // provide will never arrive; re-anchoring to current content is one
+        // clean break for the viewer, where holding would freeze the
+        // playlist for good
+        if let (Some(oldest), Some(last)) = (timeline.first(), self.entries.back())
+            && oldest.sequence > last.sequence + 1
+        {
+            log::warn!(
+                "sequence {} is no longer available (timeline now starts at {}); \
+                 re-anchoring composed session",
+                last.sequence + 1,
+                oldest.sequence
+            );
             self.entries.clear();
             self.serve_head = None;
             self.head_advanced_at = None;
@@ -466,6 +509,7 @@ pub fn compose_timeline(
     variant: Option<&PlaylistSidecar>,
     variant_prefix: &str,
     decisions: &HashMap<String, ItemDecision>,
+    item_bases: &HashMap<String, u64>,
 ) -> Vec<ComposedEntry> {
     let templated: HashMap<&str, bool> = shared
         .pipelines
@@ -473,10 +517,8 @@ pub fn compose_timeline(
         .map(|p| (p.item_id.as_str(), p.templated))
         .collect();
 
+    let grid_ms = 1000 * SEGMENT_SECONDS;
     let mut result: Vec<ComposedEntry> = Vec::new();
-    let mut current_item: Option<&str> = None;
-    let mut item_position_ms = 0u64;
-    let mut variant_index = 0usize;
     let mut substituting = false;
 
     for segment in &shared.segments {
@@ -490,31 +532,25 @@ pub fn compose_timeline(
         let is_templated = templated.get(segment.item_id.as_str()).copied() == Some(true);
 
         if is_templated {
-            if current_item != Some(segment.item_id.as_str()) {
-                current_item = Some(segment.item_id.as_str());
-                item_position_ms = 0;
-                variant_index = 0;
-                substituting = false;
-            }
+            // the position comes from the segment's own number against the
+            // item's recorded first number, so it does not shift as the
+            // sidecar trims the item's early segments out of its history
+            let position_ms = item_bases
+                .get(&segment.item_id)
+                .map(|base| sequence.saturating_sub(*base) * grid_ms);
 
-            let position_ms = item_position_ms;
-            item_position_ms += (segment.duration.max(0f64) * 1000.0) as u64;
-
-            match decisions.get(&segment.item_id) {
-                Some(ItemDecision::Variant { join_ms, anchor_ms }) => {
-                    // this position's variant twin, counted on the grid from
+            match (decisions.get(&segment.item_id), position_ms) {
+                (Some(ItemDecision::Variant { join_ms, anchor_ms }), Some(position_ms)) => {
+                    // this position's variant twin, numbered on the grid from
                     // the anchor whether or not the twin is served
                     let has_twin = position_ms + 750 >= *anchor_ms;
 
                     if has_twin && position_ms + 750 >= *join_ms {
-                        // looked up by the index in the file name, not list
-                        // position: the variant's own history trims during a
-                        // window longer than it, and a shifted list would
-                        // re-serve later segments at earlier positions
+                        let twin = (position_ms + 750 - *anchor_ms) / grid_ms;
                         let vseg = variant.and_then(|v| {
                             v.segments
                                 .iter()
-                                .find(|s| sequence_of(&s.path) == Some(variant_index as u64))
+                                .find(|s| sequence_of(&s.path) == Some(twin))
                         });
 
                         if let Some(vseg) = vseg {
@@ -528,7 +564,6 @@ pub fn compose_timeline(
                                 sequence,
                                 variant: true,
                             });
-                            variant_index += 1;
                             substituting = true;
                             continue;
                         }
@@ -536,9 +571,8 @@ pub fn compose_timeline(
                         // the variant has not produced this position yet:
                         // hold the timeline here unless it has fallen so far
                         // behind that holding would stall viewers
-                        let variant_edge_ms =
-                            *anchor_ms + (variant_index as u64 * 1000 * SEGMENT_SECONDS);
-                        let behind_ms = item_position_ms.saturating_sub(variant_edge_ms);
+                        let variant_edge_ms = *anchor_ms + twin * grid_ms;
+                        let behind_ms = (position_ms + grid_ms).saturating_sub(variant_edge_ms);
                         if (behind_ms as f64) < VARIANT_STALL_SECONDS * 1000.0 {
                             return result;
                         }
@@ -552,7 +586,8 @@ pub fn compose_timeline(
                         // fall through to emit the shared segment, marking the
                         // source switch for players that honor discontinuities.
                         // the variant's segment for this position, if it ever
-                        // arrives, is consumed unserved to keep alignment
+                        // arrives, stays unserved; later positions keep their
+                        // own twins
                         result.push(ComposedEntry {
                             path: segment.path.clone(),
                             duration: segment.duration,
@@ -561,30 +596,23 @@ pub fn compose_timeline(
                             sequence,
                             variant: false,
                         });
-                        variant_index += 1;
                         substituting = false;
                         continue;
                     }
-
-                    if has_twin {
-                        // before the join but inside the variant's envelope:
-                        // the shared segment passes through below, and its
-                        // variant twin is consumed unserved
-                        variant_index += 1;
-                    }
-                    // shared passes through below
+                    // before the join: shared passes through below
                 }
-                Some(ItemDecision::Shared) => {
+                (Some(ItemDecision::Shared), _) => {
                     // fall through: the shared segment passes into the
                     // timeline like any other
                 }
-                None => {
-                    // undecided: hold everything from here on back
+                _ => {
+                    // undecided, or an item whose base was never observed:
+                    // hold everything from here on back
                     return result;
                 }
             }
         } else {
-            current_item = None;
+            substituting = false;
         }
 
         result.push(ComposedEntry {
@@ -732,6 +760,22 @@ mod tests {
         map
     }
 
+    /// The item bases a session would have recorded from this sidecar.
+    fn bases_of(shared: &PlaylistSidecar) -> HashMap<String, u64> {
+        let mut map = HashMap::new();
+        for pipeline in shared.pipelines.iter().filter(|p| p.templated) {
+            if let Some(first) = shared
+                .segments
+                .iter()
+                .find(|s| s.item_id == pipeline.item_id)
+                .and_then(|s| sequence_of(&s.path))
+            {
+                map.insert(pipeline.item_id.clone(), first);
+            }
+        }
+        map
+    }
+
     #[test]
     fn substitutes_variant_segments_for_the_templated_item() {
         let shared = shared_with_templated_item();
@@ -742,6 +786,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
+            &bases_of(&shared),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -767,6 +812,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
+            &bases_of(&shared),
         );
 
         let sequences: Vec<u64> = timeline.iter().map(|e| e.sequence).collect();
@@ -783,6 +829,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
+            &bases_of(&shared),
         );
 
         let expected_first = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
@@ -801,6 +848,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
+            &bases_of(&shared),
         );
 
         // splice in: first variant segment; splice out: first segment of the
@@ -819,6 +867,7 @@ mod tests {
             None,
             "variants/abc/",
             &decided("game", ItemDecision::Shared),
+            &bases_of(&shared),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -838,7 +887,13 @@ mod tests {
     fn undecided_item_holds_the_timeline() {
         let shared = shared_with_templated_item();
 
-        let timeline = compose_timeline(&shared, None, "variants/abc/", &HashMap::new());
+        let timeline = compose_timeline(
+            &shared,
+            None,
+            "variants/abc/",
+            &HashMap::new(),
+            &bases_of(&shared),
+        );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec!["live000000.ts", "live000001.ts"]);
@@ -858,6 +913,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
+            &bases_of(&shared),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1028,6 +1084,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(4_000, 4_000)),
+            &bases_of(&shared),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1191,6 +1248,76 @@ mod tests {
         assert!(rendered.contains("live000015.ts"));
     }
 
+    /// The shared sidecar trims an item's early segments once the item ages
+    /// past its history. Positions derive from recorded bases, so a trimmed
+    /// sidecar must map every remaining position to the same variant twin it
+    /// mapped before the trim.
+    #[test]
+    fn positions_survive_shared_history_trimming() {
+        let shared = shared_with_templated_item();
+        let bases = bases_of(&shared);
+        let variant = variant_for_game();
+        let decisions = decided("game", variant_decision(0, 0));
+
+        let before = compose_timeline(&shared, Some(&variant), "variants/abc/", &decisions, &bases);
+
+        // the item's first segment ages out of the sidecar
+        let mut trimmed = shared.clone();
+        trimmed.segments.remove(2);
+        let after = compose_timeline(
+            &trimmed,
+            Some(&variant),
+            "variants/abc/",
+            &decisions,
+            &bases,
+        );
+
+        // live000003 (the item's second position) keeps the SECOND variant
+        // twin, exactly as before the trim
+        let find = |t: &[ComposedEntry]| {
+            t.iter()
+                .find(|e| e.sequence == 3)
+                .map(|e| e.path.clone())
+                .unwrap()
+        };
+        assert_eq!(find(&before), "variants/abc/live000001.ts");
+        assert_eq!(find(&after), "variants/abc/live000001.ts");
+    }
+
+    /// A session that held back while every sequence it needed aged out of
+    /// the timeline can never resume by waiting. It re-anchors to current
+    /// content: one clean break instead of a permanently frozen playlist.
+    #[test]
+    fn an_unfillable_gap_reanchors_instead_of_freezing() {
+        let mut session = SessionPlaylist::default();
+        let old = PlaylistSidecar {
+            segments: vec![
+                seg("live000000.ts", "before", 0, false),
+                seg("live000001.ts", "before", 4, false),
+            ],
+            pipelines: vec![pipeline("before", 0, false)],
+        };
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+        session.advance_and_render(&old, None, "variants/x/", Some(0), now, 4, |s| s.to_owned());
+
+        // much later the sidecar only holds far newer segments
+        let current = PlaylistSidecar {
+            segments: vec![
+                seg("live000200.ts", "before", 800, false),
+                seg("live000201.ts", "before", 804, false),
+            ],
+            pipelines: vec![pipeline("before", 0, false)],
+        };
+        let later = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(812);
+        let rendered =
+            session.advance_and_render(&current, None, "variants/x/", Some(200), later, 4, |s| {
+                s.to_owned()
+            });
+
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:200\n"));
+        assert!(rendered.contains("live000200.ts"));
+    }
+
     /// The variant's own playlist trims its history during a window longer
     /// than it, shifting the segment list. Substitution has to find segments
     /// by the index in their file name, or a shifted list re-serves later
@@ -1209,6 +1336,7 @@ mod tests {
             Some(&variant),
             "variants/abc/",
             &decided("game", variant_decision(4_000, 0)),
+            &bases_of(&shared),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
