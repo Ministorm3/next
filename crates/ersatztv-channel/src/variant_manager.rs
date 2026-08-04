@@ -147,6 +147,7 @@ impl VariantSession {
     /// the composed playlist a viewer reads is at most one tick old.
     async fn render(&mut self, channel: &VariantChannel, shared: &PlaylistSidecar) {
         let variant = read_sidecar(&self.folder.join("live.m3u8")).await;
+        let shared_head = read_media_sequence(&channel.output_folder.join("live.m3u8")).await;
         let now = OffsetDateTime::now_utc();
         let cohort = stable_name(&self.cohort_query);
 
@@ -154,6 +155,7 @@ impl VariantSession {
             shared,
             variant.as_ref(),
             &self.variant_prefix,
+            shared_head,
             now,
             SEGMENT_SECONDS as u32,
             |s| s.to_owned(),
@@ -163,6 +165,7 @@ impl VariantSession {
             shared,
             variant.as_ref(),
             &self.variant_prefix,
+            shared_head,
             now,
             SEGMENT_SECONDS as u32,
             |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
@@ -485,6 +488,17 @@ async fn read_sidecar(playlist_path: &Path) -> Option<PlaylistSidecar> {
     ));
     let json = tokio::fs::read_to_string(&path).await.ok()?;
     serde_json::from_str(&json).ok()
+}
+
+/// The media sequence the shared playlist currently serves from. The composed
+/// playlist mirrors it whenever it can, so a client moved between the two
+/// lands on the same numbering.
+async fn read_media_sequence(playlist_path: &Path) -> Option<u64> {
+    let playlist = tokio::fs::read_to_string(playlist_path).await.ok()?;
+    playlist
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 async fn touch_heartbeat(folder: &Path) {

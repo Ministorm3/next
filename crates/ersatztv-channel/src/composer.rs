@@ -3,19 +3,25 @@
 //! A cohort's playlist is the shared session's playlist with a templated
 //! item's segments replaced by the cohort's variant segments, keyed by the
 //! playout item ids recorded in each session's sidecar. Substitution is
-//! all-or-nothing per item per session: the decision (variant or shared) is
-//! made once, just before the item enters the served window, and pinned, so a
-//! viewer never switches sources mid-item. Everything here operates on
-//! recorded metadata; nothing is inferred from media timestamps.
+//! per position: the decision (variant or shared) is made per item just
+//! before the item enters the served window, and a position that has already
+//! been served is never served again from the other source. Everything here
+//! operates on recorded metadata; nothing is inferred from media timestamps.
+//!
+//! The composed playlist shares the shared playlist's sequence space: a
+//! shared segment's media sequence is the index in its file name, and a
+//! substituted segment takes the sequence of the shared segment it replaced.
+//! A client moved between the two playlists therefore lands on the same
+//! numbering, instead of two counters that started at different times.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ersatztv_core::sidecar::PlaylistSidecar;
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-/// Mirror of the worker's segment length; used only for serve-window
-/// anchoring, exactly as the worker anchors its own playlist.
+/// Mirror of the worker's segment length; used only for envelope grid
+/// arithmetic, exactly as the worker anchors its own playlist.
 pub const SEGMENT_SECONDS: u64 = 4;
 
 const SERVED_SEGMENTS: usize = 10;
@@ -27,13 +33,23 @@ const HISTORY_SECONDS: u64 = 120;
 /// variant still has no output; earlier, composition holds back instead.
 const DECISION_LEAD_SECONDS: u64 = 8;
 
+/// How far the serve head may fall behind the shared playlist's own head
+/// before it jumps forward instead of walking. A variant transcode of a live
+/// source cannot outrun realtime, so a late start makes the cohort's timeline
+/// lag; walking through the lag plays everything a little late, which is the
+/// preferred failure. Past this bound the head skips to the newest composed
+/// content, trading the skipped span for a bounded worst-case delay.
+const MAX_LAG_SEGMENTS: u64 = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemDecision {
-    /// Substitute variant segments from `join_ms` into the item onward
-    /// (0 = the whole item). Envelope equality makes a mid-item join safe:
-    /// variant segments occupy the same PTS grid as the shared ones they
-    /// replace. Final once made.
-    Variant { join_ms: u64 },
+    /// Substitute variant segments into the item. `anchor_ms` is where the
+    /// variant's first segment sits in the item, from its recorded pts
+    /// offset; `join_ms` is where substitution actually starts, which is
+    /// never before a position this session already served from the shared
+    /// feed. Variant segments for positions between the two are consumed
+    /// unserved so the substitution stays content-aligned. Final once made.
+    Variant { join_ms: u64, anchor_ms: u64 },
     /// Serve the shared feed. Soft: upgrades to a late `Variant` join if the
     /// cohort's variant starts producing anchored output mid-item.
     Shared,
@@ -45,6 +61,15 @@ pub struct ComposedEntry {
     pub duration: f64,
     pub program_date_time: OffsetDateTime,
     pub discontinuity: bool,
+    /// The shared sequence number of this position: the index in the shared
+    /// segment's file name, whether this entry serves that segment or the
+    /// variant segment that replaced it.
+    pub sequence: u64,
+    /// Whether this entry serves variant content. The serve head may jump
+    /// over shared content to catch up with the shared playlist, but never
+    /// over variant content: that content is why the cohort exists, so a
+    /// lagging viewer plays all of it a little late instead of losing it.
+    pub variant: bool,
 }
 
 /// Per-cohort-session playlist state. Entries are append-only; the head trims
@@ -53,9 +78,17 @@ pub struct ComposedEntry {
 #[derive(Debug, Default)]
 pub struct SessionPlaylist {
     entries: VecDeque<ComposedEntry>,
-    head_media_sequence: u64,
+    /// Sequence number of `entries[0]`; meaningful only while entries exist.
+    head_sequence: u64,
+    /// Discontinuities that have trimmed off the head.
     head_discontinuity_sequence: u64,
-    last_served_media_sequence: u64,
+    /// The sequence at the front of the served window, and when it last
+    /// advanced. The head mirrors the shared playlist's head whenever the
+    /// composed timeline has reached it, and otherwise advances at playback
+    /// rate, so a lagging cohort plays through its content instead of having
+    /// the window jump over it.
+    serve_head: Option<u64>,
+    head_advanced_at: Option<OffsetDateTime>,
     decisions: HashMap<String, ItemDecision>,
 }
 
@@ -73,17 +106,32 @@ fn format_pdt(pdt: OffsetDateTime) -> String {
     pdt.format(format).unwrap_or_default()
 }
 
+/// The sequence number a segment file name carries: the digits before the
+/// extension. The playlist manager numbers segments from zero and trims them
+/// in order, so this index is also the segment's media sequence in the
+/// shared playlist.
+fn sequence_of(path: &str) -> Option<u64> {
+    let name = path.rsplit('/').next()?;
+    let stem = name.split('.').next()?;
+    let digits: String = stem.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 impl SessionPlaylist {
     /// Advances this session's timeline from the two sidecars and renders the
     /// playlist to serve. `variant_prefix` is the path prefix (relative to the
     /// shared session folder) under which the variant's segments are served.
+    /// `shared_head` is the media sequence the shared playlist currently
+    /// serves from, which the composed window mirrors when it can.
     /// `map_path` converts a segment path for the rendered playlist (identity
     /// for media, `.ts` to `.vtt` for subtitles).
+    #[allow(clippy::too_many_arguments)]
     pub fn advance_and_render(
         &mut self,
         shared: &PlaylistSidecar,
         variant: Option<&PlaylistSidecar>,
         variant_prefix: &str,
+        shared_head: Option<u64>,
         now: OffsetDateTime,
         target_duration: u32,
         map_path: fn(&str) -> String,
@@ -92,7 +140,7 @@ impl SessionPlaylist {
         let timeline = compose_timeline(shared, variant, variant_prefix, &self.decisions);
         self.reconcile(timeline);
         self.trim(now);
-        self.render(now, target_duration, map_path)
+        self.render(shared_head, now, target_duration, map_path)
     }
 
     /// Decides each templated item's fate. A variant whose recorded anchor
@@ -100,19 +148,23 @@ impl SessionPlaylist {
     /// it was spawned with lead time, or as a late join when it wasn't. A
     /// `Shared` decision is only a soft pin: it upgrades to a late join the
     /// moment anchored variant output appears, because envelope equality
-    /// makes the mid-item switch timestamp-continuous.
+    /// makes the mid-item switch timestamp-continuous. The join is clamped
+    /// past every position this session already served, so an upgrade never
+    /// re-serves a position from the other source.
     fn decide_items(
         &mut self,
         shared: &PlaylistSidecar,
         variant: Option<&PlaylistSidecar>,
         now: OffsetDateTime,
     ) {
+        let emitted: HashSet<u64> = self.entries.iter().map(|e| e.sequence).collect();
+
         for pipeline in shared.pipelines.iter().filter(|p| p.templated) {
             if let Some(ItemDecision::Variant { .. }) = self.decisions.get(&pipeline.item_id) {
                 continue;
             }
 
-            let anchored_join = variant.and_then(|v| {
+            let anchored = variant.and_then(|v| {
                 if v.segments.is_empty() {
                     return None;
                 }
@@ -124,9 +176,31 @@ impl SessionPlaylist {
                     .map(|vp| vp.pts_offset_ms - pipeline.pts_offset_ms)
             });
 
-            if let Some(join_ms) = anchored_join {
-                self.decisions
-                    .insert(pipeline.item_id.clone(), ItemDecision::Variant { join_ms });
+            if let Some(anchor_ms) = anchored {
+                // the first position of the item this session has not served
+                // yet; substitution must not start before it
+                let mut position_ms = 0u64;
+                let mut first_unserved_ms = 0u64;
+                for segment in shared
+                    .segments
+                    .iter()
+                    .filter(|s| s.item_id == pipeline.item_id)
+                {
+                    let served = sequence_of(&segment.path).is_some_and(|s| emitted.contains(&s));
+                    if !served {
+                        break;
+                    }
+                    position_ms += (segment.duration.max(0f64) * 1000.0) as u64;
+                    first_unserved_ms = position_ms;
+                }
+
+                self.decisions.insert(
+                    pipeline.item_id.clone(),
+                    ItemDecision::Variant {
+                        join_ms: anchor_ms.max(first_unserved_ms),
+                        anchor_ms,
+                    },
+                );
                 continue;
             }
 
@@ -166,21 +240,45 @@ impl SessionPlaylist {
     }
 
     /// Appends timeline entries this session has not emitted yet. Entries are
-    /// identified by path; history is never reordered or rewritten, so every
-    /// client sees an append-only playlist.
+    /// identified by sequence; history is never reordered or rewritten, so
+    /// every client sees an append-only playlist.
     fn reconcile(&mut self, timeline: Vec<ComposedEntry>) {
+        // a timeline whose newest entry precedes everything held means the
+        // shared session restarted and renumbered from zero; composed state
+        // has to follow it rather than hold a stale history forever
+        if let (Some(newest), Some(front)) = (timeline.last(), self.entries.front())
+            && newest.sequence < front.sequence
+        {
+            log::warn!("shared playlist numbering moved backwards; resetting composed session");
+            self.entries.clear();
+            self.serve_head = None;
+            self.head_advanced_at = None;
+            self.head_discontinuity_sequence = 0;
+        }
+
         for entry in timeline {
-            // pinned decisions make the timeline append-only in practice, but
-            // never trust that: an entry conflicting with an already-emitted
-            // decision for its item is dropped rather than interleaved
-            if !self.entries.iter().any(|e| e.path == entry.path) {
-                let after_last = self
-                    .entries
-                    .back()
-                    .is_none_or(|last| entry.program_date_time >= last.program_date_time);
-                if after_last {
+            match self.entries.back() {
+                None => {
+                    self.head_sequence = entry.sequence;
                     self.entries.push_back(entry);
                 }
+                Some(last) if entry.sequence == last.sequence + 1 => {
+                    self.entries.push_back(entry);
+                }
+                Some(last) if entry.sequence > last.sequence + 1 => {
+                    // composition emits positions in order, so a gap means an
+                    // upstream skip; appending across it would misnumber every
+                    // later position, so hold here until it is filled
+                    log::warn!(
+                        "composed timeline skipped sequence {} to {}; holding",
+                        last.sequence + 1,
+                        entry.sequence
+                    );
+                    break;
+                }
+                // an already-emitted position (or a conflicting twin of one)
+                // never re-enters history
+                _ => {}
             }
         }
     }
@@ -192,8 +290,14 @@ impl SessionPlaylist {
             .front()
             .is_some_and(|e| e.program_date_time < cutoff)
         {
+            // a lagging serve head still needs its window; history behind the
+            // head is expendable, the head itself is not
+            if self.serve_head.is_some_and(|h| self.head_sequence >= h) {
+                break;
+            }
+
             if let Some(removed) = self.entries.pop_front() {
-                self.head_media_sequence += 1;
+                self.head_sequence += 1;
                 if removed.discontinuity {
                     self.head_discontinuity_sequence += 1;
                 }
@@ -203,27 +307,94 @@ impl SessionPlaylist {
 
     fn render(
         &mut self,
+        shared_head: Option<u64>,
         now: OffsetDateTime,
         target_duration: u32,
         map_path: fn(&str) -> String,
     ) -> String {
-        // serve the tail anchored a few segments behind now, mirroring the
-        // shared session's own windowing
-        let anchor = now - time::Duration::seconds((SEGMENT_SECONDS * 5) as i64);
-        let candidate_skip = self
-            .entries
-            .iter()
-            .position(|e| e.program_date_time >= anchor)
-            .unwrap_or_else(|| self.entries.len().saturating_sub(SERVED_SEGMENTS));
+        let mut playlist = String::new();
+        playlist.push_str("#EXTM3U\n");
+        // the composed playlist follows the shared playlist's declarations:
+        // version 6 for the rounded EXT-X-TARGETDURATION semantics, and the
+        // discontinuity sequence present even at zero
+        playlist.push_str("#EXT-X-VERSION:6\n");
+        playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
 
-        // monotonic clamp: the media sequence a client observed must never
-        // move backwards between reloads
-        let candidate_ms = self.head_media_sequence + candidate_skip as u64;
-        let clamped_ms = candidate_ms.max(self.last_served_media_sequence);
-        self.last_served_media_sequence = clamped_ms;
+        if self.entries.is_empty() {
+            let held = self.serve_head.unwrap_or(0);
+            playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{held}\n"));
+            playlist.push_str(&format!(
+                "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+                self.head_discontinuity_sequence
+            ));
+            playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+            return playlist;
+        }
 
-        let skip = ((clamped_ms - self.head_media_sequence) as usize).min(self.entries.len());
+        let front = self.head_sequence;
+        let tail = front + self.entries.len() as u64 - 1;
 
+        // the position the shared playlist serves from; without one to
+        // mirror, fall back to this timeline's own last full window
+        let desired = shared_head
+            .unwrap_or_else(|| tail.saturating_sub(SERVED_SEGMENTS as u64 - 1).max(front));
+
+        let mut head = match self.serve_head {
+            Some(head) => head.clamp(front, tail),
+            None => {
+                self.head_advanced_at = Some(now);
+                desired.clamp(front, tail)
+            }
+        };
+
+        // walk forward at playback rate, one segment per segment duration,
+        // never past the shared head or the newest composed content: a
+        // lagging cohort plays through its backlog instead of having the
+        // window jump over it, and a cohort never runs ahead of the shared
+        // playlist into worked-ahead content
+        let upper = tail.min(desired.max(head));
+        if let Some(mut advanced_at) = self.head_advanced_at {
+            while head < upper {
+                let index = (head - front) as usize;
+                let step = time::Duration::seconds_f64(self.entries[index].duration.max(0.1));
+                if now - advanced_at < step {
+                    break;
+                }
+                head += 1;
+                advanced_at += step;
+            }
+            self.head_advanced_at = Some(advanced_at);
+        }
+
+        // catch up by jumping, but only over shared content, or past the lag
+        // bound. content the viewer can also get from the shared feed may be
+        // skipped to get back on schedule; variant content is played out
+        // however late it runs, up to the bound
+        let target = desired.min(tail);
+        if target > head {
+            let skipped_variant = self
+                .entries
+                .iter()
+                .skip((head - front) as usize)
+                .take((target - head) as usize)
+                .any(|e| e.variant);
+
+            if !skipped_variant {
+                head = target;
+                self.head_advanced_at = Some(now);
+            } else if desired - head > MAX_LAG_SEGMENTS {
+                log::warn!(
+                    "composed serve head {head} fell more than {MAX_LAG_SEGMENTS} segments \
+                     behind shared head {desired}; skipping variant content to {target}"
+                );
+                head = target;
+                self.head_advanced_at = Some(now);
+            }
+        }
+
+        self.serve_head = Some(head);
+
+        let skip = (head - front) as usize;
         let effective_ds = self.head_discontinuity_sequence
             + self
                 .entries
@@ -232,14 +403,7 @@ impl SessionPlaylist {
                 .filter(|e| e.discontinuity)
                 .count() as u64;
 
-        let mut playlist = String::new();
-        playlist.push_str("#EXTM3U\n");
-        // the composed playlist follows the shared playlist's declarations:
-        // version 6 for the rounded EXT-X-TARGETDURATION semantics, and the
-        // discontinuity sequence present even at zero
-        playlist.push_str("#EXT-X-VERSION:6\n");
-        playlist.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
-        playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{clamped_ms}\n"));
+        playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{head}\n"));
         playlist.push_str(&format!("#EXT-X-DISCONTINUITY-SEQUENCE:{effective_ds}\n"));
         playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
@@ -267,10 +431,17 @@ impl SessionPlaylist {
 const VARIANT_STALL_SECONDS: f64 = 16.0;
 
 /// Builds the cohort's timeline from the two sidecars: shared segments pass
-/// through, and each item decided `Variant { join_ms }` has its shared
-/// segments from that offset onward replaced position-for-position by the
-/// variant's. Both transcodes occupy the same PTS envelope and segment grid,
-/// so the substituted entries reuse the shared segment's program date time.
+/// through, and each item decided `Variant { .. }` has its shared segments
+/// from the join onward replaced position-for-position by the variant's.
+/// Both transcodes occupy the same PTS envelope and segment grid, so the
+/// substituted entries reuse the shared segment's program date time and
+/// sequence number.
+///
+/// The variant's segments are indexed from the anchor, not the join: a
+/// position between the two consumes its variant segment unserved, so a
+/// join raised past already-served positions still substitutes the content
+/// that belongs at each remaining position. A position the variant skips
+/// while stalled is likewise consumed, never shifted later.
 ///
 /// Segments of an undecided templated item are held back; a position the
 /// variant has not produced yet holds the timeline at that edge (up to the
@@ -297,6 +468,9 @@ pub fn compose_timeline(
         let Some(pdt) = parse_pdt(&segment.program_date_time) else {
             continue;
         };
+        let Some(sequence) = sequence_of(&segment.path) else {
+            continue;
+        };
 
         let is_templated = templated.get(segment.item_id.as_str()).copied() == Some(true);
 
@@ -312,11 +486,12 @@ pub fn compose_timeline(
             item_position_ms += (segment.duration.max(0f64) * 1000.0) as u64;
 
             match decisions.get(&segment.item_id) {
-                Some(ItemDecision::Variant { join_ms }) => {
-                    // positions before the join stay shared; from the join
-                    // onward the variant's segments substitute one-for-one on
-                    // the shared grid
-                    if position_ms + 750 >= *join_ms {
+                Some(ItemDecision::Variant { join_ms, anchor_ms }) => {
+                    // this position's variant twin, counted on the grid from
+                    // the anchor whether or not the twin is served
+                    let has_twin = position_ms + 750 >= *anchor_ms;
+
+                    if has_twin && position_ms + 750 >= *join_ms {
                         let vseg = variant.and_then(|v| v.segments.get(variant_index));
 
                         if let Some(vseg) = vseg {
@@ -324,9 +499,11 @@ pub fn compose_timeline(
                                 path: format!("{variant_prefix}{}", vseg.path),
                                 duration: vseg.duration,
                                 program_date_time: pdt,
-                                discontinuity: variant_index == 0
+                                discontinuity: !substituting
                                     || vseg.discontinuity
                                     || segment.discontinuity,
+                                sequence,
+                                variant: true,
                             });
                             variant_index += 1;
                             substituting = true;
@@ -337,7 +514,7 @@ pub fn compose_timeline(
                         // hold the timeline here unless it has fallen so far
                         // behind that holding would stall viewers
                         let variant_edge_ms =
-                            *join_ms + (variant_index as u64 * 1000 * SEGMENT_SECONDS);
+                            *anchor_ms + (variant_index as u64 * 1000 * SEGMENT_SECONDS);
                         let behind_ms = item_position_ms.saturating_sub(variant_edge_ms);
                         if (behind_ms as f64) < VARIANT_STALL_SECONDS * 1000.0 {
                             return result;
@@ -350,17 +527,29 @@ pub fn compose_timeline(
                             position_ms
                         );
                         // fall through to emit the shared segment, marking the
-                        // source switch for players that honor discontinuities
+                        // source switch for players that honor discontinuities.
+                        // the variant's segment for this position, if it ever
+                        // arrives, is consumed unserved to keep alignment
                         result.push(ComposedEntry {
                             path: segment.path.clone(),
                             duration: segment.duration,
                             program_date_time: pdt,
                             discontinuity: substituting || segment.discontinuity,
+                            sequence,
+                            variant: false,
                         });
+                        variant_index += 1;
                         substituting = false;
                         continue;
                     }
-                    // before the join: shared passes through below
+
+                    if has_twin {
+                        // before the join but inside the variant's envelope:
+                        // the shared segment passes through below, and its
+                        // variant twin is consumed unserved
+                        variant_index += 1;
+                    }
+                    // shared passes through below
                 }
                 Some(ItemDecision::Shared) => {
                     // fall through: the shared segment passes into the
@@ -380,6 +569,8 @@ pub fn compose_timeline(
             duration: segment.duration,
             program_date_time: pdt,
             discontinuity: segment.discontinuity,
+            sequence,
+            variant: false,
         });
     }
 
@@ -411,6 +602,10 @@ mod tests {
             duration_ms: 0,
             templated,
         }
+    }
+
+    fn variant_decision(join_ms: u64, anchor_ms: u64) -> ItemDecision {
+        ItemDecision::Variant { join_ms, anchor_ms }
     }
 
     fn shared_with_templated_item() -> PlaylistSidecar {
@@ -471,20 +666,10 @@ mod tests {
         }
     }
 
-    /// Composition used to advance once per playlist request and now advances
-    /// on a timer, so it is sampled several times more often. The media
-    /// sequence is clamped to a running maximum, which means a denser sampler
-    /// can only ever ratchet further forward, never back. Two samplers walking
-    /// the same span must still leave a client at the same place, including
-    /// across the hold-back while a templated item waits for its decision.
-    ///
-    /// The clamp only binds once the serve anchor has passed every entry,
-    /// which takes a full serve window of no new output. A channel still
-    /// producing always has entries ahead of the anchor, so the candidate
-    /// sequence rises monotonically and the cadence cannot matter. On a
-    /// timeline that has genuinely stopped, a denser sampler settles one
-    /// segment further into the dead tail; both remain monotonic, and only one
-    /// renderer exists per cohort, so no client observes the difference.
+    /// Composition advances on a timer rather than per request, so it is
+    /// sampled at whatever cadence the loop runs. Two samplers walking the
+    /// same span must leave a client at the same place, including across the
+    /// hold-back while a templated item waits for its decision.
     #[test]
     fn render_cadence_does_not_change_what_is_served() {
         let shared = continuous_shared_with_templated_item();
@@ -498,14 +683,17 @@ mod tests {
             let now = base + time::Duration::seconds(elapsed);
 
             let from_fine =
-                fine.advance_and_render(&shared, None, "variants/x/", now, 4, |s| s.to_owned());
+                fine.advance_and_render(&shared, None, "variants/x/", None, now, 4, |s| {
+                    s.to_owned()
+                });
 
             // the coarse sampler skips three quarters of those instants, as a
             // client polling once per segment would
             if step % 4 == 0 {
                 let from_coarse =
-                    coarse
-                        .advance_and_render(&shared, None, "variants/x/", now, 4, |s| s.to_owned());
+                    coarse.advance_and_render(&shared, None, "variants/x/", None, now, 4, |s| {
+                        s.to_owned()
+                    });
 
                 assert_eq!(
                     from_fine, from_coarse,
@@ -530,7 +718,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant { join_ms: 0 }),
+            &decided("game", variant_decision(0, 0)),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -547,6 +735,22 @@ mod tests {
     }
 
     #[test]
+    fn substituted_entries_keep_the_shared_sequence_numbers() {
+        let shared = shared_with_templated_item();
+        let variant = variant_for_game();
+
+        let timeline = compose_timeline(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            &decided("game", variant_decision(0, 0)),
+        );
+
+        let sequences: Vec<u64> = timeline.iter().map(|e| e.sequence).collect();
+        assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn variant_segments_take_pdt_from_the_item_start() {
         let shared = shared_with_templated_item();
         let variant = variant_for_game();
@@ -555,7 +759,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant { join_ms: 0 }),
+            &decided("game", variant_decision(0, 0)),
         );
 
         let expected_first = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
@@ -573,7 +777,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant { join_ms: 0 }),
+            &decided("game", variant_decision(0, 0)),
         );
 
         // splice in: first variant segment; splice out: first segment of the
@@ -630,7 +834,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant { join_ms: 0 }),
+            &decided("game", variant_decision(0, 0)),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -653,10 +857,7 @@ mod tests {
 
         session.decide_items(&shared, Some(&variant), now);
 
-        assert_eq!(
-            session.decisions.get("game"),
-            Some(&ItemDecision::Variant { join_ms: 0 })
-        );
+        assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
     }
 
     #[test]
@@ -708,7 +909,7 @@ mod tests {
 
         assert_eq!(
             session.decisions.get("game"),
-            Some(&ItemDecision::Variant { join_ms: 4_000 })
+            Some(&variant_decision(4_000, 4_000))
         );
     }
 
@@ -728,8 +929,66 @@ mod tests {
         session.decide_items(&shared, Some(&variant), late);
         assert_eq!(
             session.decisions.get("game"),
-            Some(&ItemDecision::Variant { join_ms: 4_000 })
+            Some(&variant_decision(4_000, 4_000))
         );
+    }
+
+    /// The defect this guards against: a soft-pinned item whose first
+    /// positions were already served from the shared feed, upgraded when the
+    /// variant appeared. The join must start past the served positions, and
+    /// the variant's own segments for those positions must be consumed
+    /// unserved so no position is served twice and none is served shifted.
+    #[test]
+    fn upgrade_never_reserves_an_already_served_position() {
+        let mut session = SessionPlaylist::default();
+        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
+
+        // the shared session has produced only the item's first position when
+        // the deadline passes: shared pinned, that position served
+        let partial = PlaylistSidecar {
+            segments: vec![
+                seg("live000000.ts", "before", 0, false),
+                seg("live000001.ts", "before", 4, false),
+                seg("live000002.ts", "game", 8, true),
+            ],
+            pipelines: vec![pipeline("before", 0, false), pipeline("game", 8_000, true)],
+        };
+        let first =
+            session.advance_and_render(&partial, None, "variants/abc/", Some(0), late, 4, |s| {
+                s.to_owned()
+            });
+        assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+        assert!(first.contains("live000002.ts"));
+
+        // the variant appears anchored at the item start; the upgrade must
+        // join past the served position
+        let shared = shared_with_templated_item();
+        let variant = variant_for_game();
+        let second = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            Some(0),
+            late + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert_eq!(
+            session.decisions.get("game"),
+            Some(&variant_decision(4_000, 0))
+        );
+        // position 0 stays the shared segment; position 1 is the variant's
+        // SECOND segment, because its first belongs to the served position
+        assert!(second.contains("live000002.ts"));
+        assert!(!second.contains("variants/abc/live000000.ts"));
+        assert!(second.contains("variants/abc/live000001.ts"));
+
+        // and no sequence number appears twice across the whole history
+        let sequences: Vec<u64> = session.entries.iter().map(|e| e.sequence).collect();
+        let mut deduped = sequences.clone();
+        deduped.dedup();
+        assert_eq!(sequences, deduped);
     }
 
     #[test]
@@ -745,7 +1004,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
-            &decided("game", ItemDecision::Variant { join_ms: 4_000 }),
+            &decided("game", variant_decision(4_000, 4_000)),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -770,19 +1029,120 @@ mod tests {
         let variant = variant_for_game();
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
 
-        let first =
-            session.advance_and_render(&shared, Some(&variant), "variants/abc/", now, 4, |s| {
-                s.to_owned()
-            });
+        let first = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            None,
+            now,
+            4,
+            |s| s.to_owned(),
+        );
         assert!(first.contains("variants/abc/live000000.ts"));
 
         // a later advance with the same inputs must not duplicate entries
-        let second =
-            session.advance_and_render(&shared, Some(&variant), "variants/abc/", now, 4, |s| {
-                s.to_owned()
-            });
+        let second = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            None,
+            now,
+            4,
+            |s| s.to_owned(),
+        );
         assert_eq!(first, second);
         assert_eq!(session.entries.len(), 5);
+    }
+
+    /// The composed playlist shares the shared playlist's sequence space, so
+    /// serving mirrors the shared head whenever composed content has reached
+    /// it, and a client moved between the playlists sees one numbering.
+    #[test]
+    fn serving_mirrors_the_shared_head_when_content_is_complete() {
+        let mut session = SessionPlaylist::default();
+        let shared = shared_with_templated_item();
+        let variant = variant_for_game();
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            Some(2),
+            now,
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
+        assert!(rendered.contains("variants/abc/live000000.ts"));
+        assert!(!rendered.contains("\nlive000001.ts"));
+    }
+
+    /// When the variant lags, the head walks at playback rate instead of
+    /// mirroring, so the window never jumps over content a viewer has not
+    /// played. Here the shared head is far ahead of what composition has
+    /// emitted; the head holds at the emission edge.
+    #[test]
+    fn a_lagging_head_walks_instead_of_jumping() {
+        let mut session = SessionPlaylist::default();
+        let shared = shared_with_templated_item();
+        // no variant output yet: composition holds before the game item
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+
+        let rendered =
+            session.advance_and_render(&shared, None, "variants/abc/", Some(4), now, 4, |s| {
+                s.to_owned()
+            });
+
+        // only live000000/1 are emitted; the head cannot reach shared's 4
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+        assert!(rendered.contains("live000001.ts"));
+
+        // two seconds later the head has not skipped anywhere
+        let again = session.advance_and_render(
+            &shared,
+            None,
+            "variants/abc/",
+            Some(4),
+            now + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+        assert!(again.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+    }
+
+    /// Past the lag bound the head jumps to the newest composed content: a
+    /// bounded worst-case delay is preferred over an unbounded one.
+    #[test]
+    fn a_head_past_the_lag_bound_jumps_to_the_emission_edge() {
+        let mut session = SessionPlaylist::default();
+        let shared = continuous_shared_with_templated_item();
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        // decided shared so the whole timeline emits
+        session
+            .decisions
+            .insert(String::from("game"), ItemDecision::Shared);
+
+        session.advance_and_render(&shared, None, "variants/x/", Some(0), now, 4, |s| {
+            s.to_owned()
+        });
+        assert_eq!(session.serve_head, Some(0));
+
+        // the shared head leaps far ahead (a burst after a stall); the lag
+        // bound caps how far behind this session may stay
+        let rendered = session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(30),
+            now + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:15\n"));
     }
 
     #[test]
@@ -792,22 +1152,34 @@ mod tests {
         let variant = variant_for_game();
 
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
-        session.advance_and_render(&shared, Some(&variant), "variants/abc/", now, 4, |s| {
-            s.to_owned()
-        });
+        session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            Some(0),
+            now,
+            4,
+            |s| s.to_owned(),
+        );
 
-        // far in the future every entry has aged out of history
+        // much later the shared head has moved to the end; the head walks
+        // there (through the variant span, which is never jumped) and the
+        // window discontinuity count reflects the rolled-off splice
         let later = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(500);
-        let rendered =
-            session.advance_and_render(&shared, Some(&variant), "variants/abc/", later, 4, |s| {
-                s.to_owned()
-            });
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            Some(4),
+            later,
+            4,
+            |s| s.to_owned(),
+        );
 
-        assert!(session.entries.is_empty());
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:5\n"));
-        // three discontinuities rolled off the head: splice-in, splice-out,
-        // and none from the leading shared segments
-        assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:2\n"));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:4\n"));
+        // the splice-in discontinuity is behind the head now
+        assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
+        assert!(rendered.contains("live000004.ts"));
     }
 
     #[test]
@@ -817,10 +1189,15 @@ mod tests {
         let variant = variant_for_game();
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
 
-        let rendered =
-            session.advance_and_render(&shared, Some(&variant), "variants/abc/", now, 4, |s| {
-                format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s))
-            });
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            None,
+            now,
+            4,
+            |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
+        );
 
         assert!(rendered.contains("variants/abc/live000000.vtt"));
         assert!(!rendered.contains(".ts\n"));
