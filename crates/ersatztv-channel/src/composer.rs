@@ -424,30 +424,20 @@ impl SessionPlaylist {
             self.head_advanced_at = Some(advanced_at);
         }
 
-        // catch up by jumping, but only over shared content, or past the lag
-        // bound. content the viewer can also get from the shared feed may be
-        // skipped to get back on schedule; variant content is played out
-        // however late it runs, up to the bound
-        let target = desired.min(reachable).max(head);
-        if target > head {
-            let skipped_variant = self
-                .entries
-                .iter()
-                .skip((head - front) as usize)
-                .take((target - head) as usize)
-                .any(|e| e.variant);
-
-            if !skipped_variant {
-                head = target;
-                self.head_advanced_at = Some(now);
-            } else if desired - head > MAX_LAG_SEGMENTS {
-                log::warn!(
-                    "composed serve head {head} fell more than {MAX_LAG_SEGMENTS} segments \
-                     behind shared head {desired}; skipping variant content to {target}"
-                );
-                head = target;
-                self.head_advanced_at = Some(now);
-            }
+        // a head behind the shared one stays behind: every unplayed entry is
+        // content, and what follows a window on a real channel is the next
+        // program, whose beginning a jump would eat. the lag does not grow
+        // window over window, since the next variant has produced by the time
+        // a lagging viewer reaches it; only past the bound is a skip taken,
+        // trading content for a bounded worst-case delay
+        if desired > head && desired - head > MAX_LAG_SEGMENTS {
+            let target = desired.min(reachable).max(head);
+            log::warn!(
+                "composed serve head {head} fell more than {MAX_LAG_SEGMENTS} segments \
+                 behind shared head {desired}; skipping to {target}"
+            );
+            head = target;
+            self.head_advanced_at = Some(now);
         }
 
         self.serve_head = Some(head);
@@ -1224,6 +1214,48 @@ mod tests {
         );
 
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
+    }
+
+    /// A lagging head inside the bound never jumps: what follows a window on
+    /// a real channel is the next program, and a jump would eat its
+    /// beginning. The head walks, one segment per segment duration.
+    #[test]
+    fn a_lagging_head_never_skips_content_inside_the_bound() {
+        let mut session = SessionPlaylist::default();
+        let shared = continuous_shared_with_templated_item();
+        session
+            .decisions
+            .insert(String::from("game"), ItemDecision::Shared);
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
+            s.to_owned()
+        });
+        assert_eq!(session.serve_head, Some(0));
+
+        // the shared head moves 6 ahead (inside the bound); ours walks one
+        // segment per segment duration instead of jumping
+        let rendered = session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(6),
+            base + time::Duration::seconds(4),
+            4,
+            |s| s.to_owned(),
+        );
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+
+        let rendered = session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(6),
+            base + time::Duration::seconds(8),
+            4,
+            |s| s.to_owned(),
+        );
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
     }
 
     /// A fresh session joining a lagging timeline starts a buffer window
