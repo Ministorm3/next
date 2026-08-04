@@ -679,8 +679,9 @@ impl ChannelSession {
                 // a watermark is cosmetic: an unreadable or unprobeable
                 // artwork file must not take down the item it decorates
                 let prepared = async {
-                    let input_source = self.playout_source_to_input_source(w.source.clone())?;
-                    let probe_result = self.resolve_probe(&w.source, &input_source).await?;
+                    let source = cosmetic_source(w.source.clone());
+                    let input_source = self.playout_source_to_input_source(source.clone())?;
+                    let probe_result = self.resolve_probe(&source, &input_source).await?;
                     Ok::<_, ChannelError>((input_source, probe_result))
                 }
                 .await;
@@ -1553,6 +1554,38 @@ fn playout_timing_to_pipeline(
     })
 }
 
+/// Strips streaming options from a source used for decoration. A watermark
+/// fetch is one small read, not a stream: `reconnect` and friends belong to
+/// the media inputs, and the image demuxer that reads a still watermark
+/// rejects them outright, taking down the whole transcode with it.
+fn cosmetic_source(source: PlayoutItemSource) -> PlayoutItemSource {
+    match source {
+        PlayoutItemSource::Http {
+            uri,
+            in_point_ms,
+            out_point_ms,
+            headers,
+            user_agent,
+            timeout_us,
+            probe_hint,
+            ..
+        } => PlayoutItemSource::Http {
+            uri,
+            is_live: None,
+            in_point_ms,
+            out_point_ms,
+            headers,
+            user_agent,
+            timeout_us,
+            reconnect: Some(false),
+            reconnect_delay_max: None,
+            keep_alive: None,
+            probe_hint,
+        },
+        other => other,
+    }
+}
+
 /// Whether a source's URI references `{query:}` variables, meaning the item
 /// may be transcoded more than once with different values and its PTS
 /// envelope must be exact.
@@ -1734,5 +1767,63 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_source_tests {
+    use super::*;
+
+    /// The exact failure this guards against: a watermark whose artwork is a
+    /// url inherited `reconnect` (which defaults on for http sources), the
+    /// image2 demuxer rejected the option, and ffmpeg refused to start,
+    /// taking the item down with it.
+    #[test]
+    fn a_cosmetic_http_source_carries_no_streaming_options() {
+        let source = PlayoutItemSource::Http {
+            uri: String::from("http://localhost:8409/iptv/logos/gen?text=Test"),
+            is_live: Some(true),
+            in_point_ms: None,
+            out_point_ms: None,
+            headers: None,
+            user_agent: None,
+            timeout_us: None,
+            reconnect: None,
+            reconnect_delay_max: Some(2),
+            keep_alive: Some(true),
+            probe_hint: None,
+        };
+
+        let PlayoutItemSource::Http {
+            reconnect,
+            reconnect_delay_max,
+            keep_alive,
+            is_live,
+            uri,
+            ..
+        } = cosmetic_source(source)
+        else {
+            panic!("http stays http");
+        };
+
+        assert_eq!(reconnect, Some(false));
+        assert_eq!(reconnect_delay_max, None);
+        assert_eq!(keep_alive, None);
+        assert_eq!(is_live, None);
+        assert_eq!(uri, "http://localhost:8409/iptv/logos/gen?text=Test");
+    }
+
+    #[test]
+    fn local_sources_pass_through_unchanged() {
+        let source = PlayoutItemSource::Local {
+            path: String::from("/bumps/logo.mp4"),
+            in_point_ms: None,
+            out_point_ms: None,
+            probe_hint: None,
+        };
+        assert!(matches!(
+            cosmetic_source(source),
+            PlayoutItemSource::Local { path, .. } if path == "/bumps/logo.mp4"
+        ));
     }
 }
