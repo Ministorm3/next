@@ -358,6 +358,38 @@ impl ChannelSession {
             ChannelSessionState::SeekAndRealtime
         };
 
+        // a live source starts producing on connect, so a variant spawned
+        // with lead time must not open it before the position its output
+        // claims: connecting early would shift the content off the envelope.
+        // file sources seek, so they may start whenever they are ready
+        let live_item = [
+            Self::resolve_source(&item, |t| t.video.as_ref()),
+            Self::resolve_source(&item, |t| t.audio.as_ref()),
+        ]
+        .iter()
+        .flatten()
+        .any(source_is_live);
+        if live_item {
+            let wait_tn = self.timeout_notify.clone();
+            loop {
+                let now = OffsetDateTime::now_local()? + self.start_time_offset;
+                if now >= self.transcoded_until {
+                    break;
+                }
+                let remaining: Duration = (self.transcoded_until - now)
+                    .try_into()
+                    .unwrap_or(Duration::from_secs(1));
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {}
+                    _ = wait_tn.notified() => {
+                        return Err(ChannelError::IdleTimeout(
+                            self.channel_config.number().to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
         let base_offset = Duration::from_millis(pts_offset_ms);
 
         while self.transcoded_until < item.finish {
