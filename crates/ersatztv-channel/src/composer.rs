@@ -33,6 +33,13 @@ const HISTORY_SECONDS: u64 = 120;
 /// variant still has no output; earlier, composition holds back instead.
 const DECISION_LEAD_SECONDS: u64 = 8;
 
+/// While the timeline is still being produced, the head stays this many
+/// segments behind the newest composed entry, so the served window keeps
+/// the three-target-durations of media rfc8216bis 6.2.2 requires. Worth its
+/// cost in delay: a window at the emission edge serves one segment, and a
+/// player cannot buffer one segment.
+const EDGE_HOLD_SEGMENTS: u64 = 3;
+
 /// How far the serve head may fall behind the shared playlist's own head
 /// before it jumps forward instead of walking. A variant transcode of a live
 /// source cannot outrun realtime, so a late start makes the cohort's timeline
@@ -339,11 +346,19 @@ impl SessionPlaylist {
         let desired = shared_head
             .unwrap_or_else(|| tail.saturating_sub(SERVED_SEGMENTS as u64 - 1).max(front));
 
+        // while emission is still catching up to the shared head, the head
+        // may only reach this far, holding a buffer window open at the edge
+        let reachable = if desired > tail {
+            tail.saturating_sub(EDGE_HOLD_SEGMENTS).max(front)
+        } else {
+            tail
+        };
+
         let mut head = match self.serve_head {
             Some(head) => head.clamp(front, tail),
             None => {
                 self.head_advanced_at = Some(now);
-                desired.clamp(front, tail)
+                desired.clamp(front, reachable)
             }
         };
 
@@ -352,7 +367,7 @@ impl SessionPlaylist {
         // lagging cohort plays through its backlog instead of having the
         // window jump over it, and a cohort never runs ahead of the shared
         // playlist into worked-ahead content
-        let upper = tail.min(desired.max(head));
+        let upper = reachable.min(desired.max(head)).max(head);
         if let Some(mut advanced_at) = self.head_advanced_at {
             while head < upper {
                 let index = (head - front) as usize;
@@ -370,7 +385,7 @@ impl SessionPlaylist {
         // bound. content the viewer can also get from the shared feed may be
         // skipped to get back on schedule; variant content is played out
         // however late it runs, up to the bound
-        let target = desired.min(tail);
+        let target = desired.min(reachable).max(head);
         if target > head {
             let skipped_variant = self
                 .entries
@@ -492,7 +507,15 @@ pub fn compose_timeline(
                     let has_twin = position_ms + 750 >= *anchor_ms;
 
                     if has_twin && position_ms + 750 >= *join_ms {
-                        let vseg = variant.and_then(|v| v.segments.get(variant_index));
+                        // looked up by the index in the file name, not list
+                        // position: the variant's own history trims during a
+                        // window longer than it, and a shifted list would
+                        // re-serve later segments at earlier positions
+                        let vseg = variant.and_then(|v| {
+                            v.segments
+                                .iter()
+                                .find(|s| sequence_of(&s.path) == Some(variant_index as u64))
+                        });
 
                         if let Some(vseg) = vseg {
                             result.push(ComposedEntry {
@@ -1095,8 +1118,9 @@ mod tests {
                 s.to_owned()
             });
 
-        // only live000000/1 are emitted; the head cannot reach shared's 4
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+        // only live000000/1 are emitted; the head holds a window open at
+        // the emission edge instead of chasing shared's 4
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
         assert!(rendered.contains("live000001.ts"));
 
         // two seconds later the head has not skipped anywhere
@@ -1109,7 +1133,7 @@ mod tests {
             4,
             |s| s.to_owned(),
         );
-        assert!(again.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+        assert!(again.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
     }
 
     /// Past the lag bound the head jumps to the newest composed content: a
@@ -1142,7 +1166,62 @@ mod tests {
             |s| s.to_owned(),
         );
 
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:15\n"));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
+    }
+
+    /// A fresh session joining a lagging timeline starts a buffer window
+    /// behind the emission edge, not at it: a one-segment playlist gives a
+    /// player nothing to buffer.
+    #[test]
+    fn a_fresh_session_holds_a_window_open_at_the_emission_edge() {
+        let mut session = SessionPlaylist::default();
+        let shared = continuous_shared_with_templated_item();
+        session
+            .decisions
+            .insert(String::from("game"), ItemDecision::Shared);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        let rendered =
+            session.advance_and_render(&shared, None, "variants/x/", Some(30), now, 4, |s| {
+                s.to_owned()
+            });
+
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
+        assert!(rendered.contains("live000012.ts"));
+        assert!(rendered.contains("live000015.ts"));
+    }
+
+    /// The variant's own playlist trims its history during a window longer
+    /// than it, shifting the segment list. Substitution has to find segments
+    /// by the index in their file name, or a shifted list re-serves later
+    /// segments at earlier positions.
+    #[test]
+    fn substitution_survives_variant_history_trimming() {
+        let shared = shared_with_templated_item();
+        // the variant's first file has been trimmed from its sidecar
+        let variant = PlaylistSidecar {
+            segments: vec![seg("live000001.ts", "game", 4, false)],
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+
+        let timeline = compose_timeline(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            &decided("game", variant_decision(4_000, 0)),
+        );
+
+        let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "live000000.ts",
+                "live000001.ts",
+                "live000002.ts",
+                "variants/abc/live000001.ts",
+                "live000004.ts",
+            ]
+        );
     }
 
     #[test]
