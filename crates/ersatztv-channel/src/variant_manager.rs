@@ -103,6 +103,16 @@ impl VariantManager {
         let requests = read_requests(channel, &recognized).await;
         let shared = read_sidecar(&channel.output_folder.join("live.m3u8")).await;
 
+        // a live cohort request is a viewer of this channel. during a
+        // substituted window that viewer fetches only composed playlists and
+        // variant segments, none of which touch the shared session's files,
+        // so without this the session idles out mid-window with an active
+        // audience. requests here are already pruned of stale ones, so an
+        // audience that leaves still lets the channel wind down
+        if !requests.is_empty() {
+            touch_heartbeat(&channel.output_folder).await;
+        }
+
         let mut sessions = self.sessions.lock().await;
 
         let admitted = admit(&requests, &sessions, shared.is_some(), &channel.number);
@@ -771,6 +781,54 @@ mod tests {
         let second = tokio::fs::read_to_string(&playlist_path).await.unwrap();
 
         assert_eq!(first, second);
+    }
+
+    /// A cohort viewer's polls never touch the shared session's own files
+    /// during a substituted window, so their request file is the only proof
+    /// the channel has an audience. The tick must convert that proof into
+    /// the shared heartbeat, or the session idles out mid-window.
+    #[tokio::test]
+    async fn a_live_cohort_request_keeps_the_shared_heartbeat_fresh() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        let heartbeat = output.join(HEARTBEAT_FILE_NAME);
+        tokio::fs::write(&heartbeat, b"").await.unwrap();
+        let stale = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(&heartbeat, stale).unwrap();
+
+        ersatztv_core::variant_request::publish_request(output, "zip=15216")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        let after = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&heartbeat).unwrap(),
+        );
+        assert!(after > stale, "tick must refresh the shared heartbeat");
+    }
+
+    /// With no live requests the tick leaves the heartbeat alone, so an
+    /// audience that leaves still lets the channel wind down.
+    #[tokio::test]
+    async fn no_requests_leave_the_shared_heartbeat_stale() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        let heartbeat = output.join(HEARTBEAT_FILE_NAME);
+        tokio::fs::write(&heartbeat, b"").await.unwrap();
+        let stale = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(&heartbeat, stale).unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        let after = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&heartbeat).unwrap(),
+        );
+        assert_eq!(after, stale, "an idle channel must still time out");
     }
 
     /// Both playlists a client can ask for are published, since the master
