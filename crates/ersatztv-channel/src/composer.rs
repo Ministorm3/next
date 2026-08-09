@@ -155,12 +155,44 @@ impl SessionPlaylist {
         map_path: fn(&str) -> String,
     ) -> String {
         self.decide_items(shared, variant, now);
+
+        // a sidecar whose newest segment precedes everything held means the
+        // shared session restarted and renumbered from zero; composed state
+        // has to follow it rather than hold a stale history forever. judged
+        // from the sidecar itself, never from the composed timeline: the
+        // timeline truncates at a position whose variant twin is missing,
+        // and with retention reaching behind the held front, a truncation
+        // at a trimmed twin is indistinguishable from renumbering when read
+        // off the timeline alone
+        let newest_shared = shared
+            .segments
+            .iter()
+            .rev()
+            .find_map(|s| sequence_of(&s.path));
+        if let (Some(newest), Some(front)) = (newest_shared, self.entries.front())
+            && newest < front.sequence
+        {
+            log::warn!("shared playlist numbering moved backwards; resetting composed session");
+            self.entries.clear();
+            self.serve_head = None;
+            self.head_advanced_at = None;
+            self.head_discontinuity_sequence = 0;
+        }
+
+        // held positions are append-only history: composition resumes at the
+        // first position not yet held, so trimmed-away twins behind it are
+        // never revisited
+        let resume = ComposeResume {
+            from_sequence: self.entries.back().map(|e| e.sequence + 1),
+            substituting: self.entries.back().is_some_and(|e| e.variant),
+        };
         let timeline = compose_timeline(
             shared,
             variant,
             variant_prefix,
             &self.decisions,
             &self.item_bases,
+            resume,
         );
         self.reconcile(timeline);
         self.trim(now);
@@ -279,19 +311,6 @@ impl SessionPlaylist {
     /// identified by sequence; history is never reordered or rewritten, so
     /// every client sees an append-only playlist.
     fn reconcile(&mut self, timeline: Vec<ComposedEntry>) {
-        // a timeline whose newest entry precedes everything held means the
-        // shared session restarted and renumbered from zero; composed state
-        // has to follow it rather than hold a stale history forever
-        if let (Some(newest), Some(front)) = (timeline.last(), self.entries.front())
-            && newest.sequence < front.sequence
-        {
-            log::warn!("shared playlist numbering moved backwards; resetting composed session");
-            self.entries.clear();
-            self.serve_head = None;
-            self.head_advanced_at = None;
-            self.head_discontinuity_sequence = 0;
-        }
-
         // a sequence this session still needs but the timeline can no longer
         // provide will never arrive; re-anchoring to current content is one
         // clean break for the viewer, where holding would freeze the
@@ -521,12 +540,27 @@ const VARIANT_STALL_SECONDS: f64 = 16.0;
 /// Segments of an undecided templated item are held back; a position the
 /// variant has not produced yet holds the timeline at that edge (up to the
 /// stall threshold) so the timeline never emits around a hole.
+/// Where composition resumes for a session that has already emitted part of
+/// the timeline. `from_sequence` is the first position the session does not
+/// hold yet: everything earlier is append-only history, and its variant
+/// twins may already be trimmed from the variant's own sidecar, so walking
+/// it again would read that absence as a hole and truncate. `substituting`
+/// seeds the source state at the resume point (whether the last held entry
+/// served variant content), so the discontinuity tag at the join comes out
+/// exactly as a continuous walk would have tagged it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComposeResume {
+    pub from_sequence: Option<u64>,
+    pub substituting: bool,
+}
+
 pub fn compose_timeline(
     shared: &PlaylistSidecar,
     variant: Option<&PlaylistSidecar>,
     variant_prefix: &str,
     decisions: &HashMap<String, ItemDecision>,
     item_bases: &HashMap<String, u64>,
+    resume: ComposeResume,
 ) -> Vec<ComposedEntry> {
     let templated: HashMap<&str, bool> = shared
         .pipelines
@@ -536,7 +570,7 @@ pub fn compose_timeline(
 
     let grid_ms = 1000 * SEGMENT_SECONDS;
     let mut result: Vec<ComposedEntry> = Vec::new();
-    let mut substituting = false;
+    let mut substituting = resume.substituting;
 
     for segment in &shared.segments {
         let Some(pdt) = parse_pdt(&segment.program_date_time) else {
@@ -545,6 +579,12 @@ pub fn compose_timeline(
         let Some(sequence) = sequence_of(&segment.path) else {
             continue;
         };
+
+        // history the session already holds; skipped without touching the
+        // substitution state, which `resume` seeded for this very position
+        if resume.from_sequence.is_some_and(|from| sequence < from) {
+            continue;
+        }
 
         let is_templated = templated.get(segment.item_id.as_str()).copied() == Some(true);
 
@@ -804,6 +844,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -830,6 +871,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let sequences: Vec<u64> = timeline.iter().map(|e| e.sequence).collect();
@@ -847,6 +889,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let expected_first = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
@@ -866,6 +909,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         // splice in: first variant segment; splice out: first segment of the
@@ -885,6 +929,7 @@ mod tests {
             "variants/abc/",
             &decided("game", ItemDecision::Shared),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -910,6 +955,7 @@ mod tests {
             "variants/abc/",
             &HashMap::new(),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -931,6 +977,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1102,6 +1149,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(4_000, 4_000)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1382,7 +1430,14 @@ mod tests {
         let variant = variant_for_game();
         let decisions = decided("game", variant_decision(0, 0));
 
-        let before = compose_timeline(&shared, Some(&variant), "variants/abc/", &decisions, &bases);
+        let before = compose_timeline(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            &decisions,
+            &bases,
+            ComposeResume::default(),
+        );
 
         // the item's first segment ages out of the sidecar
         let mut trimmed = shared.clone();
@@ -1393,6 +1448,7 @@ mod tests {
             "variants/abc/",
             &decisions,
             &bases,
+            ComposeResume::default(),
         );
 
         // live000003 (the item's second position) keeps the SECOND variant
@@ -1460,6 +1516,7 @@ mod tests {
             "variants/abc/",
             &decided("game", variant_decision(4_000, 0)),
             &bases_of(&shared),
+            ComposeResume::default(),
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1531,5 +1588,159 @@ mod tests {
 
         assert!(rendered.contains("variants/abc/live000000.vtt"));
         assert!(!rendered.contains(".ts\n"));
+    }
+
+    /// A session that has already emitted history at sequence 40..49, ticked
+    /// against a sidecar whose retention now reaches back to 20.
+    fn session_holding_40_to_49() -> SessionPlaylist {
+        let mut session = SessionPlaylist::default();
+        let shared = PlaylistSidecar {
+            segments: (40..50i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 40))
+                .collect(),
+            pipelines: vec![pipeline("show", 0, false)],
+        };
+        session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(46),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200),
+            4,
+            |s| s.to_owned(),
+        );
+        assert_eq!(session.head_sequence, 40);
+        assert_eq!(session.entries.len(), 10);
+        session
+    }
+
+    /// The regression seen live: retention deepened, so the sidecar reaches
+    /// back past everything held, into a templated item whose variant twins
+    /// have been trimmed. Composition truncates at the missing twin, below
+    /// the held front. That truncation says nothing about shared numbering,
+    /// and the session must hold its history, not reset to the truncated
+    /// timeline.
+    #[test]
+    fn a_timeline_truncated_below_held_history_does_not_reset_the_session() {
+        let mut session = session_holding_40_to_49();
+        session
+            .decisions
+            .insert(String::from("star"), variant_decision(0, 0));
+
+        let mut segments: Vec<SidecarSegment> = (20..25i64)
+            .map(|i| seg(&format!("live{i:06}.ts"), "pre", i * 4, i == 20))
+            .collect();
+        segments
+            .extend((25..35i64).map(|i| seg(&format!("live{i:06}.ts"), "star", i * 4, i == 25)));
+        segments
+            .extend((35..50i64).map(|i| seg(&format!("live{i:06}.ts"), "post", i * 4, i == 35)));
+        let shared = PlaylistSidecar {
+            segments,
+            pipelines: vec![
+                pipeline("pre", 0, false),
+                pipeline("star", 0, true),
+                pipeline("post", 0, false),
+            ],
+        };
+        // the star item's early twins are trimmed; only a later one survives
+        let variant = PlaylistSidecar {
+            segments: vec![seg("live000005.ts", "star", 20, false)],
+            pipelines: vec![pipeline("star", 0, true)],
+        };
+
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(46),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(204),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert_eq!(session.head_sequence, 40);
+        assert_eq!(session.entries.back().map(|e| e.sequence), Some(49));
+        assert!(rendered.contains("live000049.ts"));
+    }
+
+    /// The reset the guard exists for: the shared session restarted and
+    /// renumbered from zero, which the sidecar itself shows. Detection must
+    /// still fire now that it reads the sidecar instead of the timeline.
+    #[test]
+    fn a_renumbered_shared_sidecar_resets_the_session() {
+        let mut session = session_holding_40_to_49();
+
+        let shared = PlaylistSidecar {
+            segments: (0..10i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "encore", 200 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("encore", 0, false)],
+        };
+
+        let rendered = session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(0),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(240),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert_eq!(session.head_sequence, 0);
+        assert_eq!(session.entries.len(), 10);
+        assert!(rendered.contains("live000000.ts"));
+    }
+
+    /// Composition resumes at the first position not yet held, mid
+    /// substitution: the resumed twin must join without a spurious
+    /// discontinuity, exactly as a continuous walk would have tagged it.
+    #[test]
+    fn resuming_mid_substitution_keeps_the_join_continuous() {
+        let mut session = SessionPlaylist::default();
+        let shared = shared_with_templated_item();
+        session
+            .decisions
+            .insert(String::from("game"), variant_decision(0, 0));
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        // only the first twin exists yet: composition holds at position 3
+        let first_twin = PlaylistSidecar {
+            segments: vec![seg("live000000.ts", "game", 0, true)],
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+        session.advance_and_render(
+            &shared,
+            Some(&first_twin),
+            "variants/x/",
+            Some(0),
+            base,
+            4,
+            |s| s.to_owned(),
+        );
+        assert_eq!(session.entries.back().map(|e| e.sequence), Some(2));
+        assert!(session.entries.back().is_some_and(|e| e.variant));
+
+        // the second twin arrives; the session resumes from position 3
+        session.advance_and_render(
+            &shared,
+            Some(&variant_for_game()),
+            "variants/x/",
+            Some(0),
+            base + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+
+        let resumed = session
+            .entries
+            .iter()
+            .find(|e| e.sequence == 3)
+            .expect("position 3 composed");
+        assert!(resumed.variant);
+        assert!(
+            !resumed.discontinuity,
+            "mid-substitution resume must not tag a discontinuity"
+        );
     }
 }
