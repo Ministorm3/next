@@ -365,7 +365,7 @@ impl PlaylistManager {
     }
 
     /// The program date time before which segments have aged out of the
-    /// history window, measured from this playlist's own live edge.
+    /// history window, measured from the segment the window is serving from.
     ///
     /// Program date times advance with produced media, not with the wall
     /// clock: `last_segment_end` is seeded from the channel start time and
@@ -376,8 +376,29 @@ impl PlaylistManager {
     /// clock in that state keeps only `HISTORY_DURATION` minus the lag, and
     /// keeps nothing at all once the lag reaches `HISTORY_DURATION`, which
     /// deletes segment files that playlists being served still reference.
+    ///
+    /// Measuring it against the live edge has the mirror failure. A file
+    /// item transcodes faster than realtime, so produced media runs ahead of
+    /// the head the window serves from, and the budget is spent on segments
+    /// nobody has reached yet: what survives behind that head is
+    /// `HISTORY_DURATION` minus the work-ahead depth, reaching zero on a
+    /// channel that works far enough ahead, and deleting the same
+    /// still-referenced files.
+    ///
+    /// The served head is the anchor that bounds history where viewers
+    /// actually are, under both. Before the first render there is no head
+    /// yet and nothing is being served, so the live edge stands in.
     fn trim_cutoff(&self) -> OffsetDateTime {
-        self.last_segment_end - HISTORY_DURATION
+        let served = self
+            .paced_head
+            .and_then(|head| {
+                self.segments
+                    .get(head.saturating_sub(self.media_sequence) as usize)
+            })
+            .map(|segment| segment.program_date_time)
+            .unwrap_or(self.last_segment_end);
+
+        served - HISTORY_DURATION
     }
 
     fn generate_playlist(
@@ -844,6 +865,33 @@ mod tests {
         );
 
         assert_eq!(expired(&behind), expired(&on_time));
+    }
+
+    #[test]
+    fn history_survives_production_running_ahead_of_the_served_head() {
+        // a file item transcodes faster than realtime, so produced media runs
+        // past the head the window serves from. measuring the cutoff from the
+        // live edge spends the whole budget on media nobody has reached and
+        // deletes everything behind that head, which served playlists still
+        // reference: 60 segments produced, serving from segment 30, so 120s
+        // of media sits ahead of the head
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 60);
+        m.paced_head = Some(30);
+
+        assert_eq!(expired(&m), 0);
+
+        let behind_head = m.paced_head.unwrap() - m.media_sequence - expired(&m) as u64;
+        assert_eq!(behind_head * 4, HISTORY_DURATION.as_secs());
+    }
+
+    #[test]
+    fn history_behind_the_served_head_stays_bounded() {
+        // the mirror of the above: 160s of media sits behind the head, 40s
+        // more than the budget, and the excess still ages out
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
+        m.paced_head = Some(39);
+
+        assert_eq!(expired(&m), 9);
     }
 
     #[test]
