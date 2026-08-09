@@ -41,12 +41,17 @@ const DECISION_LEAD_SECONDS: u64 = 8;
 const EDGE_HOLD_SEGMENTS: u64 = 3;
 
 /// How far the serve head may fall behind the shared playlist's own head
-/// before it jumps forward instead of walking. A variant transcode of a live
-/// source cannot outrun realtime, so a late start makes the cohort's timeline
-/// lag; walking through the lag plays everything a little late, which is the
-/// preferred failure. Past this bound the head skips to the newest composed
-/// content, trading the skipped span for a bounded worst-case delay.
+/// before excess lag starts being trimmed. A trim inside this bound never
+/// happens; past it, the head jumps only onto an item boundary, so what a
+/// viewer loses is the tail of whatever item they were behind in, and they
+/// resume exactly at the start of the next one, the same cut a broadcast
+/// makes. With no boundary in reach the head keeps walking and retries.
 const MAX_LAG_SEGMENTS: u64 = 10;
+
+/// Past this bound the head skips forward wherever it lands, boundary or
+/// not. A gap this size means the cohort's timeline is broken, not late,
+/// and a bounded delay matters more than a clean cut.
+const HARD_LAG_SEGMENTS: u64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemDecision {
@@ -425,19 +430,41 @@ impl SessionPlaylist {
         }
 
         // a head behind the shared one stays behind: every unplayed entry is
-        // content, and what follows a window on a real channel is the next
-        // program, whose beginning a jump would eat. the lag does not grow
-        // window over window, since the next variant has produced by the time
-        // a lagging viewer reaches it; only past the bound is a skip taken,
-        // trading content for a bounded worst-case delay
-        if desired > head && desired - head > MAX_LAG_SEGMENTS {
+        // content, and a jump anywhere else would eat the middle of it. past
+        // the soft bound, excess lag is trimmed only onto an item boundary;
+        // past the hard bound, wherever the head lands
+        let gap = desired.saturating_sub(head);
+        if gap > HARD_LAG_SEGMENTS {
             let target = desired.min(reachable).max(head);
             log::warn!(
-                "composed serve head {head} fell more than {MAX_LAG_SEGMENTS} segments \
-                 behind shared head {desired}; skipping to {target}"
+                "composed serve head {head} fell {gap} segments behind shared \
+                 head {desired}; skipping to {target}"
             );
             head = target;
             self.head_advanced_at = Some(now);
+        } else if gap > MAX_LAG_SEGMENTS {
+            let limit = desired.min(reachable);
+            let mut boundary = None;
+            for entry in self
+                .entries
+                .iter()
+                .skip((head + 1).saturating_sub(front) as usize)
+                .take_while(|e| e.sequence <= limit)
+            {
+                if entry.discontinuity {
+                    boundary = Some(entry.sequence);
+                }
+            }
+
+            if let Some(target) = boundary {
+                log::info!(
+                    "composed serve head {head} trimmed {} segments of lag to item \
+                     boundary {target}",
+                    target - head
+                );
+                head = target;
+                self.head_advanced_at = Some(now);
+            }
         }
 
         self.serve_head = Some(head);
@@ -1256,6 +1283,70 @@ mod tests {
             |s| s.to_owned(),
         );
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
+    }
+
+    /// Past the soft bound, lag is trimmed only onto an item boundary: the
+    /// viewer loses the tail of the item they were behind in and resumes at
+    /// the start of the next one, never mid-content.
+    #[test]
+    fn excess_lag_is_trimmed_onto_an_item_boundary() {
+        let mut session = SessionPlaylist::default();
+        let shared = continuous_shared_with_templated_item();
+        session
+            .decisions
+            .insert(String::from("game"), ItemDecision::Shared);
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
+            s.to_owned()
+        });
+        assert_eq!(session.serve_head, Some(0));
+
+        // the gap crosses the soft bound; discontinuities sit at 6 and 11,
+        // and the trim lands on the furthest one within reach
+        let rendered = session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(15),
+            base + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:11\n"));
+        assert!(rendered.contains("live000011.ts"));
+    }
+
+    /// With no boundary in reach the trim defers: the head keeps walking at
+    /// playback speed rather than cutting mid-content.
+    #[test]
+    fn a_trim_with_no_boundary_in_reach_defers() {
+        let mut session = SessionPlaylist::default();
+        let segments = (0..16i64)
+            .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 0))
+            .collect();
+        let shared = PlaylistSidecar {
+            segments,
+            pipelines: vec![pipeline("show", 0, false)],
+        };
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+
+        session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
+            s.to_owned()
+        });
+        assert_eq!(session.serve_head, Some(0));
+
+        let rendered = session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(15),
+            base + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
+        assert_eq!(session.serve_head, Some(0));
     }
 
     /// A fresh session joining a lagging timeline starts a buffer window
