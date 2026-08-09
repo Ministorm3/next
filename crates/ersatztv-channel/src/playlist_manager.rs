@@ -17,18 +17,24 @@ const MIN_SEGMENTS: usize = 4;
 /// and their files deleted. Two minutes.
 const HISTORY_DURATION: Duration = Duration::from_secs(120);
 
-/// How much media a VARIANT session keeps instead. A variant's segments are
-/// consumed on the cohort's serve timeline, which trails this session's own
-/// production by the shared session's serve lag, so a twin deleted on this
-/// session's clock can still be referenced by composed playlists, and the
-/// reference then serves 404s at the start of the substituted window.
+/// STOPGAP: how much media a VARIANT session keeps instead.
+///
+/// A variant's segments are consumed on the cohort's serve timeline, which
+/// trails this session's own production by the shared session's serve lag,
+/// so a twin deleted on this session's clock can still be referenced by
+/// composed playlists, and the reference then serves 404s at the start of
+/// the substituted window.
 ///
 /// No constant can be correct here while that lag is unbounded; this one is
-/// a stopgap sized to clear every lag observed so far by an order of
-/// magnitude while still bounding what a long-running variant can hold on
-/// disk. Trimming under it logs a warning, because it means the lag or the
-/// item has outgrown the stopgap. The real fix is composer-owned twin
-/// lifetime: the component holding the references deletes the files.
+/// sized to clear every lag observed so far by an order of magnitude while
+/// still bounding what a long-running variant can hold on disk. Trimming
+/// under it logs a warning, because it means the lag or the item has
+/// outgrown the stopgap.
+///
+/// TODO: replace with composer-owned twin lifetime: the composer holds the
+/// only references to variant segments, so it should delete their files as
+/// entries age out of composed history, and this constant should not exist.
+/// Tracked in the timeline rearchitecture.
 pub(crate) const VARIANT_HISTORY_DURATION: Duration = Duration::from_secs(1800);
 
 // Cross-module contract: a composed cohort playlist's serve head may trail
@@ -71,6 +77,16 @@ pub struct PlaylistManager {
     /// session starts late or a source pauses (a live item that cannot be
     /// read ahead), and a wall-anchored window then runs into the tail
     /// floor and freezes for however long production takes to resume.
+    ///
+    /// TODO: pacing at exactly 1x can never recover time it loses, so every
+    /// pause it eats becomes permanent deficit against the schedule, and the
+    /// gap between production and serving grows for the life of the session
+    /// (measured 10s -> 272s across six live transitions on 2026-08-09).
+    /// Everything downstream drifts with it: work-ahead disk, variant spawn
+    /// timing, star content staleness, and the reference lifetimes the
+    /// VARIANT_HISTORY_DURATION stopgap papers over. The timeline
+    /// rearchitecture must bound this deficit (candidates: recovery at item
+    /// boundaries, or a fixed broadcast delay).
     paced_head: Option<u64>,
     paced_advanced_at: Option<OffsetDateTime>,
     discontinuity_sequence: u64,
@@ -156,8 +172,8 @@ impl PlaylistManager {
     }
 
     /// Replaces the retention budget behind the served head. Set once at
-    /// session start, before any segment lands; variants use
-    /// [`VARIANT_HISTORY_DURATION`].
+    /// session start, before any segment lands; variants use the STOPGAP
+    /// [`VARIANT_HISTORY_DURATION`] (see the TODO there).
     pub fn set_history_duration(&mut self, history: Duration) {
         self.history = history;
     }
@@ -290,8 +306,9 @@ impl PlaylistManager {
             if self.history != HISTORY_DURATION && !self.extended_trim_warned {
                 self.extended_trim_warned = true;
                 log::warn!(
-                    "extended segment retention of {}s exhausted; trimming segments \
-                     that composed playlists may still reference",
+                    "STOPGAP retention of {}s exhausted; trimming segments that \
+                     composed playlists may still reference (serve lag or item \
+                     length has outgrown VARIANT_HISTORY_DURATION)",
                     self.history.as_secs()
                 );
             }

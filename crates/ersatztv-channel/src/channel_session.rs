@@ -301,10 +301,12 @@ impl ChannelSession {
     ) -> Result<(), ChannelError> {
         self.prep_output_folder().await?;
 
-        // a variant's twins are consumed on the cohort's serve timeline,
-        // which trails this session's production by the shared session's
-        // serve lag; the extended budget keeps twins alive across that lag
-        // instead of trimming them out from under composed playlists
+        // STOPGAP: a variant's twins are consumed on the cohort's serve
+        // timeline, which trails this session's production by the shared
+        // session's serve lag; the extended budget keeps twins alive across
+        // that lag instead of trimming them out from under composed
+        // playlists. TODO: remove when the composer owns twin lifetimes
+        // (see VARIANT_HISTORY_DURATION).
         self.playlist_manager
             .lock()
             .await
