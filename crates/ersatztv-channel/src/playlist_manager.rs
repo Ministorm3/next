@@ -17,6 +17,18 @@ const MIN_SEGMENTS: usize = 4;
 /// and their files deleted. Two minutes.
 const HISTORY_DURATION: Duration = Duration::from_secs(120);
 
+// Cross-module contract: a composed cohort playlist's serve head may trail
+// the shared playlist's head by up to `composer::HARD_LAG_SEGMENTS` before
+// the composer forces it forward, while this module deletes segment files
+// `HISTORY_DURATION` behind the head it serves from. The lag bound must
+// stay strictly inside the retention window, or a lagging cohort window
+// references segments whose files are already deleted and clients 404.
+const _: () = assert!(
+    ersatztv_channel::composer::HARD_LAG_SEGMENTS
+        < HISTORY_DURATION.as_secs() / ersatztv_channel::composer::SEGMENT_SECONDS,
+    "composer::HARD_LAG_SEGMENTS must stay strictly inside the segment retention window"
+);
+
 #[derive(Clone)]
 pub struct SubtitleSource {
     pub cues: Arc<Vec<Cue>>,

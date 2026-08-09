@@ -24,6 +24,14 @@ use time::macros::format_description;
 /// arithmetic, exactly as the worker anchors its own playlist.
 pub const SEGMENT_SECONDS: u64 = 4;
 
+// This mirror is maintained by hand. If it disagrees with the length the
+// pipeline actually encodes with, every grid computation here silently
+// drifts off the real segments.
+const _: () = assert!(
+    SEGMENT_SECONDS == ffpipeline::pipeline::SEGMENT_SECONDS as u64,
+    "composer::SEGMENT_SECONDS must mirror ffpipeline::pipeline::SEGMENT_SECONDS"
+);
+
 const SERVED_SEGMENTS: usize = 10;
 
 /// How long an entry stays in session history after leaving the serve window.
@@ -51,7 +59,13 @@ const MAX_LAG_SEGMENTS: u64 = 10;
 /// Past this bound the head skips forward wherever it lands, boundary or
 /// not. A gap this size means the cohort's timeline is broken, not late,
 /// and a bounded delay matters more than a clean cut.
-const HARD_LAG_SEGMENTS: u64 = 20;
+///
+/// Must stay strictly inside the playlist manager's retention window
+/// (`HISTORY_DURATION` over `SEGMENT_SECONDS`): a serve head is allowed to
+/// trail the shared head by this much, and everything it can point at must
+/// still exist on disk. The compile-time assertion lives next to
+/// `HISTORY_DURATION` in `playlist_manager.rs`.
+pub const HARD_LAG_SEGMENTS: u64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemDecision {
