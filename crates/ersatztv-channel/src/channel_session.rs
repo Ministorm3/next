@@ -38,7 +38,9 @@ use tokio::sync::Mutex;
 
 use crate::dossier::DossierBuilder;
 use crate::local_proxy::{LocalProxyServer, ScriptCommand};
-use crate::playlist_manager::{PlaylistManager, PlaylistManagerOutputFiles, SubtitleSource};
+use crate::playlist_manager::{
+    PlaylistManager, PlaylistManagerOutputFiles, SubtitleSource, VARIANT_HISTORY_DURATION,
+};
 use crate::playout_loader::PlayoutLoader;
 use crate::pts_scanner::{PtsScanner, PtsTime};
 
@@ -298,6 +300,15 @@ impl ChannelSession {
         shared_duration_ms: u64,
     ) -> Result<(), ChannelError> {
         self.prep_output_folder().await?;
+
+        // a variant's twins are consumed on the cohort's serve timeline,
+        // which trails this session's production by the shared session's
+        // serve lag; the extended budget keeps twins alive across that lag
+        // instead of trimming them out from under composed playlists
+        self.playlist_manager
+            .lock()
+            .await
+            .set_history_duration(VARIANT_HISTORY_DURATION);
 
         self.ffmpeg_info = FfmpegInfo::load(
             &self.ffmpeg_path,

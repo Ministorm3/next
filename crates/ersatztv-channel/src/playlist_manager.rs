@@ -17,6 +17,20 @@ const MIN_SEGMENTS: usize = 4;
 /// and their files deleted. Two minutes.
 const HISTORY_DURATION: Duration = Duration::from_secs(120);
 
+/// How much media a VARIANT session keeps instead. A variant's segments are
+/// consumed on the cohort's serve timeline, which trails this session's own
+/// production by the shared session's serve lag, so a twin deleted on this
+/// session's clock can still be referenced by composed playlists, and the
+/// reference then serves 404s at the start of the substituted window.
+///
+/// No constant can be correct here while that lag is unbounded; this one is
+/// a stopgap sized to clear every lag observed so far by an order of
+/// magnitude while still bounding what a long-running variant can hold on
+/// disk. Trimming under it logs a warning, because it means the lag or the
+/// item has outgrown the stopgap. The real fix is composer-owned twin
+/// lifetime: the component holding the references deletes the files.
+pub(crate) const VARIANT_HISTORY_DURATION: Duration = Duration::from_secs(1800);
+
 // Cross-module contract: a composed cohort playlist's serve head may trail
 // the shared playlist's head by up to `composer::HARD_LAG_SEGMENTS` before
 // the composer forces it forward, while this module deletes segment files
@@ -71,6 +85,13 @@ pub struct PlaylistManager {
 
     current_item_id: String,
     pipelines: Vec<SidecarPipeline>,
+
+    /// Retention budget behind the served head; [`HISTORY_DURATION`] for a
+    /// shared session, [`VARIANT_HISTORY_DURATION`] for a variant.
+    history: Duration,
+    /// An extended budget that actually trims has been outgrown by serve
+    /// lag or item length; warned once per session.
+    extended_trim_warned: bool,
 
     timeout: bool,
 }
@@ -127,8 +148,18 @@ impl PlaylistManager {
             current_item_id: String::new(),
             pipelines: Vec::new(),
 
+            history: HISTORY_DURATION,
+            extended_trim_warned: false,
+
             timeout: false,
         }
+    }
+
+    /// Replaces the retention budget behind the served head. Set once at
+    /// session start, before any segment lands; variants use
+    /// [`VARIANT_HISTORY_DURATION`].
+    pub fn set_history_duration(&mut self, history: Duration) {
+        self.history = history;
     }
 
     pub fn timeout(&self) -> &bool {
@@ -256,6 +287,14 @@ impl PlaylistManager {
         // trim old segments
         let cutoff = self.trim_cutoff();
         while !self.segments.is_empty() && self.segments[0].program_date_time < cutoff {
+            if self.history != HISTORY_DURATION && !self.extended_trim_warned {
+                self.extended_trim_warned = true;
+                log::warn!(
+                    "extended segment retention of {}s exhausted; trimming segments \
+                     that composed playlists may still reference",
+                    self.history.as_secs()
+                );
+            }
             if let Some(removed) = self.segments.remove(0) {
                 self.media_sequence += 1;
                 if self.discontinuity_before.contains(&removed.path) {
@@ -410,7 +449,7 @@ impl PlaylistManager {
             .map(|segment| segment.program_date_time)
             .unwrap_or(self.last_segment_end);
 
-        served - HISTORY_DURATION
+        served - self.history
     }
 
     fn generate_playlist(
@@ -904,6 +943,42 @@ mod tests {
         m.paced_head = Some(39);
 
         assert_eq!(expired(&m), 9);
+    }
+
+    /// The star-opening 404s of 2026-08-09: a 150s variant produced 38 twins
+    /// and its default 120s budget deleted the first four before the lagging
+    /// cohort viewer arrived. Under the variant budget the whole envelope
+    /// survives, and keeps surviving across serve lags far beyond any
+    /// observed.
+    #[test]
+    fn variant_history_keeps_the_whole_envelope_alive() {
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 38);
+        assert_eq!(expired(&m), 8);
+
+        m.set_history_duration(VARIANT_HISTORY_DURATION);
+        assert_eq!(expired(&m), 0);
+
+        // still zero with the serve lag an order of magnitude past the
+        // worst measured (272s)
+        let long = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 38 + 60);
+        let mut long_variant = long;
+        long_variant.set_history_duration(VARIANT_HISTORY_DURATION);
+        assert_eq!(expired(&long_variant), 0);
+    }
+
+    /// The extended budget is a cap, not unlimited: an item that outgrows it
+    /// still trims, bounding what a long-running variant can hold on disk.
+    #[test]
+    fn variant_history_still_bounds_a_long_running_item() {
+        // 500 four-second segments is 2000s of media, 200s past the budget
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 500);
+        m.set_history_duration(VARIANT_HISTORY_DURATION);
+
+        assert_eq!(expired(&m), 50);
+        assert_eq!(
+            (m.segments.len() - expired(&m)) as u64 * 4,
+            VARIANT_HISTORY_DURATION.as_secs()
+        );
     }
 
     #[test]
