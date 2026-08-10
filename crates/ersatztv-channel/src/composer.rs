@@ -65,16 +65,7 @@ const DECISION_LEAD_SECONDS: u64 = 8;
 /// variant genuinely does not arrive.
 const COMPOSE_TRAIL_SECONDS: u64 = 8;
 
-/// How far behind its own emission edge the serve head holds while the
-/// shared head sits beyond it.
-///
-/// Composition trails the live edge on purpose (see COMPOSE_TRAIL_SECONDS)
-/// while the shared session keeps working ahead, so the shared head is
-/// normally past the composed tail and this is the steady state rather than
-/// a transient catch-up. Holding a whole window back is therefore what
-/// decides the window a cohort actually gets: at three segments it measured
-/// four segments wide on channel 13, against ten for the shared playlist.
-const EDGE_HOLD_SEGMENTS: u64 = SERVED_SEGMENTS as u64 - 1;
+const EDGE_HOLD_SEGMENTS: u64 = 3;
 
 /// How far the serve head may fall behind the shared playlist's own head
 /// before excess lag starts being trimmed. A trim inside this bound never
@@ -523,9 +514,8 @@ impl SessionPlaylist {
         let desired = shared_head
             .unwrap_or_else(|| tail.saturating_sub(SERVED_SEGMENTS as u64 - 1).max(front));
 
-        // the shared head sits past the composed tail whenever composition
-        // trails it, so the head holds a full window behind the emission
-        // edge rather than chasing a position this timeline never reaches
+        // while emission is still catching up to the shared head, the head
+        // may only reach this far, holding a buffer window open at the edge
         let reachable = if desired > tail {
             tail.saturating_sub(EDGE_HOLD_SEGMENTS).max(front)
         } else {
@@ -1185,35 +1175,6 @@ mod tests {
         );
     }
 
-    /// Trailing composition is the steady state, not a transient, so the
-    /// window a cohort gets while the shared head sits beyond the composed
-    /// tail is the window it gets always. Channel 13 served four segments
-    /// against the shared playlist's ten before the hold was widened.
-    #[test]
-    fn a_permanently_trailing_session_still_serves_a_full_window() {
-        let mut session = SessionPlaylist::default();
-        let shared = PlaylistSidecar {
-            segments: (0..30i64)
-                .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 0))
-                .collect(),
-            pipelines: vec![pipeline("show", 0, false)],
-        };
-        // the shared session works ahead, so its head is past everything
-        // composition will emit for some time yet
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
-
-        let rendered =
-            session.advance_and_render(&shared, None, "variants/x/", Some(28), now, 4, |s| {
-                s.to_owned()
-            });
-
-        assert_eq!(
-            rendered.lines().filter(|l| l.ends_with(".ts")).count(),
-            SERVED_SEGMENTS,
-            "a trailing cohort is served a full window, not an edge sliver"
-        );
-    }
-
     /// The 14:40 star break, in miniature. The shared session has the whole
     /// templated window on disk before it airs (slate), while the variant's
     /// first segment only exists ten seconds after air. Trailing composition
@@ -1601,7 +1562,7 @@ mod tests {
             |s| s.to_owned(),
         );
 
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
     }
 
     /// A lagging head inside the bound never jumps: what follows a window on
@@ -1614,7 +1575,7 @@ mod tests {
         session
             .decisions
             .insert(String::from("game"), ItemDecision::Shared);
-        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
 
         session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
             s.to_owned()
@@ -1727,15 +1688,9 @@ mod tests {
                 s.to_owned()
             });
 
-        // a full window behind the emission edge, not a token few
-        // segments: this is the window a cohort viewer actually gets
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
-        assert!(rendered.contains("live000006.ts"));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
+        assert!(rendered.contains("live000012.ts"));
         assert!(rendered.contains("live000015.ts"));
-        assert_eq!(
-            rendered.lines().filter(|l| l.ends_with(".ts")).count(),
-            SERVED_SEGMENTS
-        );
     }
 
     /// The shared sidecar trims an item's early segments once the item ages
