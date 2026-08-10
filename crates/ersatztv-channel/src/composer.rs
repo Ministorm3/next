@@ -46,6 +46,25 @@ const DECISION_LEAD_SECONDS: u64 = 8;
 /// the three-target-durations of media rfc8216bis 6.2.2 requires. Worth its
 /// cost in delay: a window at the emission edge serves one segment, and a
 /// player cannot buffer one segment.
+/// How far behind the live edge the composed timeline stops.
+///
+/// A cohort's viewer plays at the newest segment its playlist offers, so
+/// whatever the composer emits sets how far behind wall clock that viewer
+/// sits. Left to follow production, that distance is an accident: file
+/// content transcodes far faster than realtime, so the composed edge runs
+/// AHEAD of wall and drags viewers up to it. A variant cannot follow them
+/// there. Its source is live, so it connects at air time and its first
+/// segment closes about ten seconds later, measured on channel 13. A viewer
+/// at the live edge therefore reaches a templated window before any variant
+/// output for it can exist, and waits.
+///
+/// Holding composition this far behind the edge makes the distance a
+/// decision instead. Viewers settle roughly a client buffer further back,
+/// past the variant's startup, so the substitution is ready before they ask
+/// for it and slate stays what it is meant to be: what plays when the
+/// variant genuinely does not arrive.
+const COMPOSE_TRAIL_SECONDS: u64 = 8;
+
 const EDGE_HOLD_SEGMENTS: u64 = 3;
 
 /// How far the serve head may fall behind the shared playlist's own head
@@ -244,6 +263,7 @@ impl SessionPlaylist {
             &self.decisions,
             &self.item_bases,
             resume,
+            now - time::Duration::seconds(COMPOSE_TRAIL_SECONDS as i64),
         );
         self.reconcile(timeline);
         self.trim(now);
@@ -642,6 +662,7 @@ pub fn compose_timeline(
     decisions: &HashMap<String, ItemDecision>,
     item_bases: &HashMap<String, u64>,
     resume: ComposeResume,
+    horizon: OffsetDateTime,
 ) -> Vec<ComposedEntry> {
     let templated: HashMap<&str, bool> = shared
         .pipelines
@@ -657,6 +678,13 @@ pub fn compose_timeline(
         let Some(pdt) = parse_pdt(&segment.program_date_time) else {
             continue;
         };
+
+        // stop at the trailing edge rather than following production. the
+        // timeline is append-only and ordered, so this defers these
+        // positions to a later tick instead of dropping them
+        if pdt > horizon {
+            break;
+        }
         let Some(sequence) = sequence_of(&segment.path) else {
             continue;
         };
@@ -771,6 +799,11 @@ mod tests {
     use ersatztv_core::sidecar::{SidecarPipeline, SidecarSegment};
 
     use super::*;
+
+    /// A horizon far past every fixture, for the tests that exercise what
+    /// composition decides rather than how far it runs.
+    const NO_HORIZON: OffsetDateTime =
+        OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::days(1));
 
     fn seg(path: &str, item: &str, offset_secs: i64, discontinuity: bool) -> SidecarSegment {
         SidecarSegment {
@@ -927,6 +960,7 @@ mod tests {
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -954,6 +988,7 @@ mod tests {
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let sequences: Vec<u64> = timeline.iter().map(|e| e.sequence).collect();
@@ -972,6 +1007,7 @@ mod tests {
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let expected_first = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
@@ -992,6 +1028,7 @@ mod tests {
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         // splice in: first variant segment; splice out: first segment of the
@@ -1012,6 +1049,7 @@ mod tests {
             &decided("game", ItemDecision::Shared),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1038,6 +1076,7 @@ mod tests {
             &HashMap::new(),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1060,6 +1099,7 @@ mod tests {
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1106,6 +1146,124 @@ mod tests {
         let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
         session.decide_items(&shared, None, late);
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+    }
+
+    /// Content produced faster than realtime must not drag the composed edge
+    /// past wall clock. This is the shape of a slate window: the shared
+    /// session has the next two minutes on disk already.
+    #[test]
+    fn composition_stops_at_the_trailing_edge_of_worked_ahead_content() {
+        let mut session = SessionPlaylist::default();
+        let shared = PlaylistSidecar {
+            segments: (0..30i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("show", 0, false)],
+        };
+        // 40s of wall time has passed against 120s of produced media
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(40);
+
+        session.advance_and_render(&shared, None, "variants/x/", Some(0), now, 4, |s| {
+            s.to_owned()
+        });
+
+        let newest = session.entries.back().expect("entries");
+        assert_eq!(
+            newest.program_date_time,
+            now - time::Duration::seconds(COMPOSE_TRAIL_SECONDS as i64),
+            "the composed edge trails wall clock instead of following production"
+        );
+    }
+
+    /// The 14:40 star break, in miniature. The shared session has the whole
+    /// templated window on disk before it airs (slate), while the variant's
+    /// first segment only exists ten seconds after air. Trailing composition
+    /// must not reach the window until the variant is anchored, so the
+    /// cohort joins the variant at position zero rather than watching slate.
+    #[test]
+    fn a_trailing_edge_reaches_a_slate_window_only_once_its_variant_exists() {
+        let mut session = SessionPlaylist::with_label(String::from("cohort"));
+        let mut segments: Vec<SidecarSegment> = (0..10i64)
+            .map(|i| seg(&format!("live{i:06}.ts"), "logo", i * 4, i == 0))
+            .collect();
+        segments
+            .extend((10..48i64).map(|i| seg(&format!("live{i:06}.ts"), "star", i * 4, i == 10)));
+        let mut shared = PlaylistSidecar {
+            segments,
+            pipelines: vec![pipeline("logo", 0, false), pipeline("star", 40_000, true)],
+        };
+        shared.pipelines[1].fallback = true;
+
+        // air is 40s; at 44s the variant has produced nothing yet, and the
+        // trailing edge has not reached the window either
+        let air = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(40);
+        session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(0),
+            air + time::Duration::seconds(4),
+            4,
+            |s| s.to_owned(),
+        );
+        assert!(
+            session.entries.iter().all(|e| !e.variant),
+            "nothing substituted yet"
+        );
+        assert!(
+            session
+                .entries
+                .back()
+                .is_some_and(|e| e.program_date_time < air),
+            "the trailing edge has not reached the window"
+        );
+
+        // the variant's first segments land ten seconds after air; by the
+        // time the trailing edge arrives, they are there to substitute
+        let variant = PlaylistSidecar {
+            segments: (0..6i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "star", 40 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![{
+                let mut p = pipeline("star", 40_000, true);
+                p.fallback = false;
+                p
+            }],
+        };
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(0),
+            air + time::Duration::seconds(16),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert!(
+            rendered.contains("#EXT-X-MEDIA-SEQUENCE:"),
+            "a playlist is still rendered"
+        );
+        let star_positions: Vec<_> = session
+            .entries
+            .iter()
+            .filter(|e| e.sequence >= 10)
+            .map(|e| (e.sequence, e.variant))
+            .collect();
+        assert_eq!(
+            star_positions,
+            vec![(10, true), (11, true), (12, true)],
+            "every composed position of the window came from the variant, \
+             starting at the window's first position"
+        );
+        assert_eq!(
+            session.decisions.get("star"),
+            Some(&ItemDecision::Variant {
+                join_ms: 0,
+                anchor_ms: 0
+            }),
+            "no slate position was committed ahead of the variant"
+        );
     }
 
     #[test]
@@ -1265,6 +1423,7 @@ mod tests {
             &decided("game", variant_decision(4_000, 4_000)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1287,7 +1446,7 @@ mod tests {
         let mut session = SessionPlaylist::default();
         let shared = shared_with_templated_item();
         let variant = variant_for_game();
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(28);
 
         let first = session.advance_and_render(
             &shared,
@@ -1348,7 +1507,7 @@ mod tests {
         let mut session = SessionPlaylist::default();
         let shared = shared_with_templated_item();
         // no variant output yet: composition holds before the game item
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(18);
 
         let rendered =
             session.advance_and_render(&shared, None, "variants/abc/", Some(4), now, 4, |s| {
@@ -1379,7 +1538,7 @@ mod tests {
     fn a_head_past_the_lag_bound_jumps_to_the_emission_edge() {
         let mut session = SessionPlaylist::default();
         let shared = continuous_shared_with_templated_item();
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
 
         // decided shared so the whole timeline emits
         session
@@ -1458,7 +1617,7 @@ mod tests {
         session
             .decisions
             .insert(String::from("game"), ItemDecision::Shared);
-        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
 
         session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
             s.to_owned()
@@ -1522,7 +1681,7 @@ mod tests {
         session
             .decisions
             .insert(String::from("game"), ItemDecision::Shared);
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
 
         let rendered =
             session.advance_and_render(&shared, None, "variants/x/", Some(30), now, 4, |s| {
@@ -1552,6 +1711,7 @@ mod tests {
             &decisions,
             &bases,
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         // the item's first segment ages out of the sidecar
@@ -1564,6 +1724,7 @@ mod tests {
             &decisions,
             &bases,
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         // live000003 (the item's second position) keeps the SECOND variant
@@ -1632,6 +1793,7 @@ mod tests {
             &decided("game", variant_decision(4_000, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
+            NO_HORIZON,
         );
 
         let paths: Vec<&str> = timeline.iter().map(|e| e.path.as_str()).collect();
@@ -1720,7 +1882,7 @@ mod tests {
             None,
             "variants/x/",
             Some(46),
-            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(204),
             4,
             |s| s.to_owned(),
         );
@@ -1797,7 +1959,7 @@ mod tests {
             None,
             "variants/x/",
             Some(0),
-            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(240),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(244),
             4,
             |s| s.to_owned(),
         );
