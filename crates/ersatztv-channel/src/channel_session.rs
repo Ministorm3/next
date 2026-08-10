@@ -817,7 +817,13 @@ impl ChannelSession {
             // the -t clamp keeps their PTS envelopes identical, so one can be
             // substituted for the other at the playlist layer
             pad_to_duration: is_templated,
-            realtime,
+            // slate is never readrate-paced: pacing this padded pipeline runs
+            // measurably BELOW realtime on real hardware (0.65x live, 0.80x
+            // in isolation, 3.5x unpaced on the same box), which starves the
+            // served window for the whole slate slot. Unpaced production is
+            // safe here because the run loop's schedule-coordinate throttle
+            // sleeps once the completed slot puts the buffer over its cap
+            realtime: realtime && !slate,
             is_live,
             frame_rate: if video_probe_result.is_still_image() {
                 Some(FrameRate::default())
