@@ -42,4 +42,11 @@ pub struct SidecarPipeline {
     /// variant sessions may transcode it with different values.
     #[serde(default)]
     pub templated: bool,
+    /// Whether the shared session substituted configured slate content for
+    /// this templated window instead of tuning the live source. Declared at
+    /// production time, never inferred: a templated pipeline with this set
+    /// still spawns variants, and what viewers of the shared stream see is
+    /// slate.
+    #[serde(default)]
+    pub fallback: bool,
 }

@@ -412,7 +412,7 @@ impl ChannelSession {
 
             // a variant failure is terminal: the consumer falls back to the
             // shared feed, which is strictly better than substituted filler
-            let (finish, _is_complete) = self.transcode_item(&item, true, Some(pts)).await?;
+            let (finish, _is_complete) = self.transcode_item(&item, true, Some(pts), false).await?;
 
             if finish <= self.transcoded_until {
                 return Err(ChannelError::StreamFailure(String::from(
@@ -605,10 +605,32 @@ impl ChannelSession {
             }
         };
 
+        // slate-on-shared: a templated window plays configured slate content
+        // on the shared session instead of tuning the live source. The item
+        // keeps its identity, so the sidecar still declares a templated
+        // envelope and cohort viewers still get the live presentation through
+        // variant sessions; what changes is only what the shared stream shows
+        let mut slate = false;
+        let current_item = match Self::item_is_templated(&current_item) {
+            true => match self.load_slate_path().await {
+                Some(slate_path) => {
+                    log::info!(
+                        "item {}: shared session plays slate {} for this templated window",
+                        current_item.id,
+                        slate_path
+                    );
+                    slate = true;
+                    slate_item(current_item, slate_path)
+                }
+                None => current_item,
+            },
+            false => current_item,
+        };
+
         let pts_duration = pts_time.map(|p| p.duration);
 
         let result = self
-            .transcode_item(&current_item, realtime, pts_duration)
+            .transcode_item(&current_item, realtime, pts_duration, slate)
             .await;
 
         let (finish, is_complete) = match result {
@@ -617,7 +639,7 @@ impl ChannelSession {
             Err(e) => {
                 log::error!("item failed, replacing with black/silence: {e}");
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
-                self.transcode_item(&fake_item, realtime, pts_duration)
+                self.transcode_item(&fake_item, realtime, pts_duration, false)
                     .await?
             }
         };
@@ -635,6 +657,7 @@ impl ChannelSession {
         current_item: &PlayoutItem,
         realtime: bool,
         pts_duration: Option<Duration>,
+        slate: bool,
     ) -> Result<(OffsetDateTime, bool), ChannelError> {
         // prioritize source from audio tracks, then default source
         let audio_source = Self::resolve_source(current_item, |t| t.audio.as_ref())
@@ -749,7 +772,11 @@ impl ChannelSession {
         // live sources can never seek or work ahead
         let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
 
-        let is_templated = source_is_templated(&video_source) || source_is_templated(&audio_source);
+        // slate stands in for a templated source, so it must keep the
+        // templated envelope contract (sidecar declaration, pts padding)
+        // even though the slate source itself is a plain file
+        let is_templated =
+            slate || source_is_templated(&video_source) || source_is_templated(&audio_source);
 
         // generate pipeline
         let output_settings = OutputSettings {
@@ -813,23 +840,30 @@ impl ChannelSession {
             ChannelSessionState::ZeroAndWorkAhead | ChannelSessionState::ZeroAndRealtime
         );
 
+        // a slate item must fill its whole remaining window in one pipeline
+        // invocation: work-ahead chunking would declare one sidecar envelope
+        // per chunk, and a variant reading the first chunk's duration would
+        // mistake it for a mid-item join. input_timing's realtime flag only
+        // controls that chunking, so slate forces it; output pacing below
+        // still follows the real `realtime`
+        let whole_window = realtime || slate;
         let audio_timing = self.input_timing(
             current_item,
             &audio_source,
             start_at_zero,
-            realtime,
+            whole_window,
             is_live,
         );
         let video_timing = self.input_timing(
             current_item,
             &video_source,
             start_at_zero,
-            realtime,
+            whole_window,
             is_live,
         );
         let subtitle_timing = subtitle_source
             .as_ref()
-            .map(|s| self.input_timing(current_item, s, start_at_zero, realtime, is_live));
+            .map(|s| self.input_timing(current_item, s, start_at_zero, whole_window, is_live));
 
         let video_index = current_item
             .tracks
@@ -952,6 +986,7 @@ impl ChannelSession {
                 &current_item.id,
                 pipeline_duration_ms,
                 is_templated,
+                slate,
             )
             .await?;
 
@@ -1275,6 +1310,53 @@ impl ChannelSession {
             finish,
             is_complete,
         }
+    }
+
+    /// Whether any of the item's resolved sources is templated, judged on
+    /// the original playout item before any slate substitution.
+    fn item_is_templated(item: &PlayoutItem) -> bool {
+        Self::resolve_source(item, |t| t.video.as_ref())
+            .as_ref()
+            .is_some_and(source_is_templated)
+            || Self::resolve_source(item, |t| t.audio.as_ref())
+                .as_ref()
+                .is_some_and(source_is_templated)
+    }
+
+    /// The configured slate for this channel's templated windows, if any.
+    ///
+    /// Slate is a side file (`slate.json`, `{"path": "/abs/file"}`) next to
+    /// the playout folder rather than a channel.json field: legacy pipes the
+    /// channel config over stdin and rebuilds it per session, so a file the
+    /// operator owns is the one place the setting survives in both deployment
+    /// shapes. Re-read at every templated window, so slate can be added or
+    /// removed without a restart.
+    async fn load_slate_path(&self) -> Option<String> {
+        let file = self
+            .channel_config
+            .expanded_playout_folder()
+            .parent()?
+            .join("slate.json");
+        let bytes = tokio::fs::read(&file).await.ok()?;
+        let path = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => value
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(str::to_owned),
+            Err(err) => {
+                log::warn!("ignoring unparseable {}: {err}", file.display());
+                None
+            }
+        }?;
+        if tokio::fs::metadata(&path).await.is_err() {
+            log::warn!(
+                "slate {} configured in {} does not exist; tuning the live source instead",
+                path,
+                file.display()
+            );
+            return None;
+        }
+        Some(path)
     }
 
     fn fake_playout_item(&self, next_start: Option<OffsetDateTime>) -> PlayoutItem {
@@ -1622,6 +1704,26 @@ fn source_is_templated(source: &PlayoutItemSource) -> bool {
     }
 }
 
+/// The item the shared session transcodes in place of a templated window:
+/// the same identity and slot, so the sidecar, variant spawning, and
+/// composition all see the window unchanged, with the slate file as its
+/// only source.
+fn slate_item(item: PlayoutItem, slate_path: String) -> PlayoutItem {
+    PlayoutItem {
+        id: item.id,
+        start: item.start,
+        finish: item.finish,
+        source: Some(PlayoutItemSource::Local {
+            path: slate_path,
+            in_point_ms: None,
+            out_point_ms: None,
+            probe_hint: None,
+        }),
+        tracks: None,
+        watermark: item.watermark,
+    }
+}
+
 /// How far into an item the shared session began reading, derived from the
 /// envelope it declared for that item.
 ///
@@ -1750,6 +1852,57 @@ mod tests {
         let join = shared_join_offset_ms(item_duration_ms, shared_duration_ms);
         let position = (join + progress_ms).min(item_duration_ms);
         (progress_ms, item_duration_ms - position)
+    }
+
+    /// A star-window item as legacy exports it: a templated live URI.
+    fn templated_item() -> PlayoutItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "star",
+            "start": "2026-08-10T12:35:10.000-04:00",
+            "finish": "2026-08-10T12:37:40.000-04:00",
+            "source": {
+                "source_type": "http",
+                "uri": "http://host:8000/live.ts?sid=ch{channel_number}&zip={query:zip|10001}",
+                "is_live": true
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_templated_window_is_recognized_before_slate_substitution() {
+        assert!(ChannelSession::item_is_templated(&templated_item()));
+
+        // after substitution the sources are plain files, which is why the
+        // decision is judged on the original item and carried as a flag
+        let slated = slate_item(templated_item(), String::from("/slate.mp4"));
+        assert!(!ChannelSession::item_is_templated(&slated));
+    }
+
+    #[test]
+    fn a_slate_item_keeps_the_window_identity_and_swaps_only_the_source() {
+        let item = templated_item();
+        let (id, start, finish) = (item.id.clone(), item.start, item.finish);
+
+        let slated = slate_item(item, String::from("/slate.mp4"));
+
+        assert_eq!(slated.id, id);
+        assert_eq!(slated.start, start);
+        assert_eq!(slated.finish, finish);
+        assert!(slated.tracks.is_none());
+        match slated.source {
+            Some(PlayoutItemSource::Local {
+                path,
+                in_point_ms,
+                out_point_ms,
+                ..
+            }) => {
+                assert_eq!(path, "/slate.mp4");
+                assert_eq!(in_point_ms, None);
+                assert_eq!(out_point_ms, None);
+            }
+            other => panic!("expected a local slate source, got {other:?}"),
+        }
     }
 
     #[test]

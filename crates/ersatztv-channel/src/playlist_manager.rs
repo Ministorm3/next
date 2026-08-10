@@ -189,6 +189,7 @@ impl PlaylistManager {
         item_id: &str,
         duration_ms: u64,
         templated: bool,
+        fallback: bool,
     ) -> Result<(), ChannelError> {
         self.update().await?;
         self.pts_offset = new_pts_offset;
@@ -201,6 +202,7 @@ impl PlaylistManager {
             pts_offset_ms: new_pts_offset.unwrap_or_default().duration.as_millis() as u64,
             duration_ms,
             templated,
+            fallback,
         });
 
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
@@ -751,12 +753,14 @@ mod tests {
                 pts_offset_ms: 0,
                 duration_ms: 8000,
                 templated: false,
+                fallback: false,
             },
             SidecarPipeline {
                 item_id: String::from("item-b"),
                 pts_offset_ms: 8000,
                 duration_ms: 8000,
                 templated: true,
+                fallback: true,
             },
         ];
         m.segments.push_back(segment("seg0.ts", "item-a", 0));
@@ -785,6 +789,8 @@ mod tests {
         assert_eq!(pipelines.len(), 2);
         assert_eq!(pipelines[1]["item_id"], "item-b");
         assert_eq!(pipelines[1]["pts_offset_ms"], 8000);
+        assert_eq!(pipelines[0]["fallback"], false);
+        assert_eq!(pipelines[1]["fallback"], true);
     }
 
     #[test]
@@ -797,12 +803,14 @@ mod tests {
                 pts_offset_ms: 0,
                 duration_ms: 8000,
                 templated: false,
+                fallback: false,
             },
             SidecarPipeline {
                 item_id: String::from("item-b"),
                 pts_offset_ms: 8000,
                 duration_ms: 8000,
                 templated: true,
+                fallback: false,
             },
         ];
         // item-a segments have been trimmed from the window already

@@ -371,10 +371,15 @@ impl SessionPlaylist {
                 if !self.label.is_empty() {
                     log::warn!(
                         "[{}] item {}: no anchored variant by the decision deadline, \
-                         serving shared until one appears: {}",
+                         serving shared until one appears: {}{}",
                         self.label,
                         pipeline.item_id,
                         unanchored_reason(pipeline, variant),
+                        if pipeline.fallback {
+                            " (shared is slate)"
+                        } else {
+                            ""
+                        },
                     );
                 }
                 self.decisions
@@ -785,6 +790,7 @@ mod tests {
             pts_offset_ms: offset_ms,
             duration_ms: 0,
             templated,
+            fallback: false,
         }
     }
 

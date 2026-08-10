@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use ersatztv_core::HEARTBEAT_FILE_NAME;
 use ersatztv_core::cohort;
-use ersatztv_core::sidecar::{PlaylistSidecar, SIDECAR_SUFFIX};
+use ersatztv_core::sidecar::{PlaylistSidecar, SIDECAR_SUFFIX, SidecarPipeline};
 use ersatztv_core::variant_request::{
     VARIANTS_FOLDER, answers_folder, composed_playlist_name, requests_folder, stable_name,
 };
@@ -373,6 +373,28 @@ async fn reap(
     }
 }
 
+/// Where the variant's coverage of the shared envelope begins: at the end of
+/// the shared session's PUBLISHED coverage of the item, not at the wall
+/// clock, because a channel running behind schedule would otherwise anchor
+/// the variant deep into the envelope and never line up with the shared
+/// grid. That equivalence only holds while the shared source is live and
+/// publishes in step with air time; a fallback (slate) window is produced
+/// ahead of air, so its coverage says nothing about where viewers are, and
+/// the variant must cover the whole declared envelope from its start. The
+/// composer's first-unserved clamp keeps already-served slate positions from
+/// being re-served either way.
+fn variant_progress_ms(pipeline: &SidecarPipeline, shared: &PlaylistSidecar) -> u64 {
+    if pipeline.fallback {
+        return 0;
+    }
+    shared
+        .segments
+        .iter()
+        .filter(|s| s.item_id == pipeline.item_id)
+        .map(|s| (s.duration.max(0f64) * 1000.0) as u64)
+        .sum()
+}
+
 /// Spawns a variant worker for each templated item in the shared sidecar this
 /// session has not spawned yet. The worker receives the shared item's
 /// pts offset so both transcodes occupy the same envelope.
@@ -392,16 +414,7 @@ async fn spawn_missing_variants(
             continue;
         }
 
-        // anchor the variant where the shared session's PUBLISHED coverage of
-        // the item ends, not at the wall clock: a channel running behind
-        // schedule would otherwise anchor the variant deep into the envelope
-        // and never line up with the shared grid
-        let progress_ms: u64 = shared
-            .segments
-            .iter()
-            .filter(|s| s.item_id == pipeline.item_id)
-            .map(|s| (s.duration.max(0f64) * 1000.0) as u64)
-            .sum();
+        let progress_ms = variant_progress_ms(pipeline, shared);
 
         // the shared session has already covered everything it declared for
         // this item, so there is nothing left for a variant to substitute
@@ -685,8 +698,30 @@ mod tests {
                 pts_offset_ms: 0,
                 duration_ms: 60_000,
                 templated: false,
+                fallback: false,
             }],
         }
+    }
+
+    #[test]
+    fn a_live_window_anchors_the_variant_at_published_coverage() {
+        let mut shared = shared_sidecar(OffsetDateTime::now_utc());
+        shared.pipelines[0].templated = true;
+
+        assert_eq!(variant_progress_ms(&shared.pipelines[0], &shared), 12_000);
+    }
+
+    #[test]
+    fn a_slate_window_anchors_the_variant_at_the_envelope_start() {
+        // slate is produced ahead of air, so published coverage says nothing
+        // about where viewers are. anchored at coverage, the variant would
+        // join 12s in (or, fully published, never spawn at all) and the
+        // cohort would lose the head of every star window
+        let mut shared = shared_sidecar(OffsetDateTime::now_utc());
+        shared.pipelines[0].templated = true;
+        shared.pipelines[0].fallback = true;
+
+        assert_eq!(variant_progress_ms(&shared.pipelines[0], &shared), 0);
     }
 
     async fn write_shared_session(output: &Path, recognized: &str) {
