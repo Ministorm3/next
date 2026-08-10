@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use ersatztv_core::sidecar::PlaylistSidecar;
+use ersatztv_core::sidecar::{PlaylistSidecar, SidecarPipeline};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -122,6 +122,11 @@ pub struct SessionPlaylist {
     /// measured from "the first segment still listed" shifts as the item
     /// ages, and every position-based decision would shift with it.
     item_bases: HashMap<String, u64>,
+    /// Names this session in decision logs. Empty (the default) stays silent:
+    /// the media and subtitle playlists run the same decisions over the same
+    /// sidecars, so only one of the pair carries a label, and each item's
+    /// decision is reported once.
+    label: String,
 }
 
 fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
@@ -138,6 +143,30 @@ fn format_pdt(pdt: OffsetDateTime) -> String {
     pdt.format(format).unwrap_or_default()
 }
 
+/// Why a templated item has no anchored variant, for the decision log. The
+/// anchored check can fail several distinct ways and which one decides what
+/// to investigate: a variant that never produced, a variant on the wrong
+/// item, or a variant whose pts envelope starts before the shared one.
+fn unanchored_reason(pipeline: &SidecarPipeline, variant: Option<&PlaylistSidecar>) -> String {
+    let Some(v) = variant else {
+        return String::from("no variant sidecar published");
+    };
+    if v.segments.is_empty() {
+        return String::from("variant has produced no segments");
+    }
+    match v.pipelines.first() {
+        None => String::from("variant sidecar lists no pipeline"),
+        Some(vp) if vp.item_id != pipeline.item_id => {
+            format!("variant is anchored to item {} instead", vp.item_id)
+        }
+        Some(vp) if vp.pts_offset_ms < pipeline.pts_offset_ms => format!(
+            "variant pts_offset {}ms precedes the shared envelope's {}ms",
+            vp.pts_offset_ms, pipeline.pts_offset_ms
+        ),
+        Some(_) => String::from("anchored variant appeared between checks"),
+    }
+}
+
 /// The sequence number a segment file name carries: the digits before the
 /// extension. The playlist manager numbers segments from zero and trims them
 /// in order, so this index is also the segment's media sequence in the
@@ -150,6 +179,14 @@ fn sequence_of(path: &str) -> Option<u64> {
 }
 
 impl SessionPlaylist {
+    /// A playlist that names itself in decision logs.
+    pub fn with_label(label: String) -> SessionPlaylist {
+        SessionPlaylist {
+            label,
+            ..SessionPlaylist::default()
+        }
+    }
+
     /// Advances this session's timeline from the two sidecars and renders the
     /// playlist to serve. `variant_prefix` is the path prefix (relative to the
     /// shared session folder) under which the variant's segments are served.
@@ -276,12 +313,28 @@ impl SessionPlaylist {
                         seq.saturating_sub(base).saturating_add(1) * 1000 * SEGMENT_SECONDS;
                 }
 
+                let join_ms = anchor_ms.max(first_unserved_ms);
+                if !self.label.is_empty() {
+                    let upgraded = matches!(
+                        self.decisions.get(&pipeline.item_id),
+                        Some(ItemDecision::Shared)
+                    );
+                    log::info!(
+                        "[{}] item {}: serving variant{} (anchor {}ms, join {}ms)",
+                        self.label,
+                        pipeline.item_id,
+                        if upgraded {
+                            " as a late join after a shared pin"
+                        } else {
+                            ""
+                        },
+                        anchor_ms,
+                        join_ms,
+                    );
+                }
                 self.decisions.insert(
                     pipeline.item_id.clone(),
-                    ItemDecision::Variant {
-                        join_ms: anchor_ms.max(first_unserved_ms),
-                        anchor_ms,
-                    },
+                    ItemDecision::Variant { join_ms, anchor_ms },
                 );
                 continue;
             }
@@ -315,6 +368,15 @@ impl SessionPlaylist {
                     (SEGMENT_SECONDS * 5) as i64 - DECISION_LEAD_SECONDS as i64,
                 );
             if now >= deadline {
+                if !self.label.is_empty() {
+                    log::warn!(
+                        "[{}] item {}: no anchored variant by the decision deadline, \
+                         serving shared until one appears: {}",
+                        self.label,
+                        pipeline.item_id,
+                        unanchored_reason(pipeline, variant),
+                    );
+                }
                 self.decisions
                     .insert(pipeline.item_id.clone(), ItemDecision::Shared);
             }
@@ -1038,6 +1100,39 @@ mod tests {
         let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
         session.decide_items(&shared, None, late);
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+    }
+
+    #[test]
+    fn the_unanchored_reason_names_each_failure_mode() {
+        let shared_pipeline = pipeline("game", 8_000, true);
+
+        assert_eq!(
+            unanchored_reason(&shared_pipeline, None),
+            "no variant sidecar published"
+        );
+
+        let unproduced = PlaylistSidecar {
+            segments: Vec::new(),
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+        assert_eq!(
+            unanchored_reason(&shared_pipeline, Some(&unproduced)),
+            "variant has produced no segments"
+        );
+
+        let mut wrong_item = variant_for_game();
+        wrong_item.pipelines[0].item_id = String::from("other");
+        assert_eq!(
+            unanchored_reason(&shared_pipeline, Some(&wrong_item)),
+            "variant is anchored to item other instead"
+        );
+
+        let mut early = variant_for_game();
+        early.pipelines[0].pts_offset_ms = 7_000;
+        assert_eq!(
+            unanchored_reason(&shared_pipeline, Some(&early)),
+            "variant pts_offset 7000ms precedes the shared envelope's 8000ms"
+        );
     }
 
     #[test]

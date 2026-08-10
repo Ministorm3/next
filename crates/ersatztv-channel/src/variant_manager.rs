@@ -146,7 +146,9 @@ impl VariantSession {
                 .join(VARIANTS_FOLDER)
                 .join(&folder_name),
             variant_prefix: format!("{VARIANTS_FOLDER}/{folder_name}/"),
-            playlist: SessionPlaylist::default(),
+            // only the media playlist carries the logging label; the subtitle
+            // playlist reruns the same decisions and would double every line
+            playlist: SessionPlaylist::with_label(format!("cohort '{cohort_query}'")),
             subtitle_playlist: SessionPlaylist::default(),
             spawned_items: HashSet::new(),
         }
