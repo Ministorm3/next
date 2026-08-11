@@ -103,6 +103,10 @@ pub struct ChannelSession {
     /// Caller-supplied values for `{query:}` variables. Empty for the shared
     /// channel session; a variant session carries its cohort's values.
     query_parameters: std::collections::HashMap<String, String>,
+
+    /// Exclusive ownership of the output folder, held for the life of this
+    /// session so a second worker for the same folder refuses to start.
+    _output_folder_lock: ersatztv_core::FolderLock,
 }
 
 impl ChannelSession {
@@ -116,6 +120,24 @@ impl ChannelSession {
         };
 
         let output_folder = channel_config.expanded_output_folder().to_owned();
+
+        // Two workers writing one output folder alternate their numbering
+        // regimes on disk and corrupt every consumer; refuse to be the
+        // second one. The owner releases only by exiting.
+        let output_folder_lock = match ersatztv_core::lock_folder_exclusive(&output_folder) {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(ChannelError::ChannelStartup(format!(
+                    "another channel worker already owns the output folder {}; \
+                     refusing to start a second writer",
+                    output_folder.display()
+                )));
+            }
+            Err(e) => {
+                return Err(e).io_context("lock the output folder", &output_folder);
+            }
+        };
+
         let generated_output_file = output_folder
             .join("live.m3u8")
             .into_os_string()
@@ -211,6 +233,7 @@ impl ChannelSession {
             dynamic_http_client,
             published_recognized_params: None,
             query_parameters: std::collections::HashMap::new(),
+            _output_folder_lock: output_folder_lock,
         })
     }
 
