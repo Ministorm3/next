@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::{ChannelError, IoContext};
+use ersatztv_channel::slate::{self, SlateFile};
 use ersatztv_channel::variant_manager;
 use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
 use ersatztv_core::{READY_FILE_NAME, empty_folder};
@@ -533,6 +534,7 @@ impl ChannelSession {
             output_folder: self.channel_config.expanded_output_folder().clone(),
             channel_binary,
             config_json: self.channel_config.merged_source_json(),
+            slate_file: slate::slate_file(self.channel_config.expanded_playout_folder()),
         };
 
         tokio::spawn(async move {
@@ -1435,28 +1437,22 @@ impl ChannelSession {
 
     /// The configured slate for this channel's templated windows, if any.
     ///
-    /// Slate is a side file (`slate.json`, `{"path": "/abs/file"}`) next to
-    /// the playout folder rather than a channel.json field: legacy pipes the
-    /// channel config over stdin and rebuilds it per session, so a file the
-    /// operator owns is the one place the setting survives in both deployment
-    /// shapes. Re-read at every templated window, so slate can be added or
-    /// removed without a restart.
+    /// Slate is a side file ([`slate::SlateConfig`], next to the playout
+    /// folder) rather than a channel.json field: legacy pipes the channel
+    /// config over stdin and rebuilds it per session, so a file the operator
+    /// owns is the one place the setting survives in both deployment shapes.
+    /// Re-read at every templated window, so slate can be added or removed
+    /// without a restart. Only `path` matters here; the variant manager owns
+    /// the `default` key on its own cadence.
     async fn load_slate_path(&self) -> Option<String> {
-        let file = self
-            .channel_config
-            .expanded_playout_folder()
-            .parent()?
-            .join("slate.json");
-        let bytes = tokio::fs::read(&file).await.ok()?;
-        let path = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => value
-                .get("path")
-                .and_then(|p| p.as_str())
-                .map(str::to_owned),
-            Err(err) => {
-                log::warn!("ignoring unparseable {}: {err}", file.display());
+        let file = slate::slate_file(self.channel_config.expanded_playout_folder())?;
+        let path = match slate::read_slate_file(&file).await {
+            SlateFile::Missing => None,
+            SlateFile::Malformed(err) => {
+                log::warn!("ignoring {}: {err}", file.display());
                 None
             }
+            SlateFile::Present(config) => config.path,
         }?;
         if tokio::fs::metadata(&path).await.is_err() {
             log::warn!(
