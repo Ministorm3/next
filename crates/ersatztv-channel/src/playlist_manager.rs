@@ -43,10 +43,27 @@ pub(crate) const VARIANT_HISTORY_DURATION: Duration = Duration::from_secs(1800);
 // `HISTORY_DURATION` behind the head it serves from. The lag bound must
 // stay strictly inside the retention window, or a lagging cohort window
 // references segments whose files are already deleted and clients 404.
+//
+// The composer forces a lagging head only as far as its own last full
+// window, which is `SERVED_SEGMENTS - 1` behind its newest composed entry,
+// so that offset is part of the trail and belongs in this bound.
+//
+// One term is NOT compile-time bounded: how far the shared head runs past
+// the composed timeline's own edge. Composition stops
+// `composer::COMPOSE_TRAIL_SECONDS` behind the live edge while this
+// module's head is paced from wherever it was first placed, so on a channel
+// that works far enough ahead the shared head sits an unbounded distance
+// past everything the composer has emitted, and no forcing rule can close
+// that distance because the content does not exist on the composed
+// timeline yet. The composer warns when it detects that state; this
+// assertion covers only what a constant can cover.
 const _: () = assert!(
     ersatztv_channel::composer::HARD_LAG_SEGMENTS
+        + ersatztv_channel::composer::SERVED_SEGMENTS as u64
+        - 1
         < HISTORY_DURATION.as_secs() / ersatztv_channel::composer::SEGMENT_SECONDS,
-    "composer::HARD_LAG_SEGMENTS must stay strictly inside the segment retention window"
+    "composer::HARD_LAG_SEGMENTS plus the served window must stay strictly inside \
+     the segment retention window"
 );
 
 #[derive(Clone)]

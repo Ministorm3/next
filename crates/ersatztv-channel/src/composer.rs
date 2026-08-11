@@ -32,7 +32,16 @@ const _: () = assert!(
     "composer::SEGMENT_SECONDS must mirror ffpipeline::pipeline::SEGMENT_SECONDS"
 );
 
-const SERVED_SEGMENTS: usize = 10;
+/// How many entries a rendered window carries, and so how far behind the
+/// newest composed entry the serve head sits: the head stays a full window
+/// back, keeping the three-target-durations of media rfc8216bis 6.2.2
+/// requires. Worth its cost in delay: a head at the composed edge serves
+/// one segment, and a player cannot buffer one segment.
+pub const SERVED_SEGMENTS: usize = 10;
+
+/// How often the composer repeats a warning about a state it cannot leave,
+/// so a stuck head is visible in the log without filling it at tick rate.
+const STALL_WARN_SECONDS: i64 = 30;
 
 /// How long an entry stays in session history after leaving the serve window.
 const HISTORY_SECONDS: u64 = 120;
@@ -41,11 +50,6 @@ const HISTORY_SECONDS: u64 = 120;
 /// variant still has no output; earlier, composition holds back instead.
 const DECISION_LEAD_SECONDS: u64 = 8;
 
-/// While the timeline is still being produced, the head stays this many
-/// segments behind the newest composed entry, so the served window keeps
-/// the three-target-durations of media rfc8216bis 6.2.2 requires. Worth its
-/// cost in delay: a window at the emission edge serves one segment, and a
-/// player cannot buffer one segment.
 /// How far behind the live edge the composed timeline stops.
 ///
 /// A cohort's viewer plays at the newest segment its playlist offers, so
@@ -65,14 +69,18 @@ const DECISION_LEAD_SECONDS: u64 = 8;
 /// variant genuinely does not arrive.
 const COMPOSE_TRAIL_SECONDS: u64 = 8;
 
-const EDGE_HOLD_SEGMENTS: u64 = 3;
-
 /// How far the serve head may fall behind the shared playlist's own head
 /// before excess lag starts being trimmed. A trim inside this bound never
 /// happens; past it, the head jumps only onto an item boundary, so what a
 /// viewer loses is the tail of whatever item they were behind in, and they
 /// resume exactly at the start of the next one, the same cut a broadcast
 /// makes. With no boundary in reach the head keeps walking and retries.
+///
+/// Measured against the shared head, never against this timeline's own
+/// edge. Composition holds whenever a position's variant twin is missing,
+/// and a hold stops the composed edge and the head together: a bound read
+/// off the composed edge would report no lag at all in exactly the state
+/// where the viewer is falling behind the channel fastest.
 const MAX_LAG_SEGMENTS: u64 = 10;
 
 /// Past this bound the head skips forward wherever it lands, boundary or
@@ -134,6 +142,11 @@ pub struct SessionPlaylist {
     /// the window jump over it.
     serve_head: Option<u64>,
     head_advanced_at: Option<OffsetDateTime>,
+    /// When the composer last reported a head that is past the hard lag
+    /// bound and cannot be moved. Throttles that warning: the state persists
+    /// for as long as composition is held, and the composer renders every
+    /// couple of seconds.
+    lag_stalled_warned_at: Option<OffsetDateTime>,
     decisions: HashMap<String, ItemDecision>,
     /// The sequence number of the first segment ever observed for each
     /// templated item, recorded once and never recomputed. Positions inside
@@ -183,6 +196,40 @@ fn unanchored_reason(pipeline: &SidecarPipeline, variant: Option<&PlaylistSideca
             vp.pts_offset_ms, pipeline.pts_offset_ms
         ),
         Some(_) => String::from("anchored variant appeared between checks"),
+    }
+}
+
+/// The two positions the serve head is paced against.
+struct ServeBounds {
+    /// The newest position this timeline can serve a full window from, and
+    /// the furthest a lag trim may force the head to. Composition stops
+    /// [`COMPOSE_TRAIL_SECONDS`] behind the live edge on purpose, so the
+    /// shared head normally sits past everything composed here; a target
+    /// beyond this one is a position this session has declined to reach,
+    /// and chasing it only starves the window.
+    own_window: u64,
+    /// Where the head walks to: the shared playlist's own serve position,
+    /// capped at `own_window`. Mirroring the shared head stays the goal
+    /// whenever it lands inside what this timeline can serve, so a cohort
+    /// never runs ahead of shared into worked-ahead content.
+    desired: u64,
+}
+
+/// Derives both bounds from the composed window, so they cannot drift apart.
+///
+/// Their coupling is load-bearing rather than incidental: the lag trim
+/// declines to move the head exactly when `own_window <= head`, and because
+/// `desired <= own_window` the playback-rate walk is then also out of room.
+/// If a change let the trim stall while the walk still had somewhere to go,
+/// the trim's clock reset would starve the walk of elapsed time and freeze
+/// the head outright, which is the 2026-08-10 livelock that skipped roughly
+/// a minute of program content. `a_stalled_trim_implies_a_stalled_walk`
+/// pins it.
+fn serve_bounds(front: u64, tail: u64, shared_head: Option<u64>) -> ServeBounds {
+    let own_window = tail.saturating_sub(SERVED_SEGMENTS as u64 - 1).max(front);
+    ServeBounds {
+        own_window,
+        desired: shared_head.map_or(own_window, |head| head.min(own_window)),
     }
 }
 
@@ -509,33 +556,25 @@ impl SessionPlaylist {
         let front = self.head_sequence;
         let tail = front + self.entries.len() as u64 - 1;
 
-        // the position the shared playlist serves from; without one to
-        // mirror, fall back to this timeline's own last full window
-        let desired = shared_head
-            .unwrap_or_else(|| tail.saturating_sub(SERVED_SEGMENTS as u64 - 1).max(front));
-
-        // while emission is still catching up to the shared head, the head
-        // may only reach this far, holding a buffer window open at the edge
-        let reachable = if desired > tail {
-            tail.saturating_sub(EDGE_HOLD_SEGMENTS).max(front)
-        } else {
-            tail
-        };
+        let ServeBounds {
+            own_window,
+            desired,
+        } = serve_bounds(front, tail, shared_head);
 
         let mut head = match self.serve_head {
             Some(head) => head.clamp(front, tail),
             None => {
                 self.head_advanced_at = Some(now);
-                desired.clamp(front, reachable)
+                desired.clamp(front, tail)
             }
         };
 
         // walk forward at playback rate, one segment per segment duration,
-        // never past the shared head or the newest composed content: a
-        // lagging cohort plays through its backlog instead of having the
-        // window jump over it, and a cohort never runs ahead of the shared
-        // playlist into worked-ahead content
-        let upper = reachable.min(desired.max(head)).max(head);
+        // never past the shared head or this timeline's own last full
+        // window: a lagging cohort plays through its backlog instead of
+        // having the window jump over it, and a cohort never runs ahead of
+        // the shared playlist into worked-ahead content
+        let upper = desired.max(head).min(tail);
         if let Some(mut advanced_at) = self.head_advanced_at {
             while head < upper {
                 let index = (head - front) as usize;
@@ -546,6 +585,16 @@ impl SessionPlaylist {
                 head += 1;
                 advanced_at += step;
             }
+
+            // a head that has reached its target banks no credit for the
+            // wait. composition holds at a missing variant twin for as long
+            // as the twin is missing, and unspent credit would be paid out
+            // as one silent jump across everything the hold withheld, which
+            // is content, not lag
+            let parked = time::Duration::seconds(SEGMENT_SECONDS as i64);
+            if head >= upper && now - advanced_at > parked {
+                advanced_at = now - parked;
+            }
             self.head_advanced_at = Some(advanced_at);
         }
 
@@ -553,17 +602,37 @@ impl SessionPlaylist {
         // content, and a jump anywhere else would eat the middle of it. past
         // the soft bound, excess lag is trimmed only onto an item boundary;
         // past the hard bound, wherever the head lands
-        let gap = desired.saturating_sub(head);
+        let gap = shared_head.unwrap_or(head).saturating_sub(head);
         if gap > HARD_LAG_SEGMENTS {
-            let target = desired.min(reachable).max(head);
-            log::warn!(
-                "composed serve head {head} fell {gap} segments behind shared \
-                 head {desired}; skipping to {target}"
-            );
-            head = target;
-            self.head_advanced_at = Some(now);
+            // the furthest position this timeline can serve a window from.
+            // when composition is held that is the head itself, and no
+            // amount of lag can move it: say so instead of reporting a skip
+            // that did not happen
+            let target = own_window.max(head);
+            if target > head {
+                log::warn!(
+                    "composed serve head {head} fell {gap} segments behind shared \
+                     head {}; skipping to {target}",
+                    head + gap
+                );
+                head = target;
+                self.head_advanced_at = Some(now);
+                self.lag_stalled_warned_at = None;
+            } else if self
+                .lag_stalled_warned_at
+                .is_none_or(|at| now - at >= time::Duration::seconds(STALL_WARN_SECONDS))
+            {
+                log::warn!(
+                    "composed serve head {head} is {gap} segments behind shared head {} \
+                     and cannot advance: composition is held at {tail}. the shared \
+                     session deletes segments this window still lists once the lag \
+                     reaches its retention window",
+                    head + gap
+                );
+                self.lag_stalled_warned_at = Some(now);
+            }
         } else if gap > MAX_LAG_SEGMENTS {
-            let limit = desired.min(reachable);
+            let limit = own_window;
             let mut boundary = None;
             for entry in self
                 .entries
@@ -585,6 +654,9 @@ impl SessionPlaylist {
                 head = target;
                 self.head_advanced_at = Some(now);
             }
+            self.lag_stalled_warned_at = None;
+        } else {
+            self.lag_stalled_warned_at = None;
         }
 
         self.serve_head = Some(head);
@@ -674,6 +746,18 @@ pub fn compose_timeline(
     let mut result: Vec<ComposedEntry> = Vec::new();
     let mut substituting = resume.substituting;
 
+    // the newest shared position inside the horizon. a position held for a
+    // missing variant twin measures how much shared coverage has piled up
+    // past it against this, which is the only quantity in the walk that
+    // keeps growing while a variant is stalled
+    let shared_edge = shared
+        .segments
+        .iter()
+        .filter(|s| parse_pdt(&s.program_date_time).is_some_and(|pdt| pdt <= horizon))
+        .filter_map(|s| sequence_of(&s.path))
+        .max()
+        .unwrap_or(0);
+
     for segment in &shared.segments {
         let Some(pdt) = parse_pdt(&segment.program_date_time) else {
             continue;
@@ -736,16 +820,28 @@ pub fn compose_timeline(
 
                         // the variant has not produced this position yet:
                         // hold the timeline here unless it has fallen so far
-                        // behind that holding would stall viewers
-                        let variant_edge_ms = *anchor_ms + twin * grid_ms;
-                        let behind_ms = (position_ms + grid_ms).saturating_sub(variant_edge_ms);
+                        // behind that holding would stall viewers.
+                        //
+                        // measured as shared coverage past the hole, which is
+                        // what the threshold is written against and what
+                        // grows while a variant is stalled.
+                        //
+                        // NOT from `twin`: `twin` is this position's own grid
+                        // slot, so `anchor_ms + twin * grid_ms` differs from
+                        // `position_ms + grid_ms` by less than two segments
+                        // for every anchor and every position. The threshold
+                        // was never reachable and a stalled variant held the
+                        // cohort's timeline for good
+                        let behind_ms = shared_edge.saturating_sub(sequence) * grid_ms;
                         if (behind_ms as f64) < VARIANT_STALL_SECONDS * 1000.0 {
                             return result;
                         }
 
                         log::debug!(
-                            "variant for item {} stalled {}ms behind; serving shared position {}",
+                            "variant for item {} has no segment {} and shared coverage \
+                             runs {}ms past it; serving shared position {}",
                             segment.item_id,
+                            twin,
                             behind_ms,
                             position_ms
                         );
@@ -861,6 +957,50 @@ mod tests {
     /// A channel producing continuously, with a templated item in the middle
     /// whose variant never appears. Long enough that the served window always
     /// has content ahead of it, as a working channel does.
+    /// A shared timeline long enough for the serve head to sit a full
+    /// window behind the composed edge: anything shorter than
+    /// `SERVED_SEGMENTS` pins the head to the front of the timeline, where
+    /// no walk and no lag bound can be observed.
+    fn long_shared_with_templated_item(count: i64) -> PlaylistSidecar {
+        let segments = (0..count)
+            .map(|i| {
+                let at = i * 4;
+                let item = match at {
+                    at if at < 24 => "before",
+                    at if at < 44 => "game",
+                    at if at < 80 => "after",
+                    _ => "encore",
+                };
+                seg(
+                    &format!("live{i:06}.ts"),
+                    item,
+                    at,
+                    at == 0 || at == 24 || at == 44 || at == 80,
+                )
+            })
+            .collect();
+
+        PlaylistSidecar {
+            segments,
+            pipelines: vec![
+                pipeline("before", 0, false),
+                pipeline("game", 24_000, true),
+                pipeline("after", 44_000, false),
+                pipeline("encore", 80_000, false),
+            ],
+        }
+    }
+
+    /// A variant anchored on `long_shared_with_templated_item`'s game item.
+    fn long_variant_for_game(count: i64) -> PlaylistSidecar {
+        PlaylistSidecar {
+            segments: (0..count)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", 24 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("game", 24_000, true)],
+        }
+    }
+
     fn continuous_shared_with_templated_item() -> PlaylistSidecar {
         let segments = (0..16i64)
             .map(|i| {
@@ -1479,9 +1619,12 @@ mod tests {
     #[test]
     fn serving_mirrors_the_shared_head_when_content_is_complete() {
         let mut session = SessionPlaylist::default();
-        let shared = shared_with_templated_item();
-        let variant = variant_for_game();
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        // long enough that this session's own last full window is a real
+        // position rather than the front of the timeline: with a shorter
+        // one the head is pinned to `front` and mirroring cannot be seen
+        let shared = long_shared_with_templated_item(16);
+        let variant = long_variant_for_game(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
 
         let rendered = session.advance_and_render(
             &shared,
@@ -1493,9 +1636,48 @@ mod tests {
             |s| s.to_owned(),
         );
 
+        // the shared head is inside this timeline's own window, so it is
+        // served verbatim: the numbering is neither cohort-local (0) nor
+        // this timeline's own window (4)
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
+        assert_eq!(session.serve_head, Some(2));
         assert!(rendered.contains("variants/abc/live000000.ts"));
+        // shared segment 1 is behind the head; the leading newline keeps
+        // this from matching the variant's own live000001.ts
         assert!(!rendered.contains("\nlive000001.ts"));
+    }
+
+    /// The head never chases past this timeline's own last full window. The
+    /// shared head runs ahead of everything composed here by design, since
+    /// composition stops `COMPOSE_TRAIL_SECONDS` behind the live edge, and a
+    /// head that followed it would serve a window too short to buffer.
+    #[test]
+    fn serving_stops_at_this_timelines_own_window() {
+        let mut session = SessionPlaylist::default();
+        let shared = long_shared_with_templated_item(16);
+        let variant = long_variant_for_game(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            // far past anything this timeline has composed
+            Some(30),
+            now,
+            4,
+            |s| s.to_owned(),
+        );
+
+        // composed tail is 13 (pdt 52 is the newest inside the horizon), so
+        // the head stops a full window back
+        assert_eq!(session.serve_head, Some(4));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:4\n"));
+        assert_eq!(
+            rendered.lines().filter(|l| l.ends_with(".ts")).count(),
+            SERVED_SEGMENTS,
+            "a head at its own window edge still serves a full window"
+        );
     }
 
     /// When the variant lags, the head walks at playback rate instead of
@@ -1532,10 +1714,12 @@ mod tests {
         assert!(again.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
     }
 
-    /// Past the lag bound the head jumps to the newest composed content: a
-    /// bounded worst-case delay is preferred over an unbounded one.
+    /// Past the lag bound the head jumps as far forward as this timeline can
+    /// serve from: a bounded worst-case delay is preferred over an unbounded
+    /// one. The bound is measured against the shared head, so it still fires
+    /// when composition trails that head by design.
     #[test]
-    fn a_head_past_the_lag_bound_jumps_to_the_emission_edge() {
+    fn a_head_past_the_lag_bound_jumps_to_its_own_window() {
         let mut session = SessionPlaylist::default();
         let shared = continuous_shared_with_templated_item();
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
@@ -1562,7 +1746,16 @@ mod tests {
             |s| s.to_owned(),
         );
 
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
+        // gap is 30 against the shared head, past the hard bound, and the
+        // head jumps to this timeline's own window: tail 15 less a full
+        // window. not to the composed edge, which would serve one segment
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
+        assert_eq!(session.serve_head, Some(6));
+        assert_eq!(
+            rendered.lines().filter(|l| l.ends_with(".ts")).count(),
+            SERVED_SEGMENTS
+        );
+        assert!(rendered.contains("live000015.ts"));
     }
 
     /// A lagging head inside the bound never jumps: what follows a window on
@@ -1575,7 +1768,9 @@ mod tests {
         session
             .decisions
             .insert(String::from("game"), ItemDecision::Shared);
-        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        // late enough that the whole 16-segment timeline is composed, so the
+        // head has somewhere to walk to
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
 
         session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
             s.to_owned()
@@ -1613,30 +1808,37 @@ mod tests {
     #[test]
     fn excess_lag_is_trimmed_onto_an_item_boundary() {
         let mut session = SessionPlaylist::default();
-        let shared = continuous_shared_with_templated_item();
+        // 26 segments so two boundaries sit inside the trim's reach and a
+        // third sits outside it
+        let shared = long_shared_with_templated_item(26);
         session
             .decisions
             .insert(String::from("game"), ItemDecision::Shared);
-        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(108);
 
         session.advance_and_render(&shared, None, "variants/x/", Some(0), base, 4, |s| {
             s.to_owned()
         });
         assert_eq!(session.serve_head, Some(0));
 
-        // the gap crosses the soft bound; discontinuities sit at 6 and 11,
-        // and the trim lands on the furthest one within reach
+        // the gap crosses the soft bound; discontinuities sit at 6, 11 and
+        // 20, this timeline's own window reaches 16, and the trim lands on
+        // the furthest boundary inside that reach
         let rendered = session.advance_and_render(
             &shared,
             None,
             "variants/x/",
-            Some(15),
+            Some(18),
             base + time::Duration::seconds(2),
             4,
             |s| s.to_owned(),
         );
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:11\n"));
+        assert_eq!(session.serve_head, Some(11));
         assert!(rendered.contains("live000011.ts"));
+        // the boundary at 20 is past the reachable window and is not taken
+        assert!(rendered.contains("live000020.ts"));
+        assert!(!rendered.contains("live000021.ts"));
     }
 
     /// With no boundary in reach the trim defers: the head keeps walking at
@@ -1671,11 +1873,11 @@ mod tests {
         assert_eq!(session.serve_head, Some(0));
     }
 
-    /// A fresh session joining a lagging timeline starts a buffer window
+    /// A fresh session joining a lagging timeline starts a full window
     /// behind the emission edge, not at it: a one-segment playlist gives a
     /// player nothing to buffer.
     #[test]
-    fn a_fresh_session_holds_a_window_open_at_the_emission_edge() {
+    fn a_fresh_session_opens_a_full_window_behind_the_emission_edge() {
         let mut session = SessionPlaylist::default();
         let shared = continuous_shared_with_templated_item();
         session
@@ -1688,9 +1890,38 @@ mod tests {
                 s.to_owned()
             });
 
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:12\n"));
+        // tail is 15, so the head opens a full window back at 6, never at
+        // the composed edge
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
+        assert_eq!(session.serve_head, Some(15 - (SERVED_SEGMENTS as u64 - 1)));
+        assert_eq!(
+            rendered.lines().filter(|l| l.ends_with(".ts")).count(),
+            SERVED_SEGMENTS,
+            "rfc8216bis 6.2.2 wants three target durations of media in the window"
+        );
+        assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
         assert!(rendered.contains("live000012.ts"));
         assert!(rendered.contains("live000015.ts"));
+
+        // the head is already as far forward as this timeline reaches, and
+        // the shared head is past the hard bound. a tick that cannot move
+        // the head must not restart the pacing clock, or the walk never
+        // accumulates the segment duration it needs and the head freezes
+        session.advance_and_render(
+            &shared,
+            None,
+            "variants/x/",
+            Some(30),
+            now + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+        assert_eq!(session.serve_head, Some(6));
+        assert_eq!(
+            session.head_advanced_at,
+            Some(now),
+            "a tick that moves nothing must not reset the pacing clock"
+        );
     }
 
     /// The shared sidecar trims an item's early segments once the item ages
@@ -1812,38 +2043,49 @@ mod tests {
     #[test]
     fn media_sequence_advances_as_history_trims() {
         let mut session = SessionPlaylist::default();
-        let shared = shared_with_templated_item();
-        let variant = variant_for_game();
+        let shared = long_shared_with_templated_item(20);
+        let variant = long_variant_for_game(5);
 
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(88);
         session.advance_and_render(
             &shared,
             Some(&variant),
             "variants/abc/",
-            Some(0),
+            Some(15),
             now,
             4,
             |s| s.to_owned(),
         );
+        // nothing has aged out yet: the head opens a full window back from
+        // tail 19, with the channel start and the splice-in behind it
+        assert_eq!(session.serve_head, Some(10));
 
-        // much later the shared head has moved to the end; the head walks
-        // there (through the variant span, which is never jumped) and the
-        // window discontinuity count reflects the rolled-off splice
+        // much later, history behind the head really does trim and the
+        // timeline has grown; the head walks forward (through the variant
+        // span, which is never jumped) and the window discontinuity count
+        // carries both the rolled-off splice and the in-window ones
+        let shared = long_shared_with_templated_item(30);
         let later = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(500);
         let rendered = session.advance_and_render(
             &shared,
             Some(&variant),
             "variants/abc/",
-            Some(4),
+            Some(25),
             later,
             4,
             |s| s.to_owned(),
         );
 
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:4\n"));
-        // the splice-in discontinuity is behind the head now
-        assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
-        assert!(rendered.contains("live000004.ts"));
+        assert_eq!(session.head_sequence, 10, "history behind the head trimmed");
+        assert_eq!(
+            session.head_discontinuity_sequence, 2,
+            "the channel start and the splice-in rolled off"
+        );
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:20\n"));
+        // two from rolled-off history, one from the splice-out inside the
+        // skipped span
+        assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:3\n"));
+        assert!(rendered.contains("live000020.ts"));
     }
 
     #[test]
@@ -2019,5 +2261,177 @@ mod tests {
             !resumed.discontinuity,
             "mid-substitution resume must not tag a discontinuity"
         );
+    }
+
+    /// A head that has reached the newest position its timeline can serve
+    /// from has nowhere to go, and the wait must cost nothing in either
+    /// direction: the pacing clock is not restarted (which would stop the
+    /// head from ever completing a step) and the wait is not banked as
+    /// credit (which would be spent as one jump across everything the hold
+    /// withheld, and what a hold withholds is content).
+    /// The livelock of 2026-08-10, pinned as the invariant that prevents it
+    /// rather than as one scenario.
+    ///
+    /// The hard-lag branch resets the pacing clock whenever it moves the
+    /// head. That is only safe while a branch that CANNOT move the head
+    /// implies the playback-rate walk had nowhere to go either, because a
+    /// reset fires every tick (2s) and the walk needs a segment duration
+    /// (4s) of elapsed time to step: a trim that stalls while the walk is
+    /// still live starves the walk forever and freezes the head, which on
+    /// the night skipped about a minute of program content once the head
+    /// finally jumped.
+    ///
+    /// Both quantities come from `serve_bounds`, so the implication holds by
+    /// construction. This asserts it over the whole state space so a future
+    /// change that decouples them fails here instead of on a live channel.
+    #[test]
+    fn a_stalled_trim_implies_a_stalled_walk() {
+        let shared_heads = [
+            None,
+            Some(0),
+            Some(3),
+            Some(9),
+            Some(25),
+            Some(60),
+            Some(4000),
+        ];
+
+        for tail in 0..48u64 {
+            for front in 0..=tail.min(6) {
+                for shared_head in shared_heads {
+                    let bounds = serve_bounds(front, tail, shared_head);
+
+                    for head in front..=tail {
+                        // what the hard-lag branch would force the head to
+                        let target = bounds.own_window.max(head);
+                        // what the playback-rate walk would advance it to
+                        let upper = bounds.desired.max(head).min(tail);
+
+                        if target <= head {
+                            assert!(
+                                upper <= head,
+                                "trim stalled at head {head} while the walk could still \
+                                 reach {upper} (front {front}, tail {tail}, \
+                                 shared_head {shared_head:?}): the trim's clock reset \
+                                 would starve the walk and freeze the head"
+                            );
+                        }
+
+                        // and a cohort never targets content beyond what it holds
+                        assert!(
+                            bounds.desired <= tail && target <= tail,
+                            "targeted past the composed edge (front {front}, tail {tail})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_head_with_nowhere_to_go_neither_restarts_nor_banks_its_clock() {
+        let mut session = SessionPlaylist::default();
+        let held = PlaylistSidecar {
+            segments: (0..8i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("show", 0, false)],
+        };
+        let step = time::Duration::seconds(SEGMENT_SECONDS as i64);
+        let mut at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(100);
+
+        // 60 seconds of composer ticks with the shared head far past the
+        // hard bound the whole way
+        for _ in 0..30 {
+            session.advance_and_render(&held, None, "variants/x/", Some(40), at, 4, |s| {
+                s.to_owned()
+            });
+            assert_eq!(session.serve_head, Some(0), "nothing to advance onto");
+            assert!(
+                at - session.head_advanced_at.unwrap() <= step,
+                "a parked head may hold at most one segment of pacing credit"
+            );
+            at += time::Duration::seconds(2);
+        }
+    }
+
+    /// When a hold ends, the head resumes at playback rate. The positions a
+    /// hold withheld are content, not lag, so paying the wait out as one
+    /// jump would skip them for every viewer on the cohort.
+    #[test]
+    fn a_released_hold_resumes_at_playback_rate() {
+        let mut session = SessionPlaylist::default();
+        let held = PlaylistSidecar {
+            segments: (0..8i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("show", 0, false)],
+        };
+        // the shared head stays inside both lag bounds, so nothing here is
+        // a trim: this is the walk on its own
+        let mut at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(100);
+        for _ in 0..30 {
+            session
+                .advance_and_render(&held, None, "variants/x/", Some(5), at, 4, |s| s.to_owned());
+            at += time::Duration::seconds(2);
+        }
+        assert_eq!(session.serve_head, Some(0));
+
+        // composition unblocks in a burst: 22 further positions arrive at
+        // once. the head takes one, not the 15 that 60 seconds of banked
+        // credit would have bought
+        let grown = PlaylistSidecar {
+            segments: (0..30i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "show", i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("show", 0, false)],
+        };
+        let rendered =
+            session.advance_and_render(&grown, None, "variants/x/", Some(5), at, 4, |s| {
+                s.to_owned()
+            });
+        assert_eq!(session.serve_head, Some(1));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
+    }
+
+    /// A variant that stops producing degrades to the shared feed. Holding
+    /// is right while the variant is merely late, but a hold that never
+    /// ends freezes the cohort's timeline, and with it the serve head.
+    #[test]
+    fn a_stalled_variant_falls_back_to_the_shared_feed() {
+        let shared = long_shared_with_templated_item(30);
+        // the item's first two positions were produced, then nothing
+        let variant = long_variant_for_game(2);
+        let compose = |horizon_secs: i64| {
+            compose_timeline(
+                &shared,
+                Some(&variant),
+                "variants/abc/",
+                &decided("game", variant_decision(0, 0)),
+                &bases_of(&shared),
+                ComposeResume::default(),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(horizon_secs),
+            )
+        };
+
+        // inside the threshold the timeline holds at the missing twin,
+        // exactly as it does for a variant that is only late
+        let holding = compose(44);
+        assert_eq!(holding.last().map(|e| e.sequence), Some(7));
+        assert!(holding.last().is_some_and(|e| e.variant));
+
+        // once shared coverage runs VARIANT_STALL_SECONDS past the hole,
+        // the position falls back to the shared segment and the timeline
+        // moves again
+        let recovering = compose(48);
+        let last = recovering.last().expect("timeline is not empty");
+        assert_eq!(last.sequence, 8);
+        assert_eq!(last.path, "live000008.ts");
+        assert!(!last.variant);
+        assert!(last.discontinuity, "the source switch is spliced");
+
+        // and it keeps moving: the stall does not cap the timeline short of
+        // the shared feed it fell back to
+        assert_eq!(compose(60).last().map(|e| e.sequence), Some(15));
     }
 }
