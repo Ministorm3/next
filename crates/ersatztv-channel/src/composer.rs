@@ -245,6 +245,12 @@ fn sequence_of(path: &str) -> Option<u64> {
 }
 
 impl SessionPlaylist {
+    /// How this session names itself in decision logs. Empty when it is the
+    /// silent half of a media/subtitle pair.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
     /// A playlist that names itself in decision logs.
     pub fn with_label(label: String) -> SessionPlaylist {
         SessionPlaylist {
@@ -289,7 +295,12 @@ impl SessionPlaylist {
         if let (Some(newest), Some(front)) = (newest_shared, self.entries.front())
             && newest < front.sequence
         {
-            log::warn!("shared playlist numbering moved backwards; resetting composed session");
+            if !self.label.is_empty() {
+                log::warn!(
+                    "[{}] shared playlist numbering moved backwards; resetting composed session",
+                    self.label
+                );
+            }
             self.entries.clear();
             self.serve_head = None;
             self.head_advanced_at = None;
@@ -307,6 +318,7 @@ impl SessionPlaylist {
             shared,
             variant,
             variant_prefix,
+            &self.label,
             &self.decisions,
             &self.item_bases,
             resume,
@@ -466,12 +478,15 @@ impl SessionPlaylist {
         if let (Some(oldest), Some(last)) = (timeline.first(), self.entries.back())
             && oldest.sequence > last.sequence + 1
         {
-            log::warn!(
-                "sequence {} is no longer available (timeline now starts at {}); \
-                 re-anchoring composed session",
-                last.sequence + 1,
-                oldest.sequence
-            );
+            if !self.label.is_empty() {
+                log::warn!(
+                    "[{}] sequence {} is no longer available (timeline now starts at {}); \
+                     re-anchoring composed session",
+                    self.label,
+                    last.sequence + 1,
+                    oldest.sequence
+                );
+            }
             self.entries.clear();
             self.serve_head = None;
             self.head_advanced_at = None;
@@ -491,11 +506,14 @@ impl SessionPlaylist {
                     // composition emits positions in order, so a gap means an
                     // upstream skip; appending across it would misnumber every
                     // later position, so hold here until it is filled
-                    log::warn!(
-                        "composed timeline skipped sequence {} to {}; holding",
-                        last.sequence + 1,
-                        entry.sequence
-                    );
+                    if !self.label.is_empty() {
+                        log::warn!(
+                            "[{}] composed timeline skipped sequence {} to {}; holding",
+                            self.label,
+                            last.sequence + 1,
+                            entry.sequence
+                        );
+                    }
                     break;
                 }
                 // an already-emitted position (or a conflicting twin of one)
@@ -610,11 +628,14 @@ impl SessionPlaylist {
             // that did not happen
             let target = own_window.max(head);
             if target > head {
-                log::warn!(
-                    "composed serve head {head} fell {gap} segments behind shared \
-                     head {}; skipping to {target}",
-                    head + gap
-                );
+                if !self.label.is_empty() {
+                    log::warn!(
+                        "[{}] composed serve head {head} fell {gap} segments behind \
+                         shared head {}; skipping to {target}",
+                        self.label,
+                        head + gap
+                    );
+                }
                 head = target;
                 self.head_advanced_at = Some(now);
                 self.lag_stalled_warned_at = None;
@@ -622,13 +643,16 @@ impl SessionPlaylist {
                 .lag_stalled_warned_at
                 .is_none_or(|at| now - at >= time::Duration::seconds(STALL_WARN_SECONDS))
             {
-                log::warn!(
-                    "composed serve head {head} is {gap} segments behind shared head {} \
-                     and cannot advance: composition is held at {tail}. the shared \
-                     session deletes segments this window still lists once the lag \
-                     reaches its retention window",
-                    head + gap
-                );
+                if !self.label.is_empty() {
+                    log::warn!(
+                        "[{}] composed serve head {head} is {gap} segments behind shared \
+                         head {} and cannot advance: composition is held at {tail}. the \
+                         shared session deletes segments this window still lists once \
+                         the lag reaches its retention window",
+                        self.label,
+                        head + gap
+                    );
+                }
                 self.lag_stalled_warned_at = Some(now);
             }
         } else if gap > MAX_LAG_SEGMENTS {
@@ -646,11 +670,14 @@ impl SessionPlaylist {
             }
 
             if let Some(target) = boundary {
-                log::info!(
-                    "composed serve head {head} trimmed {} segments of lag to item \
-                     boundary {target}",
-                    target - head
-                );
+                if !self.label.is_empty() {
+                    log::info!(
+                        "[{}] composed serve head {head} trimmed {} segments of lag to \
+                         item boundary {target}",
+                        self.label,
+                        target - head
+                    );
+                }
                 head = target;
                 self.head_advanced_at = Some(now);
             }
@@ -727,10 +754,12 @@ pub struct ComposeResume {
     pub substituting: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compose_timeline(
     shared: &PlaylistSidecar,
     variant: Option<&PlaylistSidecar>,
     variant_prefix: &str,
+    label: &str,
     decisions: &HashMap<String, ItemDecision>,
     item_bases: &HashMap<String, u64>,
     resume: ComposeResume,
@@ -837,14 +866,17 @@ pub fn compose_timeline(
                             return result;
                         }
 
-                        log::debug!(
-                            "variant for item {} has no segment {} and shared coverage \
-                             runs {}ms past it; serving shared position {}",
-                            segment.item_id,
-                            twin,
-                            behind_ms,
-                            position_ms
-                        );
+                        if !label.is_empty() {
+                            log::info!(
+                                "[{}] variant for item {} has no segment {} and shared \
+                                 coverage runs {}ms past it; serving shared position {}",
+                                label,
+                                segment.item_id,
+                                twin,
+                                behind_ms,
+                                position_ms
+                            );
+                        }
                         // fall through to emit the shared segment, marking the
                         // source switch for players that honor discontinuities.
                         // the variant's segment for this position, if it ever
@@ -1097,6 +1129,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1125,6 +1158,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1144,6 +1178,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1165,6 +1200,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1186,6 +1222,7 @@ mod tests {
             &shared,
             None,
             "variants/abc/",
+            "",
             &decided("game", ItemDecision::Shared),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1213,6 +1250,7 @@ mod tests {
             &shared,
             None,
             "variants/abc/",
+            "",
             &HashMap::new(),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1236,6 +1274,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(0, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1560,6 +1599,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(4_000, 4_000)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -1939,6 +1979,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decisions,
             &bases,
             ComposeResume::default(),
@@ -1952,6 +1993,7 @@ mod tests {
             &trimmed,
             Some(&variant),
             "variants/abc/",
+            "",
             &decisions,
             &bases,
             ComposeResume::default(),
@@ -2021,6 +2063,7 @@ mod tests {
             &shared,
             Some(&variant),
             "variants/abc/",
+            "",
             &decided("game", variant_decision(4_000, 0)),
             &bases_of(&shared),
             ComposeResume::default(),
@@ -2407,6 +2450,7 @@ mod tests {
                 &shared,
                 Some(&variant),
                 "variants/abc/",
+                "",
                 &decided("game", variant_decision(0, 0)),
                 &bases_of(&shared),
                 ComposeResume::default(),

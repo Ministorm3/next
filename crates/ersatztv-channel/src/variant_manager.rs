@@ -148,7 +148,10 @@ impl VariantSession {
             variant_prefix: format!("{VARIANTS_FOLDER}/{folder_name}/"),
             // only the media playlist carries the logging label; the subtitle
             // playlist reruns the same decisions and would double every line
-            playlist: SessionPlaylist::with_label(format!("cohort '{cohort_query}'")),
+            playlist: SessionPlaylist::with_label(format!(
+                "ch {} cohort '{}'",
+                channel.number, cohort_query
+            )),
             subtitle_playlist: SessionPlaylist::default(),
             spawned_items: HashSet::new(),
         }
@@ -889,5 +892,17 @@ mod tests {
                 .unwrap();
 
         assert!(subtitles.contains("live000000.vtt"));
+    }
+
+    /// One log stream carries every channel's workers, so a cohort label that
+    /// omits the channel is ambiguous the moment two channels share a query.
+    #[test]
+    fn a_cohort_label_names_its_channel() {
+        let folder = tempfile::tempdir().unwrap();
+        let session = VariantSession::new("zip=15216", &channel(folder.path()));
+
+        assert_eq!(session.playlist.label(), "ch 5 cohort 'zip=15216'");
+        // the subtitle half stays silent so decisions are reported once
+        assert_eq!(session.subtitle_playlist.label(), "");
     }
 }

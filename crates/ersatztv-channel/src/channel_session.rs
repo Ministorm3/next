@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
-use ersatztv_channel::error::ChannelError;
+use ersatztv_channel::error::{ChannelError, IoContext};
 use ersatztv_channel::variant_manager;
 use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
 use ersatztv_core::{READY_FILE_NAME, empty_folder};
@@ -120,25 +120,37 @@ impl ChannelSession {
             .join("live.m3u8")
             .into_os_string()
             .into_string()
-            .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+            .map_err(|p| ChannelError::OutputPathNotUtf8 {
+                file: "live.m3u8",
+                path: p.to_string_lossy().into_owned(),
+            })?;
 
         let generated_subtitle_output_file = output_folder
             .join("live_sub.m3u8")
             .into_os_string()
             .into_string()
-            .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+            .map_err(|p| ChannelError::OutputPathNotUtf8 {
+                file: "live_sub.m3u8",
+                path: p.to_string_lossy().into_owned(),
+            })?;
 
         let ffmpeg_output_file = output_folder
             .join("ffmpeg.m3u8")
             .into_os_string()
             .into_string()
-            .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+            .map_err(|p| ChannelError::OutputPathNotUtf8 {
+                file: "ffmpeg.m3u8",
+                path: p.to_string_lossy().into_owned(),
+            })?;
 
         let output_segment_template = output_folder
             .join("live%06d.ts")
             .into_os_string()
             .into_string()
-            .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+            .map_err(|p| ChannelError::OutputPathNotUtf8 {
+                file: "live%06d.ts",
+                path: p.to_string_lossy().into_owned(),
+            })?;
 
         let ready_file = output_folder.join(READY_FILE_NAME);
 
@@ -235,9 +247,27 @@ impl ChannelSession {
         let tn = self.timeout_notify.clone();
 
         tokio::spawn(async move {
+            // this loop is the only thing that publishes segments to viewers,
+            // and it runs every two seconds: report each distinct failure once
+            // rather than thirty times a minute, and report recovery, so a
+            // persistent fault is visible without burying the log
+            let mut last_failure: Option<String> = None;
             loop {
                 let mut playlist_manager = pm.lock().await;
-                let _ = playlist_manager.update().await;
+                match playlist_manager.update().await {
+                    Ok(()) => {
+                        if last_failure.take().is_some() {
+                            log::info!("playlist update recovered");
+                        }
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if last_failure.as_deref() != Some(message.as_str()) {
+                            log::warn!("playlist update failed: {message}");
+                            last_failure = Some(message);
+                        }
+                    }
+                }
                 if *playlist_manager.timeout() {
                     tn.notify_one();
                     break;
@@ -331,9 +361,27 @@ impl ChannelSession {
         let tn = self.timeout_notify.clone();
 
         tokio::spawn(async move {
+            // this loop is the only thing that publishes segments to viewers,
+            // and it runs every two seconds: report each distinct failure once
+            // rather than thirty times a minute, and report recovery, so a
+            // persistent fault is visible without burying the log
+            let mut last_failure: Option<String> = None;
             loop {
                 let mut playlist_manager = pm.lock().await;
-                let _ = playlist_manager.update().await;
+                match playlist_manager.update().await {
+                    Ok(()) => {
+                        if last_failure.take().is_some() {
+                            log::info!("playlist update recovered");
+                        }
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if last_failure.as_deref() != Some(message.as_str()) {
+                            log::warn!("playlist update failed: {message}");
+                            last_failure = Some(message);
+                        }
+                    }
+                }
                 if *playlist_manager.timeout() {
                     tn.notify_one();
                     break;
@@ -512,17 +560,19 @@ impl ChannelSession {
         let output_folder = self.channel_config.expanded_output_folder();
 
         if self.ready_file.exists() {
-            tokio::fs::remove_file(&self.ready_file).await?;
+            tokio::fs::remove_file(&self.ready_file)
+                .await
+                .io_context("remove the stale ready file", &self.ready_file)?;
         }
 
         if output_folder.exists() {
             empty_folder(output_folder)
                 .await
-                .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+                .io_context("empty the output folder", output_folder)?;
         } else {
             tokio::fs::create_dir(output_folder)
                 .await
-                .map_err(|_| ChannelError::ChannelConfigOutputFolderRequired)?;
+                .io_context("create the output folder", output_folder)?;
         }
 
         Ok(())
@@ -572,7 +622,7 @@ impl ChannelSession {
         let mut pts_time: Option<PtsTime> = None;
         match self.pts_scanner.get_last_pts().await {
             Ok(scanned_pts_time) => pts_time = Some(scanned_pts_time),
-            Err(e) => log::debug!("failed to scan pts time: {e}"),
+            Err(e) => log::debug!("{e}"),
         }
 
         self.publish_recognized_params().await;
@@ -597,10 +647,11 @@ impl ChannelSession {
         let current_item = match current_item_result {
             Ok(playout_item) => playout_item,
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
+                log::error!("{}", no_item_message(self.transcoded_until, next_start));
                 self.fake_playout_item(next_start)
             }
             Err(err) => {
-                log::error!("{}", err);
+                log::error!("{}", item_unselectable_message(self.transcoded_until, &err));
                 self.fake_playout_item(None)
             }
         };
@@ -637,7 +688,7 @@ impl ChannelSession {
             Ok(ok) => ok,
             Err(e @ ChannelError::IdleTimeout(_)) => return Err(e),
             Err(e) => {
-                log::error!("item failed, replacing with black/silence: {e}");
+                log::error!("{}", item_failed_message(&current_item, &e));
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
                 self.transcode_item(&fake_item, realtime, pts_duration, false)
                     .await?
@@ -1621,6 +1672,32 @@ impl ChannelSession {
     }
 }
 
+/// The three ways a slot airs black, worded so one grep for
+/// `replacing with black/silence` is a complete census and each line names
+/// the slot it lost. They are separate faults with separate remedies: a
+/// schedule gap is expected, an unreadable playout and a failed transcode
+/// are not, and the earlier wording distinguished none of them.
+fn no_item_message(at: OffsetDateTime, next_start: Option<OffsetDateTime>) -> String {
+    format!(
+        "no playout item covers {at}, replacing with black/silence until {}",
+        next_start.map_or_else(
+            || String::from("the next reload"),
+            |start| start.to_string()
+        )
+    )
+}
+
+fn item_unselectable_message(at: OffsetDateTime, error: &ChannelError) -> String {
+    format!("no item could be selected for {at}, replacing with black/silence: {error}")
+}
+
+fn item_failed_message(item: &PlayoutItem, error: &ChannelError) -> String {
+    format!(
+        "item {} ({} .. {}) failed, replacing with black/silence: {error}",
+        item.id, item.start, item.finish
+    )
+}
+
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
     match value {
         WatermarkLocation::TopLeft => ffpipeline::input::WatermarkLocation::TopLeft,
@@ -2010,6 +2087,34 @@ mod tests {
                 }
             }
         }
+    }
+    /// One grep has to find every black-air line, and each has to say which
+    /// slot it lost: 144 anonymous lines cannot be told apart from one slot
+    /// failing 144 times.
+    #[test]
+    fn every_black_air_line_names_its_slot_and_shares_one_phrase() {
+        let item = templated_item();
+        let at = item.start;
+
+        let messages = [
+            no_item_message(at, Some(item.finish)),
+            item_unselectable_message(at, &ChannelError::CaptureFFmpegStderrFailure),
+            item_failed_message(&item, &ChannelError::CaptureFFmpegStderrFailure),
+        ];
+
+        for message in &messages {
+            assert!(
+                message.contains("replacing with black/silence"),
+                "black-air line is not greppable: {message}"
+            );
+        }
+
+        assert!(messages[0].contains(&at.to_string()));
+        assert!(messages[0].contains(&item.finish.to_string()));
+        assert!(messages[1].contains(&at.to_string()));
+        assert!(messages[2].contains(&item.id));
+        assert!(messages[2].contains(&item.start.to_string()));
+        assert!(messages[2].contains(&item.finish.to_string()));
     }
 }
 
