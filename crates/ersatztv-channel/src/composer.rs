@@ -159,6 +159,15 @@ pub struct SessionPlaylist {
     /// sidecars, so only one of the pair carries a label, and each item's
     /// decision is reported once.
     label: String,
+    /// Why the last compose walk stopped, quoted by the stall warning so a
+    /// held playlist names its cause.
+    last_halt: Option<ComposeHalt>,
+    /// The newest listed shared sequence at the last walk, quoted alongside.
+    last_newest_shared: Option<u64>,
+    /// Ticks in a row that reset for backwards numbering. One reset is a
+    /// legitimate shared restart; a run of them means the sidecar is
+    /// alternating between numbering regimes, i.e. two writers.
+    consecutive_resets: u32,
 }
 
 fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
@@ -295,16 +304,32 @@ impl SessionPlaylist {
         if let (Some(newest), Some(front)) = (newest_shared, self.entries.front())
             && newest < front.sequence
         {
+            self.consecutive_resets += 1;
             if !self.label.is_empty() {
                 log::warn!(
-                    "[{}] shared playlist numbering moved backwards; resetting composed session",
-                    self.label
+                    "[{}] shared playlist numbering moved backwards (newest listed {} vs \
+                     composed history {}..{}); resetting composed session{}",
+                    self.label,
+                    newest,
+                    front.sequence,
+                    self.entries.back().map_or(front.sequence, |e| e.sequence),
+                    if self.consecutive_resets > 2 {
+                        format!(
+                            " ({} ticks in a row: the sidecar is alternating between \
+                             numbering regimes, which means two writers)",
+                            self.consecutive_resets
+                        )
+                    } else {
+                        String::new()
+                    }
                 );
             }
             self.entries.clear();
             self.serve_head = None;
             self.head_advanced_at = None;
             self.head_discontinuity_sequence = 0;
+        } else {
+            self.consecutive_resets = 0;
         }
 
         // held positions are append-only history: composition resumes at the
@@ -314,7 +339,7 @@ impl SessionPlaylist {
             from_sequence: self.entries.back().map(|e| e.sequence + 1),
             substituting: self.entries.back().is_some_and(|e| e.variant),
         };
-        let timeline = compose_timeline(
+        let (timeline, halt) = compose_timeline_explained(
             shared,
             variant,
             variant_prefix,
@@ -324,6 +349,8 @@ impl SessionPlaylist {
             resume,
             now - time::Duration::seconds(COMPOSE_TRAIL_SECONDS as i64),
         );
+        self.last_halt = Some(halt);
+        self.last_newest_shared = newest_shared;
         self.reconcile(timeline);
         self.trim(now);
         self.render(shared_head, now, target_duration, map_path)
@@ -428,12 +455,29 @@ impl SessionPlaylist {
             let first_shared = shared
                 .segments
                 .iter()
-                .find(|s| s.item_id == pipeline.item_id)
-                .and_then(|s| parse_pdt(&s.program_date_time));
+                .find(|s| s.item_id == pipeline.item_id);
 
-            let Some(item_start) = first_shared else {
+            let Some(first_segment) = first_shared else {
                 // no shared output for the item yet; nothing to serve either
                 // way, so wait
+                continue;
+            };
+
+            let Some(item_start) = parse_pdt(&first_segment.program_date_time) else {
+                // a segment exists but its program date time cannot be read,
+                // so the deadline cannot arm and the item holds with no
+                // timer at all: the one state that must never pass silently
+                if !self.label.is_empty() {
+                    log::warn!(
+                        "[{}] item {}: shared segment {} carries unparseable \
+                         program_date_time {:?}; the decision deadline cannot arm \
+                         and composition holds at this item until it parses",
+                        self.label,
+                        pipeline.item_id,
+                        first_segment.path,
+                        first_segment.program_date_time,
+                    );
+                }
                 continue;
             };
 
@@ -493,6 +537,7 @@ impl SessionPlaylist {
             self.head_discontinuity_sequence = 0;
         }
 
+        let mut regressed: Option<(u64, u64, u64)> = None;
         for entry in timeline {
             match self.entries.back() {
                 None => {
@@ -517,9 +562,35 @@ impl SessionPlaylist {
                     break;
                 }
                 // an already-emitted position (or a conflicting twin of one)
-                // never re-enters history
-                _ => {}
+                // never re-enters history. positions below the FRONT are a
+                // different animal: nothing this session ever held, numbered
+                // before its history begins, which means the shared numbering
+                // space regressed underneath it (a second writer). counted
+                // and reported, because this discard used to be the silent
+                // sink that made the dual-writer incident invisible
+                _ => {
+                    if entry.sequence < self.head_sequence {
+                        regressed = Some(match regressed {
+                            None => (1, entry.sequence, entry.sequence),
+                            Some((n, lo, hi)) => {
+                                (n + 1, lo.min(entry.sequence), hi.max(entry.sequence))
+                            }
+                        });
+                    }
+                }
             }
+        }
+
+        if let Some((count, lo, hi)) = regressed
+            && !self.label.is_empty()
+        {
+            log::warn!(
+                "[{}] discarded {count} timeline entries numbered {lo}..{hi}, below \
+                 composed history starting at {}: the shared numbering space regressed \
+                 (a second writer, or a shared session restart mid-composition)",
+                self.label,
+                self.head_sequence
+            );
         }
     }
 
@@ -646,11 +717,18 @@ impl SessionPlaylist {
                 if !self.label.is_empty() {
                     log::warn!(
                         "[{}] composed serve head {head} is {gap} segments behind shared \
-                         head {} and cannot advance: composition is held at {tail}. the \
-                         shared session deletes segments this window still lists once \
-                         the lag reaches its retention window",
+                         head {} and cannot advance: composition is held at {tail} \
+                         because {} (history {front}..{tail}, {} entries, newest listed \
+                         shared {}). the shared session deletes segments this window \
+                         still lists once the lag reaches its retention window",
                         self.label,
-                        head + gap
+                        head + gap,
+                        self.last_halt
+                            .as_ref()
+                            .map_or_else(|| String::from("of an unknown cause"), |h| h.to_string()),
+                        self.entries.len(),
+                        self.last_newest_shared
+                            .map_or_else(|| String::from("none"), |n| n.to_string()),
                     );
                 }
                 self.lag_stalled_warned_at = Some(now);
@@ -754,6 +832,75 @@ pub struct ComposeResume {
     pub substituting: bool,
 }
 
+/// Why the compose walk stopped where it did. The serve-side stall warning
+/// quotes this, because "composition is held at {tail}" without the cause
+/// cost a morning of log archaeology during the 2026-08-11 incident: four
+/// distinct stop conditions rendered identically.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComposeHalt {
+    /// The walk consumed every listed shared segment inside the horizon.
+    /// Normal when composition is caught up; with a large serve gap it means
+    /// the sidecar's listed numbering no longer reaches past composed
+    /// history.
+    Exhausted,
+    /// The next position's program date time is past the horizon: the
+    /// normal trailing edge.
+    Horizon,
+    /// A templated position with no decision, or one decided `Variant`
+    /// whose first segment number was never observed. Held with no timer.
+    Undecided {
+        item_id: String,
+        decided: bool,
+        has_base: bool,
+    },
+    /// A decided `Variant` position whose twin the variant has not produced,
+    /// still under the stall threshold.
+    MissingTwin {
+        item_id: String,
+        twin: u64,
+        sequence: u64,
+        behind_ms: u64,
+        shared_edge: u64,
+    },
+}
+
+impl std::fmt::Display for ComposeHalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComposeHalt::Exhausted => {
+                write!(
+                    f,
+                    "every listed shared segment inside the horizon is consumed"
+                )
+            }
+            ComposeHalt::Horizon => write!(f, "the trailing-edge horizon (normal)"),
+            ComposeHalt::Undecided {
+                item_id,
+                decided: false,
+                ..
+            } => write!(f, "item {item_id} is undecided"),
+            ComposeHalt::Undecided { item_id, .. } => write!(
+                f,
+                "item {item_id} is decided variant but its first segment number \
+                 was never observed"
+            ),
+            ComposeHalt::MissingTwin {
+                item_id,
+                twin,
+                sequence,
+                behind_ms,
+                shared_edge,
+            } => write!(
+                f,
+                "item {item_id} is missing variant twin {twin} at position {sequence} \
+                 ({behind_ms}ms of shared coverage past it, stall threshold \
+                 {}ms, shared edge {shared_edge})",
+                (VARIANT_STALL_SECONDS * 1000.0) as u64
+            ),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compose_timeline(
     shared: &PlaylistSidecar,
@@ -765,6 +912,30 @@ pub fn compose_timeline(
     resume: ComposeResume,
     horizon: OffsetDateTime,
 ) -> Vec<ComposedEntry> {
+    compose_timeline_explained(
+        shared,
+        variant,
+        variant_prefix,
+        label,
+        decisions,
+        item_bases,
+        resume,
+        horizon,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compose_timeline_explained(
+    shared: &PlaylistSidecar,
+    variant: Option<&PlaylistSidecar>,
+    variant_prefix: &str,
+    label: &str,
+    decisions: &HashMap<String, ItemDecision>,
+    item_bases: &HashMap<String, u64>,
+    resume: ComposeResume,
+    horizon: OffsetDateTime,
+) -> (Vec<ComposedEntry>, ComposeHalt) {
     let templated: HashMap<&str, bool> = shared
         .pipelines
         .iter()
@@ -774,6 +945,7 @@ pub fn compose_timeline(
     let grid_ms = 1000 * SEGMENT_SECONDS;
     let mut result: Vec<ComposedEntry> = Vec::new();
     let mut substituting = resume.substituting;
+    let mut halt = ComposeHalt::Exhausted;
 
     // the newest shared position inside the horizon. a position held for a
     // missing variant twin measures how much shared coverage has piled up
@@ -796,6 +968,7 @@ pub fn compose_timeline(
         // timeline is append-only and ordered, so this defers these
         // positions to a later tick instead of dropping them
         if pdt > horizon {
+            halt = ComposeHalt::Horizon;
             break;
         }
         let Some(sequence) = sequence_of(&segment.path) else {
@@ -863,7 +1036,16 @@ pub fn compose_timeline(
                         // cohort's timeline for good
                         let behind_ms = shared_edge.saturating_sub(sequence) * grid_ms;
                         if (behind_ms as f64) < VARIANT_STALL_SECONDS * 1000.0 {
-                            return result;
+                            return (
+                                result,
+                                ComposeHalt::MissingTwin {
+                                    item_id: segment.item_id.clone(),
+                                    twin,
+                                    sequence,
+                                    behind_ms,
+                                    shared_edge,
+                                },
+                            );
                         }
 
                         if !label.is_empty() {
@@ -902,7 +1084,14 @@ pub fn compose_timeline(
                 _ => {
                     // undecided, or an item whose base was never observed:
                     // hold everything from here on back
-                    return result;
+                    return (
+                        result,
+                        ComposeHalt::Undecided {
+                            item_id: segment.item_id.clone(),
+                            decided: decisions.contains_key(&segment.item_id),
+                            has_base: item_bases.contains_key(&segment.item_id),
+                        },
+                    );
                 }
             }
         } else {
@@ -919,7 +1108,7 @@ pub fn compose_timeline(
         });
     }
 
-    result
+    (result, halt)
 }
 
 #[cfg(test)]
@@ -1118,6 +1307,138 @@ mod tests {
             }
         }
         map
+    }
+
+    /// Four stop conditions used to render identically as "composition is
+    /// held at {tail}". The halt names them apart; these pin each name to
+    /// its state so the stall warning stays trustworthy.
+    #[test]
+    fn an_undecided_item_names_itself_in_the_halt() {
+        let shared = shared_with_templated_item();
+
+        let (timeline, halt) = compose_timeline_explained(
+            &shared,
+            None,
+            "variants/abc/",
+            "",
+            &HashMap::new(),
+            &HashMap::new(),
+            ComposeResume::default(),
+            NO_HORIZON,
+        );
+
+        assert_eq!(timeline.len(), 2, "composition holds at the undecided item");
+        assert_eq!(
+            halt,
+            ComposeHalt::Undecided {
+                item_id: String::from("game"),
+                decided: false,
+                has_base: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_variant_decision_with_no_observed_base_says_so_in_the_halt() {
+        let shared = shared_with_templated_item();
+
+        let (_, halt) = compose_timeline_explained(
+            &shared,
+            Some(&variant_for_game()),
+            "variants/abc/",
+            "",
+            &decided("game", variant_decision(0, 0)),
+            &HashMap::new(),
+            ComposeResume::default(),
+            NO_HORIZON,
+        );
+
+        assert_eq!(
+            halt,
+            ComposeHalt::Undecided {
+                item_id: String::from("game"),
+                decided: true,
+                has_base: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_missing_twin_under_the_stall_threshold_reports_its_arithmetic() {
+        let shared = shared_with_templated_item();
+        let empty_variant = PlaylistSidecar {
+            segments: vec![],
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+
+        let (timeline, halt) = compose_timeline_explained(
+            &shared,
+            Some(&empty_variant),
+            "variants/abc/",
+            "",
+            &decided("game", variant_decision(0, 0)),
+            &bases_of(&shared),
+            ComposeResume::default(),
+            NO_HORIZON,
+        );
+
+        assert_eq!(timeline.len(), 2, "composition holds at the missing twin");
+        assert_eq!(
+            halt,
+            ComposeHalt::MissingTwin {
+                item_id: String::from("game"),
+                twin: 0,
+                sequence: 2,
+                // the newest listed position is 4, the hole is at 2
+                behind_ms: 2 * 1000 * SEGMENT_SECONDS,
+                shared_edge: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_caught_up_walk_reports_the_horizon() {
+        let shared = shared_with_templated_item();
+
+        let (timeline, halt) = compose_timeline_explained(
+            &shared,
+            None,
+            "variants/abc/",
+            "",
+            &HashMap::new(),
+            &HashMap::new(),
+            ComposeResume::default(),
+            // between the first and second segments' program date times
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2),
+        );
+
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(halt, ComposeHalt::Horizon);
+    }
+
+    #[test]
+    fn a_consumed_sidecar_reports_exhaustion() {
+        let shared = PlaylistSidecar {
+            segments: vec![
+                seg("live000000.ts", "before", 0, false),
+                seg("live000001.ts", "before", 4, false),
+            ],
+            pipelines: vec![pipeline("before", 0, false)],
+        };
+
+        let (timeline, halt) = compose_timeline_explained(
+            &shared,
+            None,
+            "variants/abc/",
+            "",
+            &HashMap::new(),
+            &HashMap::new(),
+            ComposeResume::default(),
+            NO_HORIZON,
+        );
+
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(halt, ComposeHalt::Exhausted);
     }
 
     #[test]
