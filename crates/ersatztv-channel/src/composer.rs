@@ -149,10 +149,13 @@ pub struct SessionPlaylist {
     lag_stalled_warned_at: Option<OffsetDateTime>,
     decisions: HashMap<String, ItemDecision>,
     /// The sequence number of the first segment ever observed for each
-    /// templated item, recorded once and never recomputed. Positions inside
-    /// an item derive from this: the sidecar trims its history, so anything
-    /// measured from "the first segment still listed" shifts as the item
-    /// ages, and every position-based decision would shift with it.
+    /// templated item, recorded once per numbering space and never
+    /// recomputed within it. Positions inside an item derive from this: the
+    /// sidecar trims its history, so anything measured from "the first
+    /// segment still listed" shifts as the item ages, and every
+    /// position-based decision would shift with it. The numbering-backwards
+    /// reset drops every base along with `decisions`, because a sequence
+    /// number means nothing outside the space it was observed in.
     item_bases: HashMap<String, u64>,
     /// Names this session in decision logs. Empty (the default) stays silent:
     /// the media and subtitle playlists run the same decisions over the same
@@ -328,6 +331,17 @@ impl SessionPlaylist {
             self.serve_head = None;
             self.head_advanced_at = None;
             self.head_discontinuity_sequence = 0;
+            // per-item state dies with the numbering it was measured in. a
+            // base is a sequence number from the old space: against the new
+            // one, saturating_sub collapses every re-aired position to zero
+            // and aliases the whole item onto a single twin. a Variant
+            // decision's join and anchor are differences of pts offsets from
+            // pipelines the restart discarded. the re-anchor in `reconcile`
+            // keeps both maps on purpose: there the numbering space
+            // continues and only history was trimmed, so the bases (recorded
+            // once, exactly to survive trimming) are still true
+            self.decisions.clear();
+            self.item_bases.clear();
         } else {
             self.consecutive_resets = 0;
         }
@@ -2573,6 +2587,189 @@ mod tests {
         assert_eq!(session.head_sequence, 0);
         assert_eq!(session.entries.len(), 10);
         assert!(rendered.contains("live000000.ts"));
+    }
+
+    /// A session that recorded its per-item state in a numbering space
+    /// starting at 40: base 40 for the templated item, and a final `Variant`
+    /// decision whose join and anchor were measured against that space's
+    /// pipelines.
+    fn session_decided_variant_in_the_40_space() -> SessionPlaylist {
+        let mut session = SessionPlaylist::default();
+        let shared = PlaylistSidecar {
+            segments: (40..50i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", i * 4, i == 40))
+                .collect(),
+            pipelines: vec![pipeline("game", 160_000, true)],
+        };
+        let variant = PlaylistSidecar {
+            segments: (0..10i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", 160 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("game", 160_000, true)],
+        };
+        session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(46),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(204),
+            4,
+            |s| s.to_owned(),
+        );
+        assert_eq!(session.item_bases.get("game"), Some(&40));
+        assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
+        assert_eq!(session.entries.len(), 10);
+        session
+    }
+
+    /// The stale-base failure the renumber reset must not leave behind: the
+    /// shared session restarts, numbers from zero, and re-airs the same item
+    /// id. A base recorded in the old space is huge against the new
+    /// numbering, so `saturating_sub` collapses every re-aired position to
+    /// zero, and zero names the same variant twin at every position: one
+    /// 4-second segment aliased across the whole item. The maps must die
+    /// with the numbering they were measured in, so positions derive from a
+    /// base recorded in the new space.
+    #[test]
+    fn a_renumber_rerecords_the_base_so_a_reaired_item_gets_its_own_twins() {
+        let mut session = session_decided_variant_in_the_40_space();
+
+        // the restarted session re-airs the item from sequence zero, with
+        // fresh pts envelopes and a fresh anchored variant
+        let shared = PlaylistSidecar {
+            segments: (0..10i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", 400 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+        let variant = PlaylistSidecar {
+            segments: (0..10i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", 400 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+
+        session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(0),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(440),
+            4,
+            |s| s.to_owned(),
+        );
+        // the reset tick: decide_items ran before the reset block and
+        // consulted the stale maps, and the reset dropped them anyway
+        assert!(session.decisions.is_empty());
+        assert!(session.item_bases.is_empty());
+
+        // next tick: per-item state re-forms from the new sidecar
+        session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(0),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(442),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert_eq!(session.item_bases.get("game"), Some(&0));
+        let paths: Vec<String> = session.entries.iter().map(|e| e.path.clone()).collect();
+        let expected: Vec<String> = (0..9i64)
+            .map(|i| format!("variants/x/live{i:06}.ts"))
+            .collect();
+        assert_eq!(
+            paths, expected,
+            "each re-aired position substitutes its own twin"
+        );
+    }
+
+    /// A final `Variant` decision is a join and an anchor measured against
+    /// pts envelopes the restart discarded. After the renumber the same item
+    /// re-airs with no variant published at all; the decision window must
+    /// re-arm from the new airing's first segment and pin shared, instead of
+    /// the dead decision driving twin arithmetic against files that no
+    /// longer exist.
+    #[test]
+    fn a_stale_variant_decision_does_not_survive_the_renumber() {
+        let mut session = session_decided_variant_in_the_40_space();
+
+        let shared = PlaylistSidecar {
+            segments: (0..10i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", 400 + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("game", 8_000, true)],
+        };
+
+        // both ticks run past the re-armed deadline (the first new segment's
+        // pdt + 12s), so the tick after the reset pins shared
+        for step in 0..2i64 {
+            session.advance_and_render(
+                &shared,
+                None,
+                "variants/x/",
+                Some(0),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(440 + step * 2),
+                4,
+                |s| s.to_owned(),
+            );
+        }
+
+        assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+        assert_eq!(session.entries.back().map(|e| e.sequence), Some(8));
+        assert!(
+            session.entries.iter().all(|e| !e.variant),
+            "the re-aired item serves the new shared feed"
+        );
+    }
+
+    /// The boundary of the renumber rule. `reconcile`'s re-anchor fires in
+    /// the SAME numbering space, when every sequence still needed has aged
+    /// out of the timeline: the bases were recorded once precisely to
+    /// survive that trimming, and the decisions still measure the live
+    /// pipelines. The re-anchor must keep both maps where the renumber reset
+    /// drops them, or a deep trim would shift every position of a mid-air
+    /// item by the trimmed amount.
+    #[test]
+    fn a_reanchor_keeps_the_maps_a_renumber_drops() {
+        let mut session = session_decided_variant_in_the_40_space();
+
+        // numbering continues far past everything held; nothing regressed,
+        // the history in between simply aged out
+        let shared = PlaylistSidecar {
+            segments: (200..210i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", i * 4, i == 200))
+                .collect(),
+            pipelines: vec![pipeline("game", 160_000, true)],
+        };
+        // the twins for those positions, numbered from the ORIGINAL base:
+        // 200 minus 40 puts the window at twins 160 through 169
+        let variant = PlaylistSidecar {
+            segments: (160..170i64)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", (40 + i) * 4, false))
+                .collect(),
+            pipelines: vec![pipeline("game", 160_000, true)],
+        };
+
+        session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(205),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(850),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert_eq!(session.head_sequence, 200, "the session re-anchored");
+        assert_eq!(session.item_bases.get("game"), Some(&40));
+        assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
+        assert_eq!(
+            session.entries.front().map(|e| e.path.as_str()),
+            Some("variants/x/live000160.ts"),
+            "positions still derive from the base recorded before the trim"
+        );
     }
 
     /// Composition resumes at the first position not yet held, mid
