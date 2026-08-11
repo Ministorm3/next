@@ -457,6 +457,9 @@ async fn spawn_missing_variants(
             .arg(&session.cohort_query)
             .arg("-")
             .stdin(std::process::Stdio::piped())
+            // a shared worker that dies takes its variant workers with it,
+            // instead of leaving them writing cohort folders nobody owns
+            .kill_on_drop(true)
             .spawn();
 
         match spawned {

@@ -26,6 +26,10 @@ impl ChannelSession {
             .arg(channel.number())
             .arg(channel.config_path())
             .args(channel.overlay_paths())
+            // a server that exits takes its channel workers with it, so a
+            // restart never leaves an old worker sharing a folder with the
+            // new server's spawn
+            .kill_on_drop(true)
             .spawn()
             .map_err(LineupError::Io)?;
 
