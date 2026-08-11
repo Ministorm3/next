@@ -1084,7 +1084,12 @@ impl ChannelSession {
             // worker now owns
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| ChannelError::StreamFailure(String::from("failed to spawn ffmpeg")))?;
+            .map_err(|e| {
+                ChannelError::StreamFailure(format!(
+                    "failed to spawn ffmpeg {}: {e}",
+                    self.ffmpeg_path.display()
+                ))
+            })?;
 
         let stderr = ffmpeg_child
             .stderr

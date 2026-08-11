@@ -101,7 +101,7 @@ impl VariantManager {
     pub async fn tick(&self, channel: &VariantChannel) {
         let recognized = cohort::read_recognized_params(&channel.output_folder).await;
         let requests = read_requests(channel, &recognized).await;
-        let shared = read_sidecar(&channel.output_folder.join("live.m3u8")).await;
+        let shared = read_sidecar(&channel.output_folder.join("live.m3u8"), "shared").await;
 
         // a live cohort request is a viewer of this channel. during a
         // substituted window that viewer fetches only composed playlists and
@@ -117,7 +117,20 @@ impl VariantManager {
 
         let admitted = admit(&requests, &sessions, shared.is_some(), &channel.number);
         answer_requests(channel, &requests, &admitted).await;
-        reap(&mut sessions, &admitted, channel).await;
+
+        let requested: BTreeSet<String> = requests
+            .iter()
+            .filter(|r| !r.cohort_query.is_empty())
+            .map(|r| r.cohort_query.clone())
+            .collect();
+        reap(
+            &mut sessions,
+            &admitted,
+            &requested,
+            shared.is_some(),
+            channel,
+        )
+        .await;
 
         let Some(shared) = shared else {
             return;
@@ -161,7 +174,7 @@ impl VariantSession {
     /// playlist. Rendering is driven by the clock rather than by a request, so
     /// the composed playlist a viewer reads is at most one tick old.
     async fn render(&mut self, channel: &VariantChannel, shared: &PlaylistSidecar) {
-        let variant = read_sidecar(&self.folder.join("live.m3u8")).await;
+        let variant = read_sidecar(&self.folder.join("live.m3u8"), "variant").await;
         let shared_head = read_media_sequence(&channel.output_folder.join("live.m3u8")).await;
         let now = OffsetDateTime::now_utc();
         let cohort = stable_name(&self.cohort_query);
@@ -213,8 +226,20 @@ async fn read_requests(
     recognized: &BTreeSet<String>,
 ) -> Vec<ResolvedRequest> {
     let folder = requests_folder(&channel.output_folder);
-    let Ok(mut entries) = tokio::fs::read_dir(&folder).await else {
-        return Vec::new();
+    let mut entries = match tokio::fs::read_dir(&folder).await {
+        Ok(entries) => entries,
+        // absence is the normal no-viewers case; anything else reads as
+        // "no viewers" too, which reaps every session, so it has to say so
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            log::warn!(
+                "cannot scan the cohort requests folder {}: {e}; treating channel {} \
+                 as having no cohort viewers this tick",
+                folder.display(),
+                channel.number
+            );
+            return Vec::new();
+        }
     };
 
     let mut requests = Vec::new();
@@ -309,7 +334,13 @@ async fn answer_requests(
     }
 
     let folder = answers_folder(&channel.output_folder);
-    if tokio::fs::create_dir_all(&folder).await.is_err() {
+    if let Err(e) = tokio::fs::create_dir_all(&folder).await {
+        log::warn!(
+            "cannot create the answers folder {}: {e}; every cohort request on \
+             channel {} goes unanswered and serves shared",
+            folder.display(),
+            channel.number
+        );
         return;
     }
 
@@ -330,15 +361,26 @@ async fn answer_requests(
             continue;
         }
 
-        let _ = tokio::fs::write(&path, &answer).await;
+        if let Err(e) = tokio::fs::write(&path, &answer).await {
+            log::warn!(
+                "cannot write the cohort answer {}: {e}; the requester falls back \
+                 to shared",
+                path.display()
+            );
+        }
     }
 }
 
 /// Drops sessions whose cohort is no longer admitted, removing the playlists
 /// immediately and the transcode folder once its worker has had time to exit.
+/// `requested` and `have_shared` exist to name the reason: "idle" used to
+/// cover all three causes, and a shared-sidecar read failure reaping every
+/// session read as an audience walking away.
 async fn reap(
     sessions: &mut HashMap<String, VariantSession>,
     admitted: &BTreeSet<String>,
+    requested: &BTreeSet<String>,
+    have_shared: bool,
     channel: &VariantChannel,
 ) {
     let dropped: Vec<String> = sessions
@@ -352,8 +394,15 @@ async fn reap(
             continue;
         };
 
+        let reason = if !have_shared {
+            "the shared sidecar is unavailable"
+        } else if !requested.contains(&cohort_query) {
+            "no fresh viewer request"
+        } else {
+            "not admitted at the session cap"
+        };
         log::info!(
-            "reaping idle variant session for cohort '{}' on channel {}",
+            "reaping variant session for cohort '{}' on channel {} ({reason})",
             session.cohort_query,
             channel.number
         );
@@ -413,7 +462,12 @@ async fn spawn_missing_variants(
         session.spawned_items.insert(pipeline.item_id.clone());
 
         if let Err(e) = tokio::fs::create_dir_all(&session.folder).await {
-            log::error!("cannot create variant folder: {e}");
+            log::error!(
+                "cannot create the variant folder {} for item {}: {e}; this window \
+                 will never get a variant (spawns are not retried)",
+                session.folder.display(),
+                pipeline.item_id
+            );
             continue;
         }
 
@@ -465,6 +519,8 @@ async fn spawn_missing_variants(
         match spawned {
             Ok(mut child) => {
                 let item_id = pipeline.item_id.clone();
+                let cohort_query = session.cohort_query.clone();
+                let number = channel.number.clone();
                 let config_json = channel.config_json.clone();
                 let stdin = child.stdin.take();
 
@@ -472,15 +528,45 @@ async fn spawn_missing_variants(
                     // the child blocks reading its configuration until stdin
                     // closes, so the handle has to be dropped, not just written
                     if let Some(mut stdin) = stdin {
-                        let _ = stdin.write_all(config_json.as_bytes()).await;
-                        let _ = stdin.shutdown().await;
+                        let piped = async {
+                            stdin.write_all(config_json.as_bytes()).await?;
+                            stdin.shutdown().await
+                        }
+                        .await;
+                        if let Err(e) = piped {
+                            log::warn!(
+                                "cannot pipe the channel config to the variant worker \
+                                 for item {item_id}: {e}; the worker will fail its \
+                                 config parse and exit"
+                            );
+                        }
                     }
 
-                    let status = child.wait().await;
-                    log::debug!("variant worker for item {item_id} exited: {status:?}");
+                    match child.wait().await {
+                        Ok(status) if status.success() => {
+                            log::debug!("variant worker for item {item_id} exited: {status:?}");
+                        }
+                        // there is no respawn: a failed variant means the
+                        // composer pins shared at the decision deadline, and
+                        // this line is the only durable trace of why
+                        Ok(status) => log::warn!(
+                            "variant worker for item {item_id} (cohort '{cohort_query}', \
+                             channel {number}) exited {status}; no respawn, the cohort \
+                             serves shared for this window"
+                        ),
+                        Err(e) => log::warn!(
+                            "cannot reap the variant worker for item {item_id} (cohort \
+                             '{cohort_query}', channel {number}): {e}"
+                        ),
+                    }
                 });
             }
-            Err(e) => log::error!("failed to spawn variant worker: {e}"),
+            Err(e) => log::error!(
+                "cannot spawn the variant worker {} for item {}: {e}; this window \
+                 will never get a variant (spawns are not retried)",
+                channel.channel_binary.display(),
+                pipeline.item_id
+            ),
         }
     }
 }
@@ -502,30 +588,70 @@ async fn is_stale(path: &Path) -> bool {
 async fn write_atomic(path: &Path, contents: &str) {
     let temporary = path.with_extension("tmp");
 
-    if tokio::fs::write(&temporary, contents).await.is_err() {
+    // a playlist that stops being republished goes stale against the
+    // server's freshness gate and every viewer silently falls back to
+    // shared, so neither failure may pass without naming the playlist
+    if let Err(e) = tokio::fs::write(&temporary, contents).await {
+        log::warn!(
+            "cannot write the composed playlist temp for {}: {e}",
+            path.display()
+        );
         return;
     }
 
     if let Err(e) = tokio::fs::rename(&temporary, path).await {
-        log::warn!("failed to publish composed playlist: {e}");
+        log::warn!(
+            "cannot publish the composed playlist {}: {e}",
+            path.display()
+        );
         let _ = tokio::fs::remove_file(&temporary).await;
     }
 }
 
-async fn read_sidecar(playlist_path: &Path) -> Option<PlaylistSidecar> {
+/// `context` names which sidecar this is ("shared" or "variant") in failure
+/// logs: the two have opposite blast radii (an unreadable shared sidecar
+/// reaps every cohort on the channel; an unreadable variant sidecar pins one
+/// cohort to shared), and the old silent `.ok()?` chain hid both.
+async fn read_sidecar(playlist_path: &Path, context: &str) -> Option<PlaylistSidecar> {
     let path = PathBuf::from(format!(
         "{}{SIDECAR_SUFFIX}",
         playlist_path.to_string_lossy()
     ));
-    let json = tokio::fs::read_to_string(&path).await.ok()?;
-    serde_json::from_str(&json).ok()
+    let json = match tokio::fs::read_to_string(&path).await {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!("cannot read the {context} sidecar {}: {e}", path.display());
+            return None;
+        }
+    };
+    match serde_json::from_str(&json) {
+        Ok(sidecar) => Some(sidecar),
+        Err(e) => {
+            log::warn!("cannot parse the {context} sidecar {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// The media sequence the shared playlist currently serves from. The composed
 /// playlist mirrors it whenever it can, so a client moved between the two
 /// lands on the same numbering.
 async fn read_media_sequence(playlist_path: &Path) -> Option<u64> {
-    let playlist = tokio::fs::read_to_string(playlist_path).await.ok()?;
+    let playlist = match tokio::fs::read_to_string(playlist_path).await {
+        Ok(playlist) => playlist,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            // a None here zeroes the composed lag measurement, silently
+            // disabling every lag trim and the cannot-advance warning
+            log::warn!(
+                "cannot read the shared playlist {} for its media sequence: {e}; \
+                 lag governance is disabled this tick",
+                playlist_path.display()
+            );
+            return None;
+        }
+    };
     playlist
         .lines()
         .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
@@ -533,12 +659,31 @@ async fn read_media_sequence(playlist_path: &Path) -> Option<u64> {
 }
 
 async fn touch_heartbeat(folder: &Path) {
-    if tokio::fs::create_dir_all(folder).await.is_ok() {
-        let heartbeat = folder.join(HEARTBEAT_FILE_NAME);
-        if !heartbeat.exists() {
-            let _ = tokio::fs::write(&heartbeat, b"").await;
-        }
-        let _ = filetime::set_file_mtime(&heartbeat, filetime::FileTime::now());
+    if let Err(e) = tokio::fs::create_dir_all(folder).await {
+        log::warn!(
+            "cannot create the session folder {} to refresh its heartbeat: {e}; \
+             the session may idle out despite viewers",
+            folder.display()
+        );
+        return;
+    }
+    let heartbeat = folder.join(HEARTBEAT_FILE_NAME);
+    if !heartbeat.exists()
+        && let Err(e) = tokio::fs::write(&heartbeat, b"").await
+    {
+        log::warn!(
+            "cannot create the heartbeat {}: {e}; the session may idle out \
+             despite viewers",
+            heartbeat.display()
+        );
+        return;
+    }
+    if let Err(e) = filetime::set_file_mtime(&heartbeat, filetime::FileTime::now()) {
+        log::warn!(
+            "cannot refresh the heartbeat {}: {e}; the session may idle out \
+             despite viewers",
+            heartbeat.display()
+        );
     }
 }
 
@@ -657,7 +802,14 @@ mod tests {
             VariantSession::new(cohort_query, &channel),
         );
 
-        reap(&mut sessions, &BTreeSet::new(), &channel).await;
+        reap(
+            &mut sessions,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+            &channel,
+        )
+        .await;
 
         assert!(sessions.is_empty());
         assert!(!playlist.exists());
