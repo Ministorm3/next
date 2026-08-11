@@ -194,7 +194,10 @@ impl FilterChain {
                         );
                     }
 
+                    best.kind.configure(&current_state);
+
                     // ensure main input matches overlay required pixel format
+                    let main_req = best.kind.main_input_state(&current_state);
                     if current_state.pixel_format != main_req.pixel_format {
                         Self::convert_pixel_format(
                             ffmpeg_info,
@@ -485,6 +488,18 @@ impl FilterChain {
             self.filters.swap(tonemap_index, tonemap_index + 1);
         }
 
+        // remove DV5 workaround with libplacebo
+        if self.filters.iter().any(|f| {
+            matches!(
+                f,
+                PipelineFilter::Video(VideoFilter::LibplaceboCuda(_))
+                    | PipelineFilter::Video(VideoFilter::LibplaceboVulkan(_))
+            )
+        }) {
+            self.filters
+                .retain(|f| !matches!(f, PipelineFilter::Video(VideoFilter::Dv5Workaround(_))));
+        }
+
         loop {
             let mut changed = false;
 
@@ -701,7 +716,7 @@ mod tests {
     use crate::frame_size::FrameSize;
     use crate::hw_accel::HardwareAccel;
     use crate::output_settings::ScalingMode;
-    use crate::pipeline::HwPixelFormat;
+    use crate::pipeline::{HdrFormat, HwPixelFormat};
     use crate::video_filter::{
         FormatFilter, HwMapFilter, HwUploadFilter, PadFilter, ScaleFilter, TPadFilter,
         ToneMapFilter,
@@ -781,7 +796,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::Vaapi,
             pixel_format: PixelFormat::P010le,
-            is_hdr: true,
+            hdr_format: HdrFormat::Pq,
         }
     }
 
@@ -1224,7 +1239,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::Vaapi,
             pixel_format: PixelFormat::Nv12,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         }
     }
 
@@ -1545,7 +1560,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::System,
             pixel_format: PixelFormat::P010le,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         };
 
         let mut chain = FilterChain::new(Vec::new());
@@ -1622,7 +1637,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::System,
             pixel_format: PixelFormat::Nv12,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         };
 
         let mut chain = FilterChain::new(Vec::new());
@@ -1675,7 +1690,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::System,
             pixel_format: PixelFormat::Yuv420p,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         };
 
         let mut chain = FilterChain::new(Vec::new());
@@ -1742,7 +1757,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::System,
             pixel_format: PixelFormat::Yuv420p10le,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         };
 
         let mut chain = FilterChain::new(Vec::new());
@@ -1808,7 +1823,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::System,
             pixel_format: PixelFormat::Yuv420p10le,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         };
 
         let mut chain = FilterChain::new(Vec::new());
@@ -1853,7 +1868,7 @@ mod tests {
             display_aspect_ratio: None,
             surface: FrameSurface::System,
             pixel_format: PixelFormat::Yuv420p,
-            is_hdr: false,
+            hdr_format: HdrFormat::None,
         };
         let ffmpeg_info = FfmpegInfo::default();
         let filter_options = VideoFilterOptions::default();

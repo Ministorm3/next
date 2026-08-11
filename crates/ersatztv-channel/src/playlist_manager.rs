@@ -134,6 +134,8 @@ pub struct PlaylistManager {
     /// file's mtime, so no file meant no timeout, ever.
     heartbeat_last_seen: Instant,
     heartbeat_missing_warned: bool,
+
+    last_progress: OffsetDateTime,
 }
 
 #[derive(Clone)]
@@ -197,6 +199,8 @@ impl PlaylistManager {
             // server first touches it, so absence is only worth a warning
             // after the file has been seen.
             heartbeat_missing_warned: true,
+
+            last_progress: OffsetDateTime::now_utc(),
         }
     }
 
@@ -209,6 +213,10 @@ impl PlaylistManager {
 
     pub fn timeout(&self) -> &bool {
         &self.timeout
+    }
+
+    pub fn last_progress(&self) -> &OffsetDateTime {
+        &self.last_progress
     }
 
     pub async fn before_new_pipeline(
@@ -233,6 +241,8 @@ impl PlaylistManager {
             templated,
             fallback,
         });
+
+        self.last_progress = OffsetDateTime::now_utc();
 
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
         if Path::new(&self.generated_playlist_file).exists() {
@@ -314,6 +324,7 @@ impl PlaylistManager {
             });
 
             self.last_segment_end += Duration::from_secs_f64(duration);
+            self.last_progress = OffsetDateTime::now_utc();
 
             let vtt_path = format!("{}.vtt", file.strip_suffix(".ts").unwrap_or(&file));
             let vtt_full = self.output_folder.join(&vtt_path);

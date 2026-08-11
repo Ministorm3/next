@@ -36,6 +36,8 @@ enum Commands {
         output_folder: PathBuf,
         #[arg(short, long)]
         number: String,
+        #[arg(short, long)]
+        troubleshoot: bool,
     },
     /// Transcode a single playout item as a stream variant, with cohort
     /// query values steering its templated URL
@@ -92,13 +94,14 @@ async fn run() -> Result<(), ChannelError> {
             config_paths,
             output_folder,
             number,
+            troubleshoot,
         } => {
             let channel_config =
                 ChannelConfig::from_sources(&config_paths, &output_folder, &number).await?;
 
             // start channel session
             let mut channel_session = ChannelSession::new(channel_config).await?;
-            channel_session.run().await
+            channel_session.run(troubleshoot).await
         }
         Commands::Variant {
             config_paths,

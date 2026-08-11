@@ -78,6 +78,9 @@ pub enum ChannelError {
     #[error("channel {0} terminated after idle timeout")]
     IdleTimeout(String),
 
+    #[error("channel {0} terminated after ffmpeg stall")]
+    Stalled(String),
+
     #[error("failed to capture ffmpeg stderr")]
     CaptureFFmpegStderrFailure,
 
