@@ -46,9 +46,29 @@ const STALL_WARN_SECONDS: i64 = 30;
 /// How long an entry stays in session history after leaving the serve window.
 const HISTORY_SECONDS: u64 = 120;
 
-/// An item's decision is forced this close to the serve-window edge if the
-/// variant still has no output; earlier, composition holds back instead.
-const DECISION_LEAD_SECONDS: u64 = 8;
+/// How long an item's decision stays open, measured from the program date
+/// time of the item's first shared segment. Past it, the item is pinned to
+/// shared; earlier, composition holds back instead.
+///
+/// A variant's source is live, so it cannot be worked ahead: it connects at
+/// the item's air time and closes its first segment about ten seconds later,
+/// whatever the shared session's work-ahead happened to be when the variant
+/// spawned. Measured over 22 clean windows on channels 11 and 13 on
+/// 2026-08-12, with the shared session's work-ahead ranging from 23s to 55s,
+/// that startup was 8.6s to 11.2s after the item's own stamp and showed no
+/// dependence on the work-ahead at all.
+///
+/// So the budget has to clear an 11s startup, and clear it with room for the
+/// two things that eat into it. The composer only re-evaluates about every
+/// two seconds, so a decision lands on a poll boundary rather than the
+/// instant the variant is ready. And the stamp this deadline is measured
+/// from runs early of wall clock over a long run, because the playlist
+/// manager's clock only ever advances by emitted segment durations and is
+/// never re-anchored to the schedule, which shortens the budget by exactly
+/// that error. At the previous 12s the margin was 0.8s to 3.4s and roughly
+/// one window in ten lost the race, serving slate over the top of a variant
+/// that then arrived two seconds late.
+const DECISION_BUDGET_SECONDS: u64 = 20;
 
 /// How far behind the live edge the composed timeline stops.
 ///
@@ -93,6 +113,19 @@ const MAX_LAG_SEGMENTS: u64 = 10;
 /// still exist on disk. The compile-time assertion lives next to
 /// `HISTORY_DURATION` in `playlist_manager.rs`.
 pub const HARD_LAG_SEGMENTS: u64 = 20;
+
+// Holding a decision open costs the serve head exactly the time it holds.
+// Composition stops at an undecided item once that item's first segment is
+// COMPOSE_TRAIL_SECONDS old, and the head cannot walk past a stopped
+// composed edge, so the whole remainder of the budget is lag the head
+// accumulates against the shared playlist. The budget only spends that much
+// when a variant genuinely never arrives, but it has to stay affordable
+// even then: past MAX_LAG_SEGMENTS the head starts being trimmed forward,
+// which is a decision hold turning into skipped program content.
+const _: () = assert!(
+    (DECISION_BUDGET_SECONDS - COMPOSE_TRAIL_SECONDS) / SEGMENT_SECONDS < MAX_LAG_SEGMENTS,
+    "a full decision hold must not by itself push the serve head past MAX_LAG_SEGMENTS"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemDecision {
@@ -498,12 +531,9 @@ impl SessionPlaylist {
             // hold the decision open while there is still time for the
             // variant to produce output. viewers play a full serve window
             // behind the live edge, so the decision can stay open until
-            // shortly AFTER the item's first segment pdt and still be
-            // pinned before any viewer's playlist reaches the boundary
-            let deadline = item_start
-                + time::Duration::seconds(
-                    (SEGMENT_SECONDS * 5) as i64 - DECISION_LEAD_SECONDS as i64,
-                );
+            // well AFTER the item's first segment pdt and still be pinned
+            // before any viewer's playlist reaches the boundary
+            let deadline = item_start + time::Duration::seconds(DECISION_BUDGET_SECONDS as i64);
             if now >= deadline {
                 if !self.label.is_empty() {
                     log::warn!(
@@ -1657,9 +1687,47 @@ mod tests {
 
         // by the time any viewer's playlist could reach the boundary, the
         // decision must be forced
-        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
+        let late = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(8 + DECISION_BUDGET_SECONDS as i64);
         session.decide_items(&shared, None, late);
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
+    }
+
+    /// A variant's source is live, so it connects at the item's air time and
+    /// closes its first segment about ten seconds later, sometimes more. The
+    /// decision has to still be open when a slow one lands: pinning shared
+    /// first and upgrading afterwards is exactly what puts slate on screen
+    /// over the top of a presentation that did arrive.
+    ///
+    /// Measured on 2026-08-12, a variant's startup ran 8.6s to 11.2s past
+    /// the item's stamp over 22 clean windows, and the windows that failed
+    /// were the ones that ran past 12s.
+    #[test]
+    fn decision_waits_out_a_slow_variant_instead_of_pinning_shared() {
+        let mut session = SessionPlaylist::default();
+        let shared = shared_with_templated_item();
+        // the templated item's first shared segment is stamped +8s
+        let item_pdt = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8);
+
+        // nothing from the variant yet, right through the window in which a
+        // healthy one would already have appeared
+        for elapsed in [8, 10, 12, 14, 16] {
+            session.decide_items(&shared, None, item_pdt + time::Duration::seconds(elapsed));
+            assert!(
+                session.decisions.is_empty(),
+                "pinned shared at +{elapsed}s, before a live variant's startup \
+                 can honestly be called lost",
+            );
+        }
+
+        // it lands late and is still served from its own first frame, with
+        // no shared pin to upgrade away from and so no slate on screen
+        session.decide_items(
+            &shared,
+            Some(&variant_for_game()),
+            item_pdt + time::Duration::seconds(18),
+        );
+        assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
     }
 
     /// Content produced faster than realtime must not drag the composed edge
@@ -1820,7 +1888,8 @@ mod tests {
         let mut variant = variant_for_game();
         variant.pipelines[0].pts_offset_ms = 7_000;
 
-        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
+        let late = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(8 + DECISION_BUDGET_SECONDS as i64);
         session.decide_items(&shared, Some(&variant), late);
 
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
@@ -1849,7 +1918,8 @@ mod tests {
         let shared = shared_with_templated_item();
 
         // deadline passes with no variant: soft-pinned shared
-        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
+        let late = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(8 + DECISION_BUDGET_SECONDS as i64);
         session.decide_items(&shared, None, late);
         assert_eq!(session.decisions.get("game"), Some(&ItemDecision::Shared));
 
@@ -1871,7 +1941,8 @@ mod tests {
     #[test]
     fn upgrade_never_reserves_an_already_served_position() {
         let mut session = SessionPlaylist::default();
-        let late = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(8 + 12);
+        let late = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(8 + DECISION_BUDGET_SECONDS as i64);
 
         // the shared session has produced only the item's first position when
         // the deadline passes: shared pinned, that position served
