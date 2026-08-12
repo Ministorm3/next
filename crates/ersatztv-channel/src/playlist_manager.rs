@@ -11,6 +11,14 @@ use ffpipeline::web_vtt::{Cue, format_vtt_ts};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
+/// The most a single pipeline boundary will pull the stamp clock forward onto
+/// the schedule. Steady state is well under this: the clock only slips by
+/// whatever the previous item under-emitted, and the worst single item
+/// measured was 476ms. The bound exists so that a clock which is somehow far
+/// out slews back over several boundaries rather than opening one large hole
+/// in the timeline.
+const MAX_SCHEDULE_REANCHOR: time::Duration = time::Duration::seconds(2);
+
 const MIN_SEGMENTS: usize = 4;
 
 /// How much media is kept behind the live edge before segments are trimmed
@@ -122,6 +130,16 @@ pub struct PlaylistManager {
     /// Retention budget behind the served head; [`HISTORY_DURATION`] for a
     /// shared session, [`VARIANT_HISTORY_DURATION`] for a variant.
     history: Duration,
+    /// Whether pipeline boundaries pull this session's stamps back onto the
+    /// authored schedule. True for a shared session, whose stamps are what
+    /// viewers and the composer read. False for a variant, whose stamps are
+    /// never read by anything: the composer takes every composed entry's
+    /// program date time from the SHARED segment at that position and uses a
+    /// variant segment only for its path and duration. A variant's clock is
+    /// deliberately seeded where it starts capturing, which is one whole
+    /// work-ahead away from the item's authored start, so anchoring it would
+    /// warn on every window about a gap that means nothing.
+    anchors_to_schedule: bool,
     /// An extended budget that actually trims has been outgrown by serve
     /// lag or item length; warned once per session.
     extended_trim_warned: bool,
@@ -191,6 +209,7 @@ impl PlaylistManager {
             pipelines: Vec::new(),
 
             history: HISTORY_DURATION,
+            anchors_to_schedule: true,
             extended_trim_warned: false,
 
             timeout: false,
@@ -211,6 +230,13 @@ impl PlaylistManager {
         self.history = history;
     }
 
+    /// Marks this session as one whose stamps nobody reads, so pipeline
+    /// boundaries leave its clock where its capture put it. See
+    /// [`Self::anchors_to_schedule`].
+    pub fn stop_anchoring_to_schedule(&mut self) {
+        self.anchors_to_schedule = false;
+    }
+
     pub fn timeout(&self) -> &bool {
         &self.timeout
     }
@@ -219,6 +245,62 @@ impl PlaylistManager {
         &self.last_progress
     }
 
+    /// Pulls the stamp clock back onto the schedule at a pipeline boundary.
+    ///
+    /// `last_segment_end` is seeded once from wall clock and thereafter only
+    /// ever advances by what was actually emitted, so any item that emits
+    /// less media than its window is scheduled for moves the whole channel's
+    /// stamps permanently early. Nothing used to pull them back, even though
+    /// this same session already re-anchors its other schedule-domain clock,
+    /// `transcoded_until`, to the authored item at every boundary.
+    ///
+    /// Items do emit short, and not rarely. A source whose video stream ends
+    /// before its container says it does is scheduled for the container
+    /// duration and emits the video duration, and about a fifth of the bump
+    /// library is built that way. One recurring 11.021s logo whose video runs
+    /// 10.560s cost 476ms every time it aired. Channel 13 never showed the
+    /// problem only because a watermark overlay holds its output open to the
+    /// full window; channel 11 carries no watermark and took the whole
+    /// deficit, reaching 5.1s of early stamps over a 23 hour run.
+    ///
+    /// Correction is forward only and rate limited. Forward only because
+    /// `last_segment_end` is the end of the media already emitted, so moving
+    /// it back would stamp the next segment inside the previous one. Rate
+    /// limited so that a clock that is somehow far out closes the gap over
+    /// several items instead of tearing a visible hole in the timeline; a
+    /// boundary already carries a discontinuity, which is what makes the
+    /// small forward step legal in the first place.
+    fn reanchor_to_schedule(&mut self, item_id: &str, schedule_position: OffsetDateTime) {
+        if !self.anchors_to_schedule {
+            return;
+        }
+
+        let error = schedule_position - self.last_segment_end;
+        if error <= time::Duration::ZERO {
+            return;
+        }
+
+        let step = error.min(MAX_SCHEDULE_REANCHOR);
+        if error > MAX_SCHEDULE_REANCHOR {
+            log::warn!(
+                "item {item_id}: program date time runs {}ms early of its scheduled start, \
+                 further than one boundary should ever have to correct; closing {}ms of it \
+                 here and the rest at later boundaries",
+                error.whole_milliseconds(),
+                step.whole_milliseconds(),
+            );
+        } else {
+            log::debug!(
+                "item {item_id}: re-anchoring program date time {}ms forward onto its \
+                 scheduled start",
+                step.whole_milliseconds(),
+            );
+        }
+
+        self.last_segment_end += step;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn before_new_pipeline(
         &mut self,
         new_pts_offset: Option<PtsOffset>,
@@ -227,8 +309,10 @@ impl PlaylistManager {
         duration_ms: u64,
         templated: bool,
         fallback: bool,
+        schedule_position: OffsetDateTime,
     ) -> Result<(), ChannelError> {
         self.update().await?;
+        self.reanchor_to_schedule(item_id, schedule_position);
         self.pts_offset = new_pts_offset;
         self.subtitle_source = new_subtitle_source;
         self.pending_discontinuity = true;
@@ -1043,6 +1127,77 @@ mod tests {
         }
         m.last_segment_end = channel_start + Duration::from_secs(segment_count * 4);
         m
+    }
+
+    /// An item that emits less media than its window was scheduled for used
+    /// to move the channel's stamps early for the rest of the worker's life.
+    /// The measured case: an 11.021s logo whose video stream runs 10.560s,
+    /// which cost 476ms of stamp clock every time it aired.
+    #[test]
+    fn a_short_item_does_not_move_the_stamp_clock_early_for_good() {
+        let air = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(600);
+        let mut m = manager();
+        m.last_segment_end = air;
+
+        // the logo is scheduled 11.021s but emits only 10.545s
+        m.last_segment_end += Duration::from_millis(10_545);
+        // the next item is scheduled to start a full 11.021s after the logo
+        let next_scheduled = air + Duration::from_millis(11_021);
+        m.reanchor_to_schedule("logo", next_scheduled);
+
+        assert_eq!(
+            m.last_segment_end, next_scheduled,
+            "the next item must be stamped at the time it is scheduled to air",
+        );
+    }
+
+    /// `last_segment_end` is the end of the media already emitted, so pulling
+    /// it backwards would stamp the next segment inside the previous one.
+    #[test]
+    fn the_stamp_clock_is_never_pulled_backwards() {
+        let air = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(600);
+        let mut m = manager();
+        // an item that ran long, so the clock is already past the schedule
+        m.last_segment_end = air + Duration::from_millis(250);
+
+        m.reanchor_to_schedule("overrun", air);
+
+        assert_eq!(m.last_segment_end, air + Duration::from_millis(250));
+    }
+
+    /// A clock that is somehow far out closes the gap over several boundaries
+    /// rather than tearing one large hole in the timeline.
+    #[test]
+    fn a_large_correction_slews_instead_of_jumping() {
+        let air = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(600);
+        let mut m = manager();
+        m.last_segment_end = air;
+
+        m.reanchor_to_schedule("far-out", air + Duration::from_secs(9));
+
+        assert_eq!(
+            m.last_segment_end,
+            air + Duration::from_secs(2),
+            "a single boundary corrects at most MAX_SCHEDULE_REANCHOR",
+        );
+    }
+
+    /// A variant's stamps are never read: the composer takes every composed
+    /// entry's program date time from the shared segment at that position.
+    /// Its clock is seeded where it starts capturing, a whole work-ahead
+    /// after the item's authored start, so anchoring it would warn on every
+    /// window about a gap that means nothing.
+    #[test]
+    fn a_variant_session_leaves_its_own_clock_where_its_capture_put_it() {
+        let air = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(600);
+        let mut m = manager();
+        m.stop_anchoring_to_schedule();
+        // a variant starts capturing a full work-ahead after the item airs
+        m.last_segment_end = air - Duration::from_secs(30);
+
+        m.reanchor_to_schedule("star", air);
+
+        assert_eq!(m.last_segment_end, air - Duration::from_secs(30));
     }
 
     /// The leading segments `update` would trim and delete.

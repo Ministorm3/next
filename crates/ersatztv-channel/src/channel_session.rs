@@ -373,6 +373,10 @@ impl ChannelSession {
             .lock()
             .await
             .set_history_duration(VARIANT_HISTORY_DURATION);
+        self.playlist_manager
+            .lock()
+            .await
+            .stop_anchoring_to_schedule();
 
         self.ffmpeg_info = FfmpegInfo::load(
             &self.ffmpeg_path,
@@ -1112,6 +1116,14 @@ impl ChannelSession {
                 pipeline_duration_ms,
                 is_templated,
                 slate,
+                // where in the schedule this pipeline begins. transcoded_until
+                // is still the start position here: it is only advanced to the
+                // finish once transcode_item returns. Clamped into the item the
+                // same way input_timing clamps it, so a session joining an item
+                // partway through re-anchors to where it actually joined rather
+                // than to the item's start
+                self.transcoded_until
+                    .clamp(current_item.start, current_item.finish),
             )
             .await?;
 
