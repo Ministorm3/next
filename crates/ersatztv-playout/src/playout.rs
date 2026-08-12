@@ -82,6 +82,11 @@ pub struct PlayoutItem {
     /// sessions, and that is only possible while the templated URL is still
     /// here to resolve per cohort.
     ///
+    /// A slate plays its whole window, so the trim points a source can carry
+    /// say nothing here and the worker discards them: the item's slot alone
+    /// decides how long the window runs, and media shorter than it repeats
+    /// to fill it.
+    ///
     /// Omitted when the item has no slate, which is every item written
     /// before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

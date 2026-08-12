@@ -713,7 +713,21 @@ impl ChannelSession {
                 }
                 None => current_item,
             },
-            false => current_item,
+            false => {
+                // slate answers a templated window and nothing else: an
+                // ordinary item already names the media its slot plays, and
+                // there is no live source here to stand in for. The key did
+                // nothing, so it says so rather than leaving an operator to
+                // wonder why the slate never aired
+                if let Some(declared) = current_item.slate.as_ref() {
+                    log::warn!(
+                        "item {} declares slate {} but nothing about it is templated; the slate is ignored and the item plays its own source",
+                        current_item.id,
+                        slate_label(declared)
+                    );
+                }
+                current_item
+            }
         };
 
         let pts_duration = pts_time.map(|p| p.duration);
@@ -1004,10 +1018,8 @@ impl ChannelSession {
             _ => None,
         };
 
-        // slate stands in for a window rather than filling a slot of its
-        // own, so any library item works as one whatever its length: repeat
-        // it until the output -t ends the window. Scheduled content is never
-        // repeated, because playing it twice is not what the schedule said
+        // every input is read once through, which is what the schedule asked
+        // for; the slate window then says otherwise just below
         let mut input_settings = InputSettings {
             start: current_item.start,
             audio_input: ProbedInput {
@@ -1016,7 +1028,7 @@ impl ChannelSession {
                 out_point: audio_timing.out_point,
                 probe_result: audio_probe_result.clone(),
                 stream_index: audio_index,
-                loop_when_exhausted: slate,
+                loop_when_exhausted: false,
             },
             video_input: ProbedInput {
                 input_source: video_input_source,
@@ -1028,11 +1040,12 @@ impl ChannelSession {
                 out_point: video_timing.out_point,
                 probe_result: video_probe_result.clone(),
                 stream_index: video_index,
-                loop_when_exhausted: slate,
+                loop_when_exhausted: false,
             },
             subtitle_input,
             watermark_input,
         };
+        repeat_media_inputs_for_slate(&mut input_settings, slate);
 
         let mut subtitle_source: Option<SubtitleSource> = None;
         if output_settings.subtitle_mode == SubtitleMode::Convert
@@ -1964,7 +1977,7 @@ async fn usable_item_slate(item: &PlayoutItem) -> Option<PlayoutItemSource> {
         && tokio::fs::metadata(path).await.is_err()
     {
         log::warn!(
-            "slate {} declared on item {} does not exist; falling back to the slate side file",
+            "slate {} declared on item {} does not exist; falling back to the slate side file, and tuning the live source if that names nothing usable either",
             path,
             item.id
         );
@@ -2007,6 +2020,8 @@ fn slate_label(source: &PlayoutItemSource) -> &str {
 /// already happened, and an item that still advertised one would offer a
 /// second round of it to anything that read the item back.
 fn slate_item(item: PlayoutItem, slate_source: PlayoutItemSource) -> PlayoutItem {
+    let slate_source = whole_window_slate(slate_source, &item.id);
+
     PlayoutItem {
         id: item.id,
         start: item.start,
@@ -2016,6 +2031,95 @@ fn slate_item(item: PlayoutItem, slate_source: PlayoutItemSource) -> PlayoutItem
         slate: None,
         watermark: item.watermark,
     }
+}
+
+/// The slate as its window will play it: from the top, for the whole slot.
+///
+/// A slate arrives as a full source, so the wire can carry in and out points
+/// on it, and they are discarded here. Trim points are media coordinates
+/// that describe the item a scheduler picked them for: the scheduler read a
+/// duration off that media and cut a slot to hold it, which is why
+/// [`effective_out_point_ms`] can trust one to narrow a slot and only has to
+/// defend against one that widens it. A slate is not that item. The schedule
+/// declared the window, and the slate is only what the shared session shows
+/// across it, looping for as long as the window lasts, so no slot was ever
+/// measured against these points and there is nothing for them to narrow.
+///
+/// Clamping them instead would answer a media question with the schedule's
+/// number, since the only clamp available is the window's own length, and a
+/// short out_point would still have to be overwritten to keep the window
+/// whole. Discarding leaves each domain saying what it owns: the schedule
+/// owns how long the window runs, the slate owns only what plays inside it.
+///
+/// An out_point honoured here ends the shared transcode and the sidecar
+/// envelope early while the run loop advances past the whole window, which
+/// is dead air for every viewer and a variant left waiting on segments that
+/// are never coming, so the discard is loud.
+fn whole_window_slate(mut source: PlayoutItemSource, item_id: &str) -> PlayoutItemSource {
+    let declared = match &source {
+        PlayoutItemSource::Local {
+            in_point_ms,
+            out_point_ms,
+            ..
+        }
+        | PlayoutItemSource::Http {
+            in_point_ms,
+            out_point_ms,
+            ..
+        } => (*in_point_ms, *out_point_ms),
+        _ => (None, None),
+    };
+
+    if declared == (None, None) {
+        return source;
+    }
+
+    log::warn!(
+        "slate {} on item {} declares in_point {} and out_point {}; a slate plays its whole window, so both are discarded",
+        slate_label(&source),
+        item_id,
+        trim_point_label(declared.0),
+        trim_point_label(declared.1)
+    );
+
+    if let PlayoutItemSource::Local {
+        in_point_ms,
+        out_point_ms,
+        ..
+    }
+    | PlayoutItemSource::Http {
+        in_point_ms,
+        out_point_ms,
+        ..
+    } = &mut source
+    {
+        *in_point_ms = None;
+        *out_point_ms = None;
+    }
+
+    source
+}
+
+/// A trim point as an operator reading the warning wants to see it.
+fn trim_point_label(point_ms: Option<u64>) -> String {
+    match point_ms {
+        Some(point_ms) => format!("{point_ms}ms"),
+        None => String::from("none"),
+    }
+}
+
+/// Repeat the media inputs for as long as the window runs, which only a
+/// slate does.
+///
+/// A slate stands in for a window rather than filling a slot of its own, so
+/// any library item works as one whatever its length: the input is reopened
+/// until the output `-t` ends the window. Scheduled content is never
+/// repeated, because playing an item twice is not what the schedule said.
+/// The subtitle input keeps whatever it was built with: its cues are timed
+/// once against the source, and a slate carries none of them anyway.
+fn repeat_media_inputs_for_slate(input_settings: &mut InputSettings, slate: bool) {
+    input_settings.audio_input.loop_when_exhausted = slate;
+    input_settings.video_input.loop_when_exhausted = slate;
 }
 
 /// How far into an item the shared session began reading, derived from the
@@ -2318,6 +2422,155 @@ mod tests {
             }
             other => panic!("expected a local slate source, got {other:?}"),
         }
+    }
+
+    /// The trim points `input_timing` reads off the source it is handed, in
+    /// the two shapes that can carry them. Mirrors the two matches there, so
+    /// a slate that reaches it clean here reaches it clean there.
+    fn trim_points(source: &PlayoutItemSource) -> (u64, Option<u64>) {
+        match source {
+            PlayoutItemSource::Local {
+                in_point_ms,
+                out_point_ms,
+                ..
+            }
+            | PlayoutItemSource::Http {
+                in_point_ms,
+                out_point_ms,
+                ..
+            } => (in_point_ms.unwrap_or(0), *out_point_ms),
+            _ => (0, None),
+        }
+    }
+
+    /// A slate is a full source, so a scheduler can hang trim points on it,
+    /// and they must not shorten the window it stands in for. An out_point
+    /// honoured here ends the shared transcode and the sidecar envelope
+    /// short of a slot the run loop still advances past: black to the end of
+    /// the window, and a declared envelope no variant can ever fill. The
+    /// clamp is no defence, because a short out_point is not an overrun.
+    #[tokio::test]
+    async fn a_declared_slate_plays_its_whole_window_whatever_trim_points_it_carries() {
+        let folder = tempfile::tempdir().unwrap();
+        let declared = folder.path().join("WeatherSlate.mp4");
+        tokio::fs::write(&declared, b"slate").await.unwrap();
+
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "local",
+            "path": declared.to_string_lossy(),
+            "in_point_ms": 30_000,
+            "out_point_ms": 45_000
+        })));
+        let slot_ms = (item.finish - item.start).whole_milliseconds() as u64;
+
+        let source = usable_item_slate(&item)
+            .await
+            .expect("the declared slate is on disk");
+        let slated = slate_item(item, source);
+
+        let substituted = slated.source.as_ref().expect("the slate is the source");
+        assert_eq!(slate_label(substituted), declared.to_string_lossy());
+
+        // what input_timing then reads off the substituted source: no seek,
+        // no explicit end, so the window plays whole and nothing is clamped
+        let (in_point_base_ms, explicit_out_point_ms) = trim_points(substituted);
+        assert_eq!(in_point_base_ms, 0);
+        assert_eq!(explicit_out_point_ms, None);
+        assert_eq!(
+            effective_out_point_ms(explicit_out_point_ms, in_point_base_ms, slot_ms),
+            (slot_ms, 0)
+        );
+    }
+
+    /// The same for a slate that is not a local file. Trim points ride on
+    /// http sources too, and reach `input_timing` by the same match.
+    #[tokio::test]
+    async fn a_remote_slate_loses_its_trim_points_the_same_way() {
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "http",
+            "uri": "http://slates/OffAir.mkv",
+            "out_point_ms": 20_000
+        })));
+        let slot_ms = (item.finish - item.start).whole_milliseconds() as u64;
+
+        let source = usable_item_slate(&item)
+            .await
+            .expect("a remote slate is taken at its word");
+        let slated = slate_item(item, source);
+
+        let substituted = slated.source.as_ref().expect("the slate is the source");
+        assert_eq!(trim_points(substituted), (0, None));
+        assert_eq!(
+            effective_out_point_ms(None, 0, slot_ms),
+            (slot_ms, 0),
+            "the whole window, as the schedule declared it"
+        );
+    }
+
+    /// Every input the pipeline reads for one item, before the slate window
+    /// says otherwise.
+    fn one_pass_input_settings() -> InputSettings {
+        let probed = |path: &str| ProbedInput {
+            input_source: InputSource::Local(LocalInputSource {
+                path: String::from(path),
+            }),
+            probe_result: ProbeResult {
+                path: String::from(path),
+                streams: Vec::new(),
+                duration: None,
+                format_name: None,
+            },
+            in_point: Duration::ZERO,
+            out_point: Duration::from_secs(150),
+            stream_index: None,
+            loop_when_exhausted: false,
+        };
+
+        InputSettings {
+            start: templated_item().start,
+            audio_input: probed("/slate/WeatherSlate.mp4"),
+            video_input: probed("/slate/WeatherSlate.mp4"),
+            subtitle_input: Some(probed("/slate/WeatherSlate.mp4")),
+            watermark_input: None,
+        }
+    }
+
+    /// The single line joining the two halves of the feature: the run loop
+    /// decides this window plays slate, and the pipeline's media inputs have
+    /// to repeat for that to mean anything. Without it a slate shorter than
+    /// its window ends the transcode early and takes the rest of the slot
+    /// with it, which is the whole reason any library item can be slate.
+    #[test]
+    fn a_slate_window_repeats_its_media_inputs_and_a_scheduled_one_never_does() {
+        let mut slated = one_pass_input_settings();
+        repeat_media_inputs_for_slate(&mut slated, true);
+
+        assert!(
+            slated.audio_input.loop_when_exhausted,
+            "slate audio must repeat until the window ends"
+        );
+        assert!(
+            slated.video_input.loop_when_exhausted,
+            "slate video must repeat until the window ends"
+        );
+        assert!(
+            !slated
+                .subtitle_input
+                .expect("the subtitle input is left alone")
+                .loop_when_exhausted
+        );
+
+        let mut scheduled = one_pass_input_settings();
+        repeat_media_inputs_for_slate(&mut scheduled, false);
+
+        assert!(
+            !scheduled.audio_input.loop_when_exhausted,
+            "scheduled content must never play twice"
+        );
+        assert!(
+            !scheduled.video_input.loop_when_exhausted,
+            "scheduled content must never play twice"
+        );
     }
 
     #[test]
