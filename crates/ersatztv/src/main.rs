@@ -474,11 +474,9 @@ async fn maybe_composed_playlist(
     // resulting cohort's transcode alive; the worker owns the resolution
     // because only it knows what the current playout recognizes
     let _ = variant_request::publish_request(channel.output_folder(), query).await;
-    let cohort = variant_request::read_answer(channel.output_folder(), query).await?;
 
     let playlist =
-        variant_request::read_composed_playlist(channel.output_folder(), &cohort, subtitles)
-            .await?;
+        variant_request::await_composed_playlist(channel.output_folder(), query, subtitles).await?;
 
     Some(
         (
