@@ -207,6 +207,7 @@ pub fn build_input(
             in_point: Duration::ZERO,
             out_point: duration,
             stream_index: None,
+            loop_when_exhausted: false,
         },
         video_input: ProbedInput {
             input_source: InputSource::Local(LocalInputSource { path: path_str }),
@@ -214,6 +215,7 @@ pub fn build_input(
             in_point: Duration::ZERO,
             out_point: duration,
             stream_index: None,
+            loop_when_exhausted: false,
         },
         subtitle_input: None,
         watermark_input: watermark,

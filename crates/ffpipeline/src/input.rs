@@ -369,6 +369,16 @@ pub struct ProbedInput {
     pub in_point: Duration,
     pub out_point: Duration,
     pub stream_index: Option<u32>,
+    /// Reopen this input from its start whenever it runs out, so media
+    /// shorter than the window it has to fill keeps producing frames instead
+    /// of ending early.
+    ///
+    /// Only the caller knows whether repeating is meaningful: repeating
+    /// scheduled content would play it twice, so this is for filler that
+    /// stands in for a window rather than fills a slot of its own. The
+    /// output `-t` is still the only thing that ends the transcode, so an
+    /// input longer than the window never reaches the loop.
+    pub loop_when_exhausted: bool,
 }
 
 #[derive(Debug, Clone)]

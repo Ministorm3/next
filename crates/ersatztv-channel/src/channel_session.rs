@@ -700,15 +700,16 @@ impl ChannelSession {
         // variant sessions; what changes is only what the shared stream shows
         let mut slate = false;
         let current_item = match Self::item_is_templated(&current_item) {
-            true => match self.load_slate_path().await {
-                Some(slate_path) => {
+            true => match self.resolve_slate(&current_item).await {
+                Some((slate_source, origin)) => {
                     log::info!(
-                        "item {}: shared session plays slate {} for this templated window",
+                        "item {}: shared session plays slate {} from {} for this templated window",
                         current_item.id,
-                        slate_path
+                        slate_label(&slate_source),
+                        origin
                     );
                     slate = true;
-                    slate_item(current_item, slate_path)
+                    slate_item(current_item, slate_source)
                 }
                 None => current_item,
             },
@@ -998,10 +999,15 @@ impl ChannelSession {
                 out_point: s_time.out_point,
                 probe_result: s_probe,
                 stream_index: subtitle_index,
+                loop_when_exhausted: false,
             }),
             _ => None,
         };
 
+        // slate stands in for a window rather than filling a slot of its
+        // own, so any library item works as one whatever its length: repeat
+        // it until the output -t ends the window. Scheduled content is never
+        // repeated, because playing it twice is not what the schedule said
         let mut input_settings = InputSettings {
             start: current_item.start,
             audio_input: ProbedInput {
@@ -1010,6 +1016,7 @@ impl ChannelSession {
                 out_point: audio_timing.out_point,
                 probe_result: audio_probe_result.clone(),
                 stream_index: audio_index,
+                loop_when_exhausted: slate,
             },
             video_input: ProbedInput {
                 input_source: video_input_source,
@@ -1021,6 +1028,7 @@ impl ChannelSession {
                 out_point: video_timing.out_point,
                 probe_result: video_probe_result.clone(),
                 stream_index: video_index,
+                loop_when_exhausted: slate,
             },
             subtitle_input,
             watermark_input,
@@ -1435,16 +1443,34 @@ impl ChannelSession {
                 .is_some_and(source_is_templated)
     }
 
-    /// The configured slate for this channel's templated windows, if any.
+    /// The slate this templated window plays on the shared session, and the
+    /// configuration it came from.
     ///
-    /// Slate is a side file ([`slate::SlateConfig`], next to the playout
-    /// folder) rather than a channel.json field: legacy pipes the channel
-    /// config over stdin and rebuilds it per session, so a file the operator
-    /// owns is the one place the setting survives in both deployment shapes.
-    /// Re-read at every templated window, so slate can be added or removed
-    /// without a restart. Only `path` matters here; the variant manager owns
-    /// the `default` key on its own cadence.
-    async fn load_slate_path(&self) -> Option<String> {
+    /// The side file is read only when the item declares no slate of its
+    /// own: a file that is never read cannot warn about a channel-wide
+    /// setting this window was never going to use.
+    async fn resolve_slate(&self, item: &PlayoutItem) -> Option<(PlayoutItemSource, SlateOrigin)> {
+        let item_slate = usable_item_slate(item).await;
+        let side_file_slate = match item_slate {
+            Some(_) => None,
+            None => self.load_slate_path().await,
+        };
+        choose_slate(item_slate, side_file_slate)
+    }
+
+    /// The configured slate for this channel's templated windows, if any,
+    /// with the file that configured it so a log line can name it.
+    ///
+    /// The side file ([`slate::SlateConfig`], next to the playout folder)
+    /// predates the schedule carrying slate, and outlives it: legacy pipes
+    /// the channel config over stdin and rebuilds it per session, so a file
+    /// the operator owns is the one place a channel-wide setting survives in
+    /// both deployment shapes, and it still answers for every templated
+    /// window a schedule says nothing about. Re-read at every templated
+    /// window, so slate can be added or removed without a restart. Only
+    /// `path` matters here; the variant manager owns the `default` key on
+    /// its own cadence.
+    async fn load_slate_path(&self) -> Option<(String, PathBuf)> {
         let file = slate::slate_file(self.channel_config.expanded_playout_folder())?;
         let path = match slate::read_slate_file(&file).await {
             SlateFile::Missing => None,
@@ -1462,7 +1488,7 @@ impl ChannelSession {
             );
             return None;
         }
-        Some(path)
+        Some((path, file))
     }
 
     fn fake_playout_item(&self, next_start: Option<OffsetDateTime>) -> PlayoutItem {
@@ -1525,6 +1551,7 @@ impl ChannelSession {
                 }),
                 subtitle: None,
             }),
+            slate: None,
             watermark: None,
         }
     }
@@ -1884,22 +1911,109 @@ fn source_is_templated(source: &PlayoutItemSource) -> bool {
     }
 }
 
+/// Where a templated window's slate was configured. There are two places to
+/// look now, so a line reporting that slate is on air has to say which one
+/// put it there, or it sends an operator to edit the file that lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SlateOrigin {
+    /// Declared on the playout item itself.
+    Schedule,
+    /// The channel's slate side file, named by its path.
+    SideFile(PathBuf),
+}
+
+impl std::fmt::Display for SlateOrigin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlateOrigin::Schedule => write!(f, "the schedule"),
+            SlateOrigin::SideFile(file) => write!(f, "{}", file.display()),
+        }
+    }
+}
+
+/// Which of the two configurations this window's slate comes from.
+///
+/// The item wins. A schedule can say which window gets which slate, where
+/// the side file can only say what the channel falls back to, so an item
+/// that names a slate has said the more specific thing. An item that names
+/// none leaves the channel-wide answer standing, exactly as before the
+/// schedule could carry slate at all.
+fn choose_slate(
+    item_slate: Option<PlayoutItemSource>,
+    side_file_slate: Option<(String, PathBuf)>,
+) -> Option<(PlayoutItemSource, SlateOrigin)> {
+    match (item_slate, side_file_slate) {
+        (Some(source), _) => Some((source, SlateOrigin::Schedule)),
+        (None, Some((path, file))) => Some((local_slate(path), SlateOrigin::SideFile(file))),
+        (None, None) => None,
+    }
+}
+
+/// The item's own slate, when it names media this session can play.
+///
+/// A local path that does not exist is not a slate: substituting it fails
+/// the window into the black fake item, where falling through leaves the
+/// side file and then the live source, both of which are better air. Only
+/// local paths are checked, because they are the only kind that can be
+/// answered for free; every other kind is opened by ffmpeg, and reaching it
+/// from here would cost a round trip on every templated window.
+async fn usable_item_slate(item: &PlayoutItem) -> Option<PlayoutItemSource> {
+    let source = item.slate.as_ref()?;
+
+    if let PlayoutItemSource::Local { path, .. } = source
+        && tokio::fs::metadata(path).await.is_err()
+    {
+        log::warn!(
+            "slate {} declared on item {} does not exist; falling back to the slate side file",
+            path,
+            item.id
+        );
+        return None;
+    }
+
+    Some(source.clone())
+}
+
+/// A slate configured as a bare path, which is all the side file can say.
+fn local_slate(path: String) -> PlayoutItemSource {
+    PlayoutItemSource::Local {
+        path,
+        in_point_ms: None,
+        out_point_ms: None,
+        probe_hint: None,
+    }
+}
+
+/// What to call a slate source in a line an operator reads: the part of it
+/// they typed. A slate is almost always a local file, so this is almost
+/// always its path.
+fn slate_label(source: &PlayoutItemSource) -> &str {
+    match source {
+        PlayoutItemSource::Local { path, .. } => path,
+        PlayoutItemSource::Lavfi { params, .. } => params,
+        PlayoutItemSource::Http { uri, .. }
+        | PlayoutItemSource::Rtsp { uri, .. }
+        | PlayoutItemSource::Dynamic { uri, .. } => uri,
+        PlayoutItemSource::Script { command, .. } => command,
+    }
+}
+
 /// The item the shared session transcodes in place of a templated window:
 /// the same identity and slot, so the sidecar, variant spawning, and
-/// composition all see the window unchanged, with the slate file as its
-/// only source.
-fn slate_item(item: PlayoutItem, slate_path: String) -> PlayoutItem {
+/// composition all see the window unchanged, with the slate as its only
+/// source.
+///
+/// The substituted item carries no slate of its own. The substitution has
+/// already happened, and an item that still advertised one would offer a
+/// second round of it to anything that read the item back.
+fn slate_item(item: PlayoutItem, slate_source: PlayoutItemSource) -> PlayoutItem {
     PlayoutItem {
         id: item.id,
         start: item.start,
         finish: item.finish,
-        source: Some(PlayoutItemSource::Local {
-            path: slate_path,
-            in_point_ms: None,
-            out_point_ms: None,
-            probe_hint: None,
-        }),
+        source: Some(slate_source),
         tracks: None,
+        slate: None,
         watermark: item.watermark,
     }
 }
@@ -2036,9 +2150,10 @@ mod tests {
         (progress_ms, item_duration_ms - position)
     }
 
-    /// A star-window item as legacy exports it: a templated live URI.
-    fn templated_item() -> PlayoutItem {
-        serde_json::from_value(serde_json::json!({
+    /// A star-window item as legacy exports it: a templated live URI, and
+    /// whatever slate the schedule declares on it.
+    fn templated_item_with_slate(slate: Option<serde_json::Value>) -> PlayoutItem {
+        let mut item = serde_json::json!({
             "id": "star",
             "start": "2026-08-10T12:35:10.000-04:00",
             "finish": "2026-08-10T12:37:40.000-04:00",
@@ -2047,8 +2162,23 @@ mod tests {
                 "uri": "http://host:8000/live.ts?sid=ch{channel_number}&zip={query:zip|10001}",
                 "is_live": true
             }
-        }))
-        .unwrap()
+        });
+
+        if let Some(slate) = slate {
+            item["slate"] = slate;
+        }
+
+        serde_json::from_value(item).unwrap()
+    }
+
+    fn templated_item() -> PlayoutItem {
+        templated_item_with_slate(None)
+    }
+
+    /// The side file as `load_slate_path` reports it: the media it names,
+    /// and the file that named it.
+    fn side_file_slate(path: &str) -> Option<(String, PathBuf)> {
+        Some((String::from(path), PathBuf::from("/channels/5/slate.json")))
     }
 
     #[test]
@@ -2057,8 +2187,111 @@ mod tests {
 
         // after substitution the sources are plain files, which is why the
         // decision is judged on the original item and carried as a flag
-        let slated = slate_item(templated_item(), String::from("/slate.mp4"));
+        let slated = slate_item(templated_item(), local_slate(String::from("/slate.mp4")));
         assert!(!ChannelSession::item_is_templated(&slated));
+    }
+
+    /// A slate declared on the item is the one that plays, and the log line
+    /// says it came from the schedule. The item is the more specific of the
+    /// two configurations: it names this window's slate, where the side file
+    /// can only name the channel's.
+    #[tokio::test]
+    async fn an_item_carrying_a_slate_plays_it_over_the_side_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let declared = folder.path().join("WeatherSlate.mp4");
+        tokio::fs::write(&declared, b"slate").await.unwrap();
+
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "local",
+            "path": declared.to_string_lossy()
+        })));
+
+        let chosen = choose_slate(
+            usable_item_slate(&item).await,
+            side_file_slate("/generic/OffAir.mp4"),
+        );
+
+        let (source, origin) = chosen.expect("a declared slate must be chosen");
+        assert_eq!(slate_label(&source), declared.to_string_lossy());
+        assert_eq!(origin, SlateOrigin::Schedule);
+        assert_eq!(origin.to_string(), "the schedule");
+
+        // and it is what the shared session actually transcodes, while the
+        // window keeps its identity
+        let slated = slate_item(item, source);
+        assert_eq!(slated.id, "star");
+        match slated.source {
+            Some(PlayoutItemSource::Local { path, .. }) => {
+                assert_eq!(path, declared.to_string_lossy())
+            }
+            other => panic!("expected the declared slate, got {other:?}"),
+        }
+    }
+
+    /// An item that declares nothing leaves the channel-wide answer
+    /// standing, which is the whole world before a schedule could carry
+    /// slate. The log line names the file so an operator knows which
+    /// configuration to edit.
+    #[tokio::test]
+    async fn an_item_without_a_slate_falls_back_to_the_side_file() {
+        let item = templated_item();
+
+        let chosen = choose_slate(
+            usable_item_slate(&item).await,
+            side_file_slate("/generic/OffAir.mp4"),
+        );
+
+        let (source, origin) = chosen.expect("the side file must still answer");
+        assert_eq!(slate_label(&source), "/generic/OffAir.mp4");
+        assert_eq!(
+            origin,
+            SlateOrigin::SideFile(PathBuf::from("/channels/5/slate.json"))
+        );
+        assert_eq!(origin.to_string(), "/channels/5/slate.json");
+    }
+
+    /// With slate configured in neither place there is no substitution at
+    /// all: the shared session tunes the live source, templated URL and all,
+    /// exactly as it did before slate existed.
+    #[tokio::test]
+    async fn with_no_slate_anywhere_the_live_source_is_tuned() {
+        let item = templated_item();
+
+        assert!(choose_slate(usable_item_slate(&item).await, None).is_none());
+
+        // nothing swapped the source out, so what the session transcodes is
+        // still the templated live source
+        match ChannelSession::resolve_source(&item, |t| t.video.as_ref()) {
+            Some(source @ PlayoutItemSource::Http { .. }) => {
+                assert!(source_is_templated(&source));
+                assert!(source_is_live(&source));
+            }
+            other => panic!("expected the templated live source, got {other:?}"),
+        }
+    }
+
+    /// A schedule can name a file that is not on this box (a slate folder
+    /// that did not sync, a typo). Substituting it would fail the window
+    /// into the black fake item, so it is not a usable slate and the ladder
+    /// continues to the side file and then to the live source.
+    #[tokio::test]
+    async fn a_slate_naming_media_that_is_not_there_falls_through() {
+        let folder = tempfile::tempdir().unwrap();
+
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "local",
+            "path": folder.path().join("Gone.mp4").to_string_lossy()
+        })));
+
+        assert!(usable_item_slate(&item).await.is_none());
+        assert_eq!(
+            choose_slate(
+                usable_item_slate(&item).await,
+                side_file_slate("/generic/OffAir.mp4")
+            )
+            .map(|(source, _)| slate_label(&source).to_owned()),
+            Some(String::from("/generic/OffAir.mp4"))
+        );
     }
 
     #[test]
@@ -2066,7 +2299,7 @@ mod tests {
         let item = templated_item();
         let (id, start, finish) = (item.id.clone(), item.start, item.finish);
 
-        let slated = slate_item(item, String::from("/slate.mp4"));
+        let slated = slate_item(item, local_slate(String::from("/slate.mp4")));
 
         assert_eq!(slated.id, id);
         assert_eq!(slated.start, start);

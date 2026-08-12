@@ -13,7 +13,7 @@ pub const DATE_FORMAT: Iso8601<DATE_CONFIG> = Iso8601::<DATE_CONFIG>;
 
 pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
     breaking: 0,
-    compatible: 2,
+    compatible: 3,
 };
 const VERSION_URI_PREFIX: &str = "https://ersatztv.org/playout/version/0.";
 
@@ -72,6 +72,20 @@ pub struct PlayoutItem {
     pub source: Option<PlayoutItemSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracks: Option<PlayoutItemTracks>,
+    /// What the shared session plays for this item in place of `source`,
+    /// when `source` is templated and cannot be tuned without a viewer's
+    /// query values.
+    ///
+    /// This substitutes the source for one session, it does not replace the
+    /// item: the item keeps its id, its slot and its own `source`, because
+    /// cohort viewers still get the live presentation through variant
+    /// sessions, and that is only possible while the templated URL is still
+    /// here to resolve per cohort.
+    ///
+    /// Omitted when the item has no slate, which is every item written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slate: Option<PlayoutItemSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark: Option<Watermark>,
 }
@@ -96,6 +110,7 @@ impl PlayoutItem {
                 probe_hint: None,
             }),
             tracks: None,
+            slate: None,
             watermark: None,
         })
     }
@@ -106,6 +121,10 @@ impl PlayoutItem {
 
     /// The `{query:}` variable names any of this item's sources reference,
     /// lowercased.
+    ///
+    /// The slate is deliberately not among them. It is what plays when no
+    /// viewer query values are available, so a variable inside it names
+    /// nothing a cohort could be routed by.
     pub fn query_variable_names(&self) -> std::collections::BTreeSet<String> {
         let mut names = std::collections::BTreeSet::new();
 
@@ -463,5 +482,107 @@ fn parse_unix_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
         OffsetDateTime::from_unix_timestamp(epoch).ok()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    /// A templated star window as a scheduler exports it, plus whatever
+    /// slate the caller wants declared on it.
+    fn templated_item(slate: Option<Value>) -> Value {
+        let mut item = json!({
+            "id": "12205801",
+            "start": "2026-08-11T20:20:00.000-04:00",
+            "finish": "2026-08-11T20:21:43.000-04:00",
+            "source": {
+                "source_type": "http",
+                "uri": "http://host/live.ts?zip={query:zip}",
+                "is_live": true
+            }
+        });
+
+        if let Some(slate) = slate {
+            item["slate"] = slate;
+        }
+
+        item
+    }
+
+    /// Every playout file written before this field existed omits it, and
+    /// those are the files in production right now. Absence must read as
+    /// "no slate", not as a parse error.
+    #[test]
+    fn a_playout_without_the_field_still_parses() {
+        let playout: Playout = serde_json::from_value(json!({
+            "version": "https://ersatztv.org/playout/version/0.0.2",
+            "items": [templated_item(None)]
+        }))
+        .unwrap();
+
+        assert_eq!(playout.items.len(), 1);
+        assert_eq!(playout.items[0].slate, None);
+    }
+
+    /// The slate is a full source rather than a bare path, and it is the
+    /// same type the item's own `source` is, so every source detail a
+    /// scheduler can express (here a probe hint, which spares the worker a
+    /// probe) reaches the worker unchanged.
+    #[test]
+    fn a_slate_parses_as_the_source_it_is() {
+        let item: PlayoutItem = serde_json::from_value(templated_item(Some(json!({
+            "source_type": "local",
+            "path": "/bumps/fallback/WeatherSlateStatic.mp4",
+            "probe_hint": { "format_name": "mov,mp4,m4a", "duration_ms": 15000 }
+        }))))
+        .unwrap();
+
+        match item.slate {
+            Some(PlayoutItemSource::Local {
+                path, probe_hint, ..
+            }) => {
+                assert_eq!(path, "/bumps/fallback/WeatherSlateStatic.mp4");
+                assert_eq!(probe_hint.and_then(|h| h.duration_ms), Some(15_000));
+            }
+            other => panic!("expected a local slate source, got {other:?}"),
+        }
+
+        // the slate substitutes a source for one session, it does not
+        // replace the item: the templated URL variant sessions resolve per
+        // cohort is still here
+        assert!(matches!(item.source, Some(PlayoutItemSource::Http { .. })));
+    }
+
+    /// An item with no slate must serialize exactly as it did before the
+    /// field existed. Playout files are read and diffed by other tools, and
+    /// an explicit `null` is not the same as an absent key to any of them.
+    #[test]
+    fn an_absent_slate_is_omitted_rather_than_written_as_null() {
+        let item: PlayoutItem = serde_json::from_value(templated_item(None)).unwrap();
+        let written = serde_json::to_string(&item).unwrap();
+
+        assert!(
+            !written.contains("slate"),
+            "an absent slate must not be written at all, got {written}"
+        );
+    }
+
+    /// The slate names no cohort. It is what plays when a viewer's query
+    /// values are unavailable, so a `{query:}` variable written inside one
+    /// must not join the set of parameters that route viewers.
+    #[test]
+    fn a_slate_contributes_no_query_variables() {
+        let item: PlayoutItem = serde_json::from_value(templated_item(Some(json!({
+            "source_type": "http",
+            "uri": "http://host/slate.ts?market={query:market}"
+        }))))
+        .unwrap();
+
+        let names = item.query_variable_names();
+        assert!(names.contains("zip"), "got {names:?}");
+        assert!(!names.contains("market"), "got {names:?}");
     }
 }

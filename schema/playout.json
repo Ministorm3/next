@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://ersatztv.org/playout/version/0.0.2",
+  "$id": "https://ersatztv.org/playout/version/0.0.3",
   "title": "Playout",
   "description": "A playout schedule for a single time window.\n\nFiles should be named `{start}_{finish}.json` using compact ISO 8601 (no separators), e.g. `20260413T000000.000000000-0500_20260414T002131.620000000-0500.json`, so that the channel can locate the correct file for the current time.",
   "type": "object",
@@ -61,6 +61,17 @@
           "oneOf": [
             {
               "$ref": "#/definitions/PlayoutItemTracks"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slate": {
+          "description": "What the shared session plays for this item in place of `source`, when `source` is templated and cannot be tuned without a viewer's query values.\n\nThis substitutes the source for one session, it does not replace the item: the item keeps its id, its slot and its own `source`, because cohort viewers still get the live presentation through variant sessions, and that is only possible while the templated URL is still here to resolve per cohort.\n\nIn practice this is a local file. Media shorter than the item's slot is repeated to fill it. Omit for no slate, in which case the shared session tunes the live source like any other item.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/PlayoutItemSource"
             },
             {
               "type": "null"
