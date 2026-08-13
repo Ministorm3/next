@@ -250,34 +250,25 @@ impl ChannelSession {
         self
     }
 
-    pub async fn run(&mut self, troubleshoot: bool) -> Result<(), ChannelError> {
-        self.prep_output_folder(troubleshoot).await?;
-
-        self.ffmpeg_info = FfmpegInfo::load(
-            &self.ffmpeg_path,
-            &self.channel_config.ffmpeg.disabled_filters,
-            &self.channel_config.ffmpeg.preferred_filters,
-        )
-        .await?;
-
-        log::debug!("ffmpeg info: {:?}", self.ffmpeg_info);
-
-        self.hw_accel = self
-            .channel_config
-            .normalization
-            .video
-            .accel
-            .as_ref()
-            .and_then(|a| a.to_pipeline(&self.channel_config));
-
-        let pm = self.playlist_manager.clone();
-        let tn = self.timeout_notify.clone();
-
+    /// Spawns the loop that publishes segments to viewers, which is the only
+    /// thing that does.
+    ///
+    /// Shared by the channel session and the variant session on purpose. This
+    /// existed as two identical copies until upstream changed the cadence in
+    /// #202: the copy in `run` picked up the faster startup interval and the
+    /// copy in `run_variant` silently did not, because nothing links two
+    /// blocks of copied code. A variant's first sidecar is what the composer's
+    /// decision reads, so that copy was the worse one to leave behind. One
+    /// function means the next upstream change to this loop reaches both.
+    ///
+    /// Distinct failures are reported once rather than thirty times a minute,
+    /// and recovery is reported too, so a persistent fault stays visible
+    /// without burying the log.
+    fn spawn_playlist_publisher(
+        pm: Arc<Mutex<PlaylistManager>>,
+        tn: Arc<tokio::sync::Notify>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            // this loop is the only thing that publishes segments to viewers,
-            // and it runs every two seconds: report each distinct failure once
-            // rather than thirty times a minute, and report recovery, so a
-            // persistent fault is visible without burying the log
             let mut last_failure: Option<String> = None;
             loop {
                 let mut playlist_manager = pm.lock().await;
@@ -299,6 +290,8 @@ impl ChannelSession {
                     tn.notify_one();
                     break;
                 }
+                // publish fast until the window is ready, so the first
+                // playlist (and a variant's first sidecar) lands promptly
                 let interval = if *playlist_manager.is_ready() {
                     PLAYLIST_UPDATE_INTERVAL
                 } else {
@@ -307,7 +300,30 @@ impl ChannelSession {
                 drop(playlist_manager);
                 tokio::time::sleep(interval).await;
             }
-        });
+        })
+    }
+
+    pub async fn run(&mut self, troubleshoot: bool) -> Result<(), ChannelError> {
+        self.prep_output_folder(troubleshoot).await?;
+
+        self.ffmpeg_info = FfmpegInfo::load(
+            &self.ffmpeg_path,
+            &self.channel_config.ffmpeg.disabled_filters,
+            &self.channel_config.ffmpeg.preferred_filters,
+        )
+        .await?;
+
+        log::debug!("ffmpeg info: {:?}", self.ffmpeg_info);
+
+        self.hw_accel = self
+            .channel_config
+            .normalization
+            .video
+            .accel
+            .as_ref()
+            .and_then(|a| a.to_pipeline(&self.channel_config));
+
+        Self::spawn_playlist_publisher(self.playlist_manager.clone(), self.timeout_notify.clone());
 
         self.spawn_variant_loop();
 
@@ -396,39 +412,7 @@ impl ChannelSession {
             .as_ref()
             .and_then(|a| a.to_pipeline(&self.channel_config));
 
-        let pm = self.playlist_manager.clone();
-        let tn = self.timeout_notify.clone();
-
-        tokio::spawn(async move {
-            // this loop is the only thing that publishes segments to viewers,
-            // and it runs every two seconds: report each distinct failure once
-            // rather than thirty times a minute, and report recovery, so a
-            // persistent fault is visible without burying the log
-            let mut last_failure: Option<String> = None;
-            loop {
-                let mut playlist_manager = pm.lock().await;
-                match playlist_manager.update().await {
-                    Ok(()) => {
-                        if last_failure.take().is_some() {
-                            log::info!("playlist update recovered");
-                        }
-                    }
-                    Err(e) => {
-                        let message = e.to_string();
-                        if last_failure.as_deref() != Some(message.as_str()) {
-                            log::warn!("playlist update failed: {message}");
-                            last_failure = Some(message);
-                        }
-                    }
-                }
-                if *playlist_manager.timeout() {
-                    tn.notify_one();
-                    break;
-                }
-                drop(playlist_manager);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
+        Self::spawn_playlist_publisher(self.playlist_manager.clone(), self.timeout_notify.clone());
 
         let item = self
             .playout_loader
