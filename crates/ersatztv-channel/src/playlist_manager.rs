@@ -817,35 +817,58 @@ mod tests {
         }
     }
 
-    /// The served window advances with the media it serves, one segment per
-    /// segment duration, regardless of what the wall clock does. A session
-    /// whose production pauses (a live item that cannot be read ahead) used
-    /// to freeze its window against the tail floor for the whole pause; now
-    /// the window keeps walking through the buffered segments and only rests
-    /// at the floor once it has genuinely run out of media.
+    /// The window ends at the first segment whose program date time reaches
+    /// `PUBLISH_LEAD` past the wall clock, and starts a full window behind
+    /// that. Segments are four seconds and `PUBLISH_LEAD` is twelve, so at
+    /// t=40s the horizon is t=52s, which is segment 13, and a ten segment
+    /// window starts at 3.
     #[test]
-    fn window_advances_with_media_while_production_pauses() {
+    fn window_is_placed_from_the_wall_clock() {
         let mut m = manager_with_segments(20);
         let start = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(40);
 
-        let first = m
+        let (first, count) = m
             .generate_playlist(|s| s.to_owned(), Some(10), start)
             .unwrap();
-        assert!(first.contains("#EXT-X-MEDIA-SEQUENCE:5\n"));
+        assert!(first.contains("#EXT-X-MEDIA-SEQUENCE:3\n"));
+        assert_eq!(count, 10);
 
-        // no new segments arrive; the window still advances at playback rate
-        let later = m
+        // eight seconds later the horizon has moved two segments, and the
+        // window moves with it rather than with any produced media
+        let (later, _) = m
             .generate_playlist(|s| s.to_owned(), Some(10), start + Duration::from_secs(8))
             .unwrap();
-        assert!(later.contains("#EXT-X-MEDIA-SEQUENCE:7\n"));
+        assert!(later.contains("#EXT-X-MEDIA-SEQUENCE:5\n"));
+    }
 
-        // and however long the pause runs, it never crosses the tail floor
-        let much_later = m
+    /// The anti-ratchet property. The window carries no placement between
+    /// renders, so a session that stalls does not accumulate deficit against
+    /// the schedule: however long the clock runs past the newest segment, the
+    /// next render serves the newest full window rather than resuming from
+    /// wherever a paced head had crept to.
+    ///
+    /// This is the property that makes a serve head unable to fall
+    /// permanently behind the wall clock, and it is the reason the window is
+    /// not paced at 1x.
+    #[test]
+    fn window_recovers_the_live_edge_after_a_long_stall() {
+        let mut m = manager_with_segments(20);
+        let start = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(40);
+
+        m.generate_playlist(|s| s.to_owned(), Some(10), start)
+            .unwrap();
+
+        // no new segments arrive for several minutes
+        let (after, count) = m
             .generate_playlist(|s| s.to_owned(), Some(10), start + Duration::from_secs(400))
             .unwrap();
-        assert!(much_later.contains("#EXT-X-MEDIA-SEQUENCE:17\n"));
-        assert!(much_later.contains("live000017.ts"));
-        assert!(much_later.contains("live000019.ts"));
+
+        // the newest ten segments, right up to the live edge
+        assert!(after.contains("#EXT-X-MEDIA-SEQUENCE:10\n"));
+        assert!(after.contains("live000010.ts"));
+        assert!(after.contains("live000019.ts"));
+        assert!(!after.contains("live000009.ts"));
+        assert_eq!(count, 10);
     }
 
     #[test]
