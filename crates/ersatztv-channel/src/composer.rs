@@ -152,9 +152,16 @@ pub struct ComposedEntry {
     /// variant segment that replaced it.
     pub sequence: u64,
     /// Whether this entry serves variant content. The serve head may jump
-    /// over shared content to catch up with the shared playlist, but never
-    /// over variant content: that content is why the cohort exists, so a
-    /// lagging viewer plays all of it a little late instead of losing it.
+    /// over shared content to catch up with the shared playlist, but the
+    /// soft lag trim never jumps over variant content: that content is why
+    /// the cohort exists, so a lagging viewer plays all of it a little late
+    /// instead of losing it.
+    ///
+    /// The one exception is the hard trim past [`HARD_LAG_SEGMENTS`], which
+    /// skips wherever it lands. That bound exists to keep the head inside
+    /// the shared session's retention window, and a window pointing at
+    /// deleted segments serves 404s to everyone, so there it really is
+    /// better to lose substituted content than to keep referencing it.
     pub variant: bool,
 }
 
@@ -780,14 +787,24 @@ impl SessionPlaylist {
         } else if gap > MAX_LAG_SEGMENTS {
             let limit = own_window;
             let mut boundary = None;
+            // the NEAREST boundary past the head, so the viewer loses the
+            // tail of the item they were behind in and nothing more. Every
+            // position between the head and the target goes unserved, so a
+            // variant position in that range is substituted content the
+            // cohort would lose outright: stop rather than cross it, and let
+            // the playback-rate walk carry the head through instead
             for entry in self
                 .entries
                 .iter()
-                .skip((head + 1).saturating_sub(front) as usize)
+                .skip((head - front) as usize)
                 .take_while(|e| e.sequence <= limit)
             {
-                if entry.discontinuity {
+                if entry.sequence > head && entry.discontinuity {
                     boundary = Some(entry.sequence);
+                    break;
+                }
+                if entry.variant {
+                    break;
                 }
             }
 
@@ -2268,8 +2285,9 @@ mod tests {
         assert_eq!(session.serve_head, Some(0));
 
         // the gap crosses the soft bound; discontinuities sit at 6, 11 and
-        // 20, this timeline's own window reaches 16, and the trim lands on
-        // the furthest boundary inside that reach
+        // 20, and the trim lands on the NEAREST one past the head, so the
+        // viewer loses the tail of "before" and resumes at the start of
+        // "game" rather than losing "game" entirely as well
         let rendered = session.advance_and_render(
             &shared,
             None,
@@ -2279,12 +2297,68 @@ mod tests {
             4,
             |s| s.to_owned(),
         );
-        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:11\n"));
-        assert_eq!(session.serve_head, Some(11));
-        assert!(rendered.contains("live000011.ts"));
-        // the boundary at 20 is past the reachable window and is not taken
-        assert!(rendered.contains("live000020.ts"));
-        assert!(!rendered.contains("live000021.ts"));
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
+        assert_eq!(session.serve_head, Some(6));
+        assert!(rendered.contains("live000006.ts"));
+        // a full window from there, and the boundaries at 11 and 20 are not
+        // jumped to
+        assert!(rendered.contains("live000015.ts"));
+        assert!(!rendered.contains("live000016.ts"));
+    }
+
+    /// Past the soft bound the trim still refuses to cross variant content.
+    /// A head inside the substituted item plays all of it a little late
+    /// rather than losing the item the cohort exists for, which is the
+    /// invariant `ComposedEntry::variant` documents.
+    #[test]
+    fn a_trim_never_jumps_over_variant_content() {
+        let mut session = SessionPlaylist::default();
+        let shared = long_shared_with_templated_item(26);
+        let variant = long_variant_for_game(5);
+        session.decisions.insert(
+            String::from("game"),
+            ItemDecision::Variant {
+                join_ms: 0,
+                anchor_ms: 0,
+            },
+        );
+        let base = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(108);
+
+        session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(0),
+            base,
+            4,
+            |s| s.to_owned(),
+        );
+
+        // park the head inside the substituted span: "game" covers shared
+        // positions 6..=10, so 7 is mid-variant
+        session.serve_head = Some(7);
+        session.head_advanced_at = Some(base + time::Duration::seconds(2));
+
+        // the shared head is 12 ahead, past the soft bound, and the next
+        // boundary (11) is inside the reachable window. Taking it would drop
+        // variant positions 7..=10, which is precisely what must not happen
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/x/",
+            Some(19),
+            base + time::Duration::seconds(2),
+            4,
+            |s| s.to_owned(),
+        );
+
+        assert_eq!(
+            session.serve_head,
+            Some(7),
+            "the trim crossed variant content to reach a boundary"
+        );
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:7\n"));
+        assert!(rendered.contains("variants/x/live000001.ts"));
     }
 
     /// With no boundary in reach the trim defers: the head keeps walking at
