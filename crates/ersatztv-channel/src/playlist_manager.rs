@@ -17,6 +17,10 @@ const MIN_SEGMENTS: usize = 4;
 /// and their files deleted. Two minutes.
 const HISTORY_DURATION: Duration = Duration::from_secs(120);
 
+/// How far past the wall clock the published window reaches. Twelve seconds.
+const PUBLISH_LEAD: Duration =
+    Duration::from_secs(ffpipeline::pipeline::SEGMENT_SECONDS as u64 * 3);
+
 /// STOPGAP: how much media a VARIANT session keeps instead.
 ///
 /// A variant's segments are consumed on the cohort's serve timeline, which
@@ -49,14 +53,16 @@ pub(crate) const VARIANT_HISTORY_DURATION: Duration = Duration::from_secs(1800);
 // so that offset is part of the trail and belongs in this bound.
 //
 // One term is NOT compile-time bounded: how far the shared head runs past
-// the composed timeline's own edge. Composition stops
-// `composer::COMPOSE_TRAIL_SECONDS` behind the live edge while this
-// module's head is paced from wherever it was first placed, so on a channel
-// that works far enough ahead the shared head sits an unbounded distance
-// past everything the composer has emitted, and no forcing rule can close
-// that distance because the content does not exist on the composed
-// timeline yet. The composer warns when it detects that state; this
-// assertion covers only what a constant can cover.
+// the composed timeline's own edge. Both ends are now placed from the wall
+// clock (this module publishes out to `PUBLISH_LEAD` past now, composition
+// stops `composer::COMPOSE_TRAIL_SECONDS` behind it), so the distance is no
+// longer free to grow with the life of the session the way it was while the
+// head was paced forward from its initial placement. It is still not a
+// constant: both ends are compared against program date times, which fall
+// behind the wall clock by whatever the schedule has drifted, and the
+// composer cannot emit content that does not exist on its timeline yet. The
+// composer warns when it detects that state; this assertion covers only
+// what a constant can cover.
 const _: () = assert!(
     ersatztv_channel::composer::HARD_LAG_SEGMENTS
         + ersatztv_channel::composer::SERVED_SEGMENTS as u64
@@ -87,25 +93,17 @@ pub struct PlaylistManager {
     discontinuity_before: HashSet<String>,
     media_sequence: u64,
     last_served_media_sequence: u64,
-    /// The sequence at the front of the served window, and when it last
-    /// advanced. After its initial placement the window advances with the
-    /// media it serves, one segment per segment duration, rather than with
-    /// the wall clock: program date times fall behind the wall whenever a
-    /// session starts late or a source pauses (a live item that cannot be
-    /// read ahead), and a wall-anchored window then runs into the tail
-    /// floor and freezes for however long production takes to resume.
+    /// The sequence at the front of the served window, or `None` before the
+    /// first window is rendered. Retention measures history behind this, so
+    /// it has to be the position viewers are actually reading from.
     ///
-    /// TODO: pacing at exactly 1x can never recover time it loses, so every
-    /// pause it eats becomes permanent deficit against the schedule, and the
-    /// gap between production and serving grows for the life of the session
-    /// (measured 10s -> 272s across six live transitions on 2026-08-09).
-    /// Everything downstream drifts with it: work-ahead disk, variant spawn
-    /// timing, star content staleness, and the reference lifetimes the
-    /// VARIANT_HISTORY_DURATION stopgap papers over. The timeline
-    /// rearchitecture must bound this deficit (candidates: recovery at item
-    /// boundaries, or a fixed broadcast delay).
-    paced_head: Option<u64>,
-    paced_advanced_at: Option<OffsetDateTime>,
+    /// The window itself is placed from the wall clock every render: it ends
+    /// at the first segment whose program date time reaches `PUBLISH_LEAD`
+    /// past now, and starts a full window behind that. Nothing about the
+    /// placement is carried between renders, so a session that stalls
+    /// resumes at wherever the clock has reached rather than accumulating
+    /// permanent deficit against the schedule.
+    served_head: Option<u64>,
     discontinuity_sequence: u64,
     target_duration: u32,
     target_duration_f64: f64,
@@ -175,8 +173,7 @@ impl PlaylistManager {
             discontinuity_before: HashSet::new(),
             media_sequence: 0,
             last_served_media_sequence: 0,
-            paced_head: None,
-            paced_advanced_at: None,
+            served_head: None,
             discontinuity_sequence: 0,
             target_duration,
             target_duration_f64: target_duration as f64,
@@ -219,6 +216,10 @@ impl PlaylistManager {
         &self.last_progress
     }
 
+    pub fn is_ready(&self) -> &bool {
+        &self.ready
+    }
+
     pub async fn before_new_pipeline(
         &mut self,
         new_pts_offset: Option<PtsOffset>,
@@ -246,7 +247,7 @@ impl PlaylistManager {
 
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
         if Path::new(&self.generated_playlist_file).exists() {
-            let generated_playlist =
+            let (generated_playlist, _) =
                 self.generate_playlist(|s| s.to_owned(), None, OffsetDateTime::now_utc())?;
             let temp = tempfile::NamedTempFile::new_in(&self.output_folder).io_context(
                 "create a temp file for the ffmpeg playlist",
@@ -411,7 +412,7 @@ impl PlaylistManager {
         });
 
         // generate and atomically save playlist
-        let generated_playlist =
+        let (generated_playlist, playlist_segment_count) =
             self.generate_playlist(|s| s.to_owned(), Some(10), OffsetDateTime::now_utc())?;
         let temp = tempfile::NamedTempFile::new_in(&self.output_folder).io_context(
             "create a temp file for the served playlist",
@@ -444,7 +445,7 @@ impl PlaylistManager {
             .io_context("publish the sidecar", &sidecar_file)?;
 
         // generate and atomically save subtitle playlist
-        let generated_subtitle_playlist = self.generate_playlist(
+        let (generated_subtitle_playlist, _) = self.generate_playlist(
             |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
             Some(10),
             OffsetDateTime::now_utc(),
@@ -466,7 +467,7 @@ impl PlaylistManager {
                 &self.generated_subtitle_playlist_file,
             )?;
 
-        if !self.ready && self.segments.len() >= MIN_SEGMENTS {
+        if !self.ready && playlist_segment_count >= MIN_SEGMENTS {
             tokio::fs::write(&self.ready_file, b"")
                 .await
                 .io_context("publish the ready signal", &self.ready_file)?;
@@ -578,7 +579,7 @@ impl PlaylistManager {
     /// yet and nothing is being served, so the live edge stands in.
     fn trim_cutoff(&self) -> OffsetDateTime {
         let served = self
-            .paced_head
+            .served_head
             .and_then(|head| {
                 self.segments
                     .get(head.saturating_sub(self.media_sequence) as usize)
@@ -594,7 +595,7 @@ impl PlaylistManager {
         path_map: fn(&str) -> String,
         max_segments: Option<usize>,
         now: OffsetDateTime,
-    ) -> Result<String, ChannelError> {
+    ) -> Result<(String, usize), ChannelError> {
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
         // version 6 is the lowest that carries the semantics this playlist
@@ -608,57 +609,23 @@ impl PlaylistManager {
 
         let (skip, limit) = match max_segments {
             Some(max) => {
-                // rfc8216bis 6.2.2 forbids trimming a playlist without an
-                // EXT-X-ENDLIST tag below three times the target duration,
-                // so the window start may never pass this cap however far
-                // the clock has run ahead of production
-                let floor_cap = self.media_sequence + self.max_skip_for_window() as u64;
+                let horizon = now + PUBLISH_LEAD;
 
-                let mut head = match self.paced_head {
-                    Some(head) => head.max(self.media_sequence),
-                    None => {
-                        // initial placement only: a few segments behind the
-                        // wall clock, exactly where a live window sits
-                        let anchor = now
-                            - Duration::from_secs(
-                                ffpipeline::pipeline::SEGMENT_SECONDS as u64 * 5u64,
-                            );
-                        let candidate_skip = self
-                            .segments
-                            .iter()
-                            .position(|s| s.program_date_time >= anchor)
-                            .unwrap_or_else(|| self.segments.len().saturating_sub(max));
-                        self.paced_advanced_at = Some(now);
-                        self.media_sequence + candidate_skip.min(self.max_skip_for_window()) as u64
-                    }
-                };
+                // index one past the newest segment we want to publish
+                let head = self
+                    .segments
+                    .iter()
+                    .position(|s| s.program_date_time >= horizon)
+                    .unwrap_or(self.segments.len());
 
-                // advance with the media being served: one segment per
-                // segment duration, up to the floor cap
-                if let Some(mut advanced_at) = self.paced_advanced_at {
-                    while head < floor_cap {
-                        let index = (head - self.media_sequence) as usize;
-                        let Some(segment) = self.segments.get(index) else {
-                            break;
-                        };
-                        let step = time::Duration::seconds_f64(segment.duration.max(0.1));
-                        if now - advanced_at < step {
-                            break;
-                        }
-                        head += 1;
-                        advanced_at += step;
-                    }
-                    self.paced_advanced_at = Some(advanced_at);
-                }
-
-                // monotonic clamp
-                let clamped_ms = head.max(self.last_served_media_sequence);
+                // monotonic clamp, in absolute media-sequence space
+                let candidate_ms = self.media_sequence + head.saturating_sub(max) as u64;
+                let clamped_ms = candidate_ms.max(self.last_served_media_sequence);
                 self.last_served_media_sequence = clamped_ms;
-                self.paced_head = Some(clamped_ms);
+                self.served_head = Some(clamped_ms);
 
-                let skip = (clamped_ms - self.media_sequence) as usize;
-                let skip = skip.min(self.segments.len());
-                (skip, max)
+                let skip = ((clamped_ms - self.media_sequence) as usize).min(head);
+                (skip, head - skip)
             }
             None => (0, self.segments.len()),
         };
@@ -700,7 +667,7 @@ impl PlaylistManager {
             playlist.push_str(&format!("{}\n", path_map(&segment.path)));
         }
 
-        Ok(playlist)
+        Ok((playlist, limit))
     }
 
     async fn get_new_segment_durations(&self) -> Result<HashMap<String, f64>, ChannelError> {
@@ -1090,11 +1057,11 @@ mod tests {
         // reference: 60 segments produced, serving from segment 30, so 120s
         // of media sits ahead of the head
         let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 60);
-        m.paced_head = Some(30);
+        m.served_head = Some(30);
 
         assert_eq!(expired(&m), 0);
 
-        let behind_head = m.paced_head.unwrap() - m.media_sequence - expired(&m) as u64;
+        let behind_head = m.served_head.unwrap() - m.media_sequence - expired(&m) as u64;
         assert_eq!(behind_head * 4, HISTORY_DURATION.as_secs());
     }
 
@@ -1103,7 +1070,7 @@ mod tests {
         // the mirror of the above: 160s of media sits behind the head, 40s
         // more than the budget, and the excess still ages out
         let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
-        m.paced_head = Some(39);
+        m.served_head = Some(39);
 
         assert_eq!(expired(&m), 9);
     }
