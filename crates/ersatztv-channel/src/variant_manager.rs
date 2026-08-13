@@ -397,7 +397,19 @@ async fn read_requests(
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
 
-        if is_stale(&path).await {
+        if let Some(age) = staleness(&path).await {
+            // this drop is what a "no fresh viewer request" reap is made of,
+            // so say it happened: a viewer that really left and a viewer
+            // whose requests stopped being republished look identical
+            // downstream, and only the age separates them
+            log::info!(
+                "dropping cohort request {} on channel {}: last republished {}s ago \
+                 (idle limit {}s)",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                channel.number,
+                age.as_secs(),
+                SESSION_IDLE_SECONDS
+            );
             let _ = tokio::fs::remove_file(&path).await;
             if let Some(name) = path.file_name() {
                 let _ =
@@ -560,11 +572,26 @@ async fn reap(
         };
 
         let reason = if !have_shared {
-            "the shared sidecar is unavailable"
+            String::from("the shared sidecar is unavailable")
         } else if !requested.contains(&cohort_query) {
-            "no fresh viewer request"
+            // name what WAS requested this tick. A reap while viewers are
+            // demonstrably still polling has been observed, and the three
+            // ways it can happen are indistinguishable without this: no
+            // requests at all (the folder went empty), requests that
+            // resolved to some other cohort (recognition changed under us),
+            // or this cohort's request having just been dropped as stale
+            let others: Vec<&str> = requested.iter().map(String::as_str).collect();
+            if others.is_empty() {
+                String::from("no fresh viewer request; no cohort was requested this tick")
+            } else {
+                format!(
+                    "no fresh viewer request; {} other cohort(s) were requested this tick: {}",
+                    others.len(),
+                    others.join(", ")
+                )
+            }
         } else {
-            "not admitted at the session cap"
+            String::from("not admitted at the session cap")
         };
         log::info!(
             "reaping variant session for cohort '{}' on channel {} ({reason})",
@@ -736,16 +763,18 @@ async fn spawn_missing_variants(
     }
 }
 
-async fn is_stale(path: &Path) -> bool {
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return false;
-    };
-
-    metadata
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .is_some_and(|age| age.as_secs() >= SESSION_IDLE_SECONDS)
+/// How long ago a request file was last republished, when that is long
+/// enough to drop it. `None` means it is still fresh (or unreadable, which
+/// is deliberately treated as fresh rather than reaping on a stat failure).
+///
+/// Returns the age rather than a bool so the caller can say how stale a
+/// dropped request was. A silent drop here is indistinguishable in the log
+/// from a viewer genuinely leaving, and it is the step that precedes a
+/// "no fresh viewer request" reap.
+async fn staleness(path: &Path) -> Option<Duration> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let age = metadata.modified().ok()?.elapsed().ok()?;
+    (age.as_secs() >= SESSION_IDLE_SECONDS).then_some(age)
 }
 
 /// Publishes a playlist by rename, so a reader never observes a half-written
