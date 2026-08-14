@@ -458,6 +458,13 @@ impl SessionPlaylist {
                 // yet; substitution must not start before it
                 let base = self.item_bases.get(&pipeline.item_id).copied().unwrap_or(0);
                 let mut first_unserved_ms = 0u64;
+                // walked counts the positions of this item this session has
+                // actually emitted. `first_unserved_ms` is a SPAN off `base`
+                // rather than a count, so the two agree only while `base` is
+                // the item's true first position. Where they disagree is the
+                // whole question behind a large join, so both are reported
+                let mut walked = 0u64;
+                let mut last_emitted = None;
                 for segment in shared
                     .segments
                     .iter()
@@ -469,6 +476,8 @@ impl SessionPlaylist {
                     if !emitted.contains(&seq) {
                         break;
                     }
+                    walked += 1;
+                    last_emitted = Some(seq);
                     first_unserved_ms =
                         seq.saturating_sub(base).saturating_add(1) * 1000 * SEGMENT_SECONDS;
                 }
@@ -499,6 +508,42 @@ impl SessionPlaylist {
                         anchor_ms,
                         join_ms,
                     );
+
+                    // A non-zero join costs the viewer that much of the item,
+                    // and two different defects produce one. Reporting the
+                    // arithmetic separates them on the first occurrence
+                    // instead of after another day of guessing:
+                    //
+                    //   walked == join_ms / SEGMENT  the session really did
+                    //     emit that many positions of this item, so the span
+                    //     is honest and the cause is upstream, in whatever let
+                    //     composition run that far past the trailing edge
+                    //   walked <  join_ms / SEGMENT  the span is inflated
+                    //     because `base` is not this airing's first position,
+                    //     so the join is fictional and the cause is the base
+                    //
+                    // `held` bounds both: a join beyond the item's own length
+                    // cannot be a position within it at all.
+                    if join_ms > 0 {
+                        let held = shared
+                            .segments
+                            .iter()
+                            .filter(|s| s.item_id == pipeline.item_id)
+                            .count();
+                        log::info!(
+                            "[{}] item {}: join arithmetic: base {}, last emitted {}, \
+                             walked {} position(s), {} held in the sidecar, \
+                             span {}ms vs walked {}ms",
+                            self.label,
+                            pipeline.item_id,
+                            base,
+                            last_emitted.map_or_else(|| String::from("none"), |s| s.to_string()),
+                            walked,
+                            held,
+                            first_unserved_ms,
+                            walked * 1000 * SEGMENT_SECONDS,
+                        );
+                    }
                 }
                 self.decisions.insert(
                     pipeline.item_id.clone(),
