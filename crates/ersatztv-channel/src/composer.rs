@@ -1739,34 +1739,44 @@ mod tests {
         assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
     }
 
-    /// ROUTE A, reproduced: an item that airs a second time under the same id
-    /// keeps the base recorded on its FIRST airing, and `first_unserved_ms` is
-    /// a span off that base, so the join it produces measures the distance
-    /// between the two airings rather than a position inside the item.
+    /// LATENT PROPERTY GUARD, not a live defect. `item_bases` is written once,
+    /// guarded by `!contains_key`, and cleared only by a full session reset.
+    /// `first_unserved_ms` is a SPAN off that base rather than a count of
+    /// positions served, so a base that does not belong to the airing being
+    /// composed makes the join measure the distance back to that base instead
+    /// of a position inside the item. The join is then used as a twin index in
+    /// `render`, the variant has no segment that far in, and the cohort serves
+    /// shared for the whole window.
     ///
-    /// `item_bases` is written once, guarded by `!contains_key`, and cleared
-    /// only by a full session reset. A re-air is not a reset: the numbering
-    /// space continues, so nothing revises the base.
+    /// Only a base BELOW the airing's first position does this. The span
+    /// subtracts the base, so a base that is too high can only shrink a join,
+    /// never inflate one.
     ///
-    /// This is what the 2026-08-11 outliers look like. Joins of 84000, 136000
-    /// and 156000ms were logged against an item whose own envelope was
-    /// 113000ms, and a join past the item's length cannot be a position within
-    /// it. Those items were each re-spawned from progress 0 minutes apart
-    /// (12141430 at 08:59:17.933 and again at 08:59:33.219, both reporting the
-    /// same remaining envelope).
+    /// NO KNOWN PATH REACHES IT, and the earlier claim that it explained the
+    /// 2026-08-11 outliers is withdrawn. That reading rested on paired
+    /// "shared session plays slate for this templated window" lines being one
+    /// session entering an item twice. They are two concurrent worker
+    /// processes each entering it once: the dual-worker incident, fixed by
+    /// legacy 39c43c6d on 2026-08-11 12:05. Counted afterwards, multi-entry
+    /// items fall from 59 of 193 on 08-11 to 1 of 196, 2 of 202 and 0 of 96 on
+    /// the days following, with none since the 08-13 19:30 boot. Item ids are
+    /// also unique across the playout folder (0 repeats in 2295 items), so the
+    /// schedule does not list an item twice either.
     ///
-    /// The join is then used as a twin index in `render`, the variant has no
-    /// segment that far in, and the cohort serves shared for the whole window.
+    /// The test is kept because the write-once property is real and nothing
+    /// enforces that a base belongs to the current airing. It pins the
+    /// consequence so a future change that reintroduces the precondition fails
+    /// here rather than on air.
     #[test]
-    fn a_reaired_item_joins_at_the_distance_between_airings() {
+    fn a_stale_item_base_inflates_the_join_past_the_item() {
         let mut session = SessionPlaylist::default();
 
-        // the item aired once, early in the session, and its base was recorded
-        // then from the first position it occupied
+        // a base recorded from a position well before the airing composed
+        // below. Constructed, not observed: see the note above
         session.item_bases.insert(String::from("game"), 6);
 
-        // it is airing again now, a long way further along the same numbering
-        // space, and this session has composed those positions
+        // the airing this session is actually composing, a long way further
+        // along the same numbering space
         let second_airing: Vec<u64> = (106..=110).collect();
         for sequence in &second_airing {
             session.entries.push_back(ComposedEntry {
@@ -1808,18 +1818,18 @@ mod tests {
 
         assert_eq!(anchor_ms, 0, "the variant is anchored at the item start");
 
-        // the item's second airing is five positions long: 20000ms. The join
-        // instead spans from the first airing's base at 6 all the way to 110
+        // the airing is five positions long: 20000ms. The join instead spans
+        // from the stale base at 6 all the way to 110
         assert_eq!(
             join_ms,
             (110 - 6 + 1) * 4000,
-            "the join spans both airings rather than the item"
+            "the join spans back to the stale base rather than the item"
         );
         assert!(
             join_ms > 20_000,
-            "TODAY'S BEHAVIOUR: the join is {join_ms}ms into an item that is \
-             only 20000ms long, so it indexes a twin that cannot exist. \
-             Fixing the base should make this assertion fail"
+            "the join is {join_ms}ms into an item that is only 20000ms long, \
+             so it indexes a twin that cannot exist. Making the base follow \
+             the airing being composed should make this assertion fail"
         );
     }
 
