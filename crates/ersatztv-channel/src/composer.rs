@@ -1739,26 +1739,37 @@ mod tests {
         assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
     }
 
-    /// ROUTE A, reproduced: an item that airs a second time under the same id
-    /// keeps the base recorded on its FIRST airing, and `first_unserved_ms` is
-    /// a span off that base, so the join it produces measures the distance
-    /// between the two airings rather than a position inside the item.
+    /// LATENT PROPERTY, not a live defect. If an item's recorded base is not
+    /// the first position of the airing being composed, `first_unserved_ms`
+    /// measures the distance from that stale base instead of a position inside
+    /// the item, and the join it produces can exceed the item's own envelope.
     ///
-    /// `item_bases` is written once, guarded by `!contains_key`, and cleared
-    /// only by a full session reset. A re-air is not a reset: the numbering
-    /// space continues, so nothing revises the base.
+    /// The property is real. `item_bases` is written once, guarded by
+    /// `!contains_key`, and cleared only by a full session reset, so nothing
+    /// revises a base once recorded. Note the sign: `first_unserved_ms` is
+    /// `(seq - base + 1) * SEGMENT`, which NEGATES the base, so a base that is
+    /// too high can only shrink a join and only a base that is too LOW can
+    /// inflate one.
     ///
-    /// This is what the 2026-08-11 outliers look like. Joins of 84000, 136000
-    /// and 156000ms were logged against an item whose own envelope was
-    /// 113000ms, and a join past the item's length cannot be a position within
-    /// it. Those items were each re-spawned from progress 0 minutes apart
-    /// (12141430 at 08:59:17.933 and again at 08:59:33.219, both reporting the
-    /// same remaining envelope).
+    /// Its precondition does not occur. This test was first written believing
+    /// the shared session re-entered items, on the strength of paired "shared
+    /// session plays slate" lines on 2026-08-11. That reading was refuted after
+    /// the commit was written: those pairs are TWO CONCURRENT WORKER PROCESSES
+    /// each entering the item once, which is the dual-worker incident fixed by
+    /// legacy 39c43c6d (deployed 2026-08-11 12:05). Counted independently, 59
+    /// of 193 items show multiple entries on 08-11 against 1 of 196 on 08-12,
+    /// 2 of 202 on 08-13 and 0 of 96 on 08-14, with none at all since the
+    /// 08-13 19:30 boot. The 08-11 joins of 84000, 136000 and 156000ms against
+    /// a 113000ms envelope therefore belong to that incident, not to a re-air.
     ///
-    /// The join is then used as a twin index in `render`, the variant has no
-    /// segment that far in, and the cohort serves shared for the whole window.
+    /// So this guards a shape the code still permits rather than reproducing
+    /// something observed. Keep it: it fails the moment a base is made to
+    /// follow the current airing, and it is the only place the sign of the
+    /// span is pinned. Whether a genuine oversized join is honest or inflated
+    /// is answered live by the `join arithmetic` diagnostic, which reports
+    /// `walked` beside the span for exactly this reason.
     #[test]
-    fn a_reaired_item_joins_at_the_distance_between_airings() {
+    fn a_stale_item_base_inflates_the_join_span() {
         let mut session = SessionPlaylist::default();
 
         // the item aired once, early in the session, and its base was recorded
