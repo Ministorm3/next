@@ -1739,6 +1739,90 @@ mod tests {
         assert_eq!(session.decisions.get("game"), Some(&variant_decision(0, 0)));
     }
 
+    /// ROUTE A, reproduced: an item that airs a second time under the same id
+    /// keeps the base recorded on its FIRST airing, and `first_unserved_ms` is
+    /// a span off that base, so the join it produces measures the distance
+    /// between the two airings rather than a position inside the item.
+    ///
+    /// `item_bases` is written once, guarded by `!contains_key`, and cleared
+    /// only by a full session reset. A re-air is not a reset: the numbering
+    /// space continues, so nothing revises the base.
+    ///
+    /// This is what the 2026-08-11 outliers look like. Joins of 84000, 136000
+    /// and 156000ms were logged against an item whose own envelope was
+    /// 113000ms, and a join past the item's length cannot be a position within
+    /// it. Those items were each re-spawned from progress 0 minutes apart
+    /// (12141430 at 08:59:17.933 and again at 08:59:33.219, both reporting the
+    /// same remaining envelope).
+    ///
+    /// The join is then used as a twin index in `render`, the variant has no
+    /// segment that far in, and the cohort serves shared for the whole window.
+    #[test]
+    fn a_reaired_item_joins_at_the_distance_between_airings() {
+        let mut session = SessionPlaylist::default();
+
+        // the item aired once, early in the session, and its base was recorded
+        // then from the first position it occupied
+        session.item_bases.insert(String::from("game"), 6);
+
+        // it is airing again now, a long way further along the same numbering
+        // space, and this session has composed those positions
+        let second_airing: Vec<u64> = (106..=110).collect();
+        for sequence in &second_airing {
+            session.entries.push_back(ComposedEntry {
+                path: format!("live{sequence:06}.ts"),
+                duration: 4.0,
+                program_date_time: OffsetDateTime::UNIX_EPOCH
+                    + time::Duration::seconds(*sequence as i64 * 4),
+                discontinuity: *sequence == 106,
+                sequence: *sequence,
+                variant: false,
+            });
+        }
+        session.head_sequence = 106;
+
+        let shared = PlaylistSidecar {
+            segments: second_airing
+                .iter()
+                .map(|s| seg(&format!("live{s:06}.ts"), "game", *s as i64 * 4, *s == 106))
+                .collect(),
+            pipelines: vec![pipeline("game", 424_000, true)],
+        };
+        // a variant anchored exactly at the item start, so anchor_ms is 0 and
+        // the join can only come from the span
+        let variant = PlaylistSidecar {
+            segments: vec![seg("live000000.ts", "game", 424, true)],
+            pipelines: vec![pipeline("game", 424_000, true)],
+        };
+
+        session.decide_items(&shared, Some(&variant), OffsetDateTime::UNIX_EPOCH);
+
+        let ItemDecision::Variant { join_ms, anchor_ms } = session
+            .decisions
+            .get("game")
+            .copied()
+            .expect("the item is anchored, so it must be decided")
+        else {
+            panic!("expected a Variant decision, got {:?}", session.decisions);
+        };
+
+        assert_eq!(anchor_ms, 0, "the variant is anchored at the item start");
+
+        // the item's second airing is five positions long: 20000ms. The join
+        // instead spans from the first airing's base at 6 all the way to 110
+        assert_eq!(
+            join_ms,
+            (110 - 6 + 1) * 4000,
+            "the join spans both airings rather than the item"
+        );
+        assert!(
+            join_ms > 20_000,
+            "TODAY'S BEHAVIOUR: the join is {join_ms}ms into an item that is \
+             only 20000ms long, so it indexes a twin that cannot exist. \
+             Fixing the base should make this assertion fail"
+        );
+    }
+
     #[test]
     fn decision_defers_then_forces_shared_at_the_window_edge() {
         let mut session = SessionPlaylist::default();
