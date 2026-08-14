@@ -479,15 +479,23 @@ impl SessionPlaylist {
                         self.decisions.get(&pipeline.item_id),
                         Some(ItemDecision::Shared)
                     );
+                    // "late join" means the viewer LOST content, so it has to
+                    // depend on the join position and not merely on there
+                    // having been a soft pin. A pin that upgrades at join 0
+                    // cost nothing: the substitution still starts at the
+                    // item's first frame. Reporting those as late joins
+                    // inflated every count taken off this line, which is how
+                    // ten of the nineteen "late joins" on 2026-08-11 came to
+                    // be events where nothing was actually served from shared.
+                    let how = match (upgraded, join_ms > 0) {
+                        (true, true) => " as a late join after a shared pin",
+                        (true, false) => " after a shared pin",
+                        (false, _) => "",
+                    };
                     log::info!(
-                        "[{}] item {}: serving variant{} (anchor {}ms, join {}ms)",
+                        "[{}] item {}: serving variant{how} (anchor {}ms, join {}ms)",
                         self.label,
                         pipeline.item_id,
-                        if upgraded {
-                            " as a late join after a shared pin"
-                        } else {
-                            ""
-                        },
                         anchor_ms,
                         join_ms,
                     );
