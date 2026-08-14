@@ -447,6 +447,7 @@ dependencies = [
  "ffpipeline",
  "filetime",
  "futures-core",
+ "futures-util",
  "log",
  "reqwest",
  "schemars",

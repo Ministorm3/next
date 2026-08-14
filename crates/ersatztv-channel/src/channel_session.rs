@@ -20,9 +20,8 @@ use ffpipeline::ffmpeg_info::FfmpegInfo;
 use ffpipeline::frame_rate::FrameRate;
 use ffpipeline::frame_size::FrameSize;
 use ffpipeline::input::{
-    FfmpegInputArgs, HttpInputOptions, HttpInputSource, InputSettings, InputSource,
+    FfmpegInputArgs, GraphicsInput, HttpInputOptions, HttpInputSource, InputSettings, InputSource,
     LavfiInputSource, LocalInputSource, ProbedInput, RtspInputOptions, RtspInputSource,
-    WatermarkInput,
 };
 use ffpipeline::output_settings::{AudioOutputSettings, OutputSettings, SubtitleMode};
 use ffpipeline::pipeline::{AudioFormat, Hz, Kbps, PtsOffset, SEGMENT_SECONDS, VideoFormat};
@@ -32,6 +31,7 @@ use ffpipeline::probe::{
 };
 use ffpipeline::web_vtt::Cue;
 use ffpipeline::{pipeline, probe};
+use futures_util::future::try_join_all;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use time::OffsetDateTime;
 use tokio::io::AsyncBufReadExt;
@@ -785,12 +785,14 @@ impl ChannelSession {
                 .and_then(|s| self.playout_source_to_input_source(s.clone()).ok())
         };
 
-        let audio_fut = self.resolve_probe(&audio_source, &audio_input_source);
+        let session: &ChannelSession = self;
+        let audio_fut = session.resolve_probe(&audio_source, &audio_input_source);
         let video_fut = async {
             if audio_source_is_video_source {
                 Ok::<_, ChannelError>(None)
             } else {
-                self.resolve_probe(&video_source, &video_input_source)
+                session
+                    .resolve_probe(&video_source, &video_input_source)
                     .await
                     .map(Some)
             }
@@ -801,54 +803,75 @@ impl ChannelSession {
             } else if let (Some(src), Some(s)) =
                 (subtitle_source.as_ref(), subtitle_input_source.as_ref())
             {
-                self.resolve_probe(src, s).await.map(Some)
+                session.resolve_probe(src, s).await.map(Some)
             } else {
                 Ok(None)
             }
         };
 
-        let watermark_fut = async {
-            if let Some(w) = current_item.watermark.as_ref() {
-                // a watermark is cosmetic: an unreadable or unprobeable
-                // artwork file must not take down the item it decorates
-                let prepared = async {
-                    let source = cosmetic_source(w.source.clone());
-                    let input_source = self.playout_source_to_input_source(source.clone())?;
-                    let probe_result = self.resolve_probe(&source, &input_source).await?;
-                    Ok::<_, ChannelError>((input_source, probe_result))
-                }
-                .await;
-
-                let (input_source, probe_result) = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(e) => {
-                        log::warn!("skipping watermark for item {}: {e}", current_item.id);
-                        return Ok(None);
+        let graphics_fut = async {
+            let prepared =
+                try_join_all(current_item.effective_graphics().map(|layer| async move {
+                    // a graphics layer is cosmetic: an unreadable or unprobeable
+                    // artwork file must not take down the item it decorates. The
+                    // fork carried this for the single watermark, and upstream's
+                    // multi-layer model needs it once per layer
+                    let prepared = async {
+                        let source = cosmetic_source(layer.source.clone());
+                        let input_source =
+                            session.playout_source_to_input_source(source.clone())?;
+                        let probe_result = session.resolve_probe(&source, &input_source).await?;
+                        Ok::<_, ChannelError>((input_source, probe_result))
                     }
-                };
+                    .await;
 
-                let location = playout_location_to_pipeline(&w.location);
-                let timing = playout_timing_to_pipeline(w.timing.as_ref());
-
-                Ok(Some(WatermarkInput {
-                    input_source,
-                    probe_result,
-                    stream_index: w.stream_index,
-                    location,
-                    width_percent: w.width_percent,
-                    within_source_content: w.within_source_content,
-                    horizontal_margin_percent: w.horizontal_margin_percent,
-                    vertical_margin_percent: w.vertical_margin_percent,
-                    opacity_percent: w.opacity_percent,
-                    timing,
+                    match prepared {
+                        Ok((input_source, probe_result)) => {
+                            Ok::<_, ChannelError>(Some((layer, input_source, probe_result)))
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "skipping a graphics layer for item {}: {e}",
+                                current_item.id
+                            );
+                            Ok(None)
+                        }
+                    }
                 }))
-            } else {
-                Ok(None)
-            }
+                .await?;
+
+            // `layer_index` is an ffmpeg input offset (`3 + layer_index`) and
+            // indexes `graphics_labels` directly, so a skipped layer must be
+            // closed over rather than left as a hole
+            Ok::<_, ChannelError>(
+                prepared
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(layer_index, (layer, input_source, probe_result))| {
+                        let location = playout_location_to_pipeline(&layer.location);
+                        let timing = playout_timing_to_pipeline(layer.timing.as_ref());
+
+                        GraphicsInput {
+                            layer_index,
+                            input_source,
+                            probe_result,
+                            stream_index: layer.stream_index,
+                            location,
+                            width_percent: layer.width_percent,
+                            within_source_content: layer.within_source_content,
+                            horizontal_margin_percent: layer.horizontal_margin_percent,
+                            vertical_margin_percent: layer.vertical_margin_percent,
+                            opacity_percent: layer.opacity_percent,
+                            timing,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
         };
 
-        let (audio_probe_result, video_probe_opt, subtitle_probe_opt, watermark_input) =
-            tokio::try_join!(audio_fut, video_fut, subtitle_fut, watermark_fut)?;
+        let (audio_probe_result, video_probe_opt, subtitle_probe_opt, graphics_inputs) =
+            tokio::try_join!(audio_fut, video_fut, subtitle_fut, graphics_fut)?;
 
         let video_probe_result = video_probe_opt.unwrap_or_else(|| audio_probe_result.clone());
         let subtitle_probe_result = if subtitle_source_is_video_source {
@@ -1013,6 +1036,15 @@ impl ChannelSession {
         // for; the slate window then says otherwise just below
         let mut input_settings = InputSettings {
             start: current_item.start,
+            playout_offset: if start_at_zero {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(
+                    (self.transcoded_until - current_item.start)
+                        .whole_milliseconds()
+                        .max(0) as u64,
+                )
+            },
             audio_input: ProbedInput {
                 input_source: audio_input_source,
                 in_point: audio_timing.in_point,
@@ -1034,7 +1066,7 @@ impl ChannelSession {
                 loop_when_exhausted: false,
             },
             subtitle_input,
-            watermark_input,
+            graphics_inputs,
         };
         repeat_media_inputs_for_slate(&mut input_settings, slate);
 
@@ -1403,6 +1435,19 @@ impl ChannelSession {
             self.transcoded_until
         };
 
+        // live content never seeks. limit it to the remaining schedule interval
+        // so pipeline duration and graphics timing end at the same point.
+        if is_live {
+            return TimingResult {
+                in_point: Duration::ZERO,
+                out_point: Duration::from_millis(
+                    (item_finish - effective_now).whole_milliseconds().max(0) as u64,
+                ),
+                finish: item_finish,
+                is_complete: true,
+            };
+        }
+
         let progress_ms = if start_at_zero {
             0
         } else {
@@ -1557,6 +1602,7 @@ impl ChannelSession {
             }),
             slate: None,
             watermark: None,
+            graphics: Vec::new(),
         }
     }
 
@@ -1694,6 +1740,14 @@ impl ChannelSession {
 
         if let Some(watermark) = &item.watermark
             && let PlayoutItemSource::Dynamic { .. } = watermark.source
+        {
+            return Err(ChannelError::DynamicSourceCannotRecurse);
+        }
+
+        if item
+            .graphics
+            .iter()
+            .any(|layer| matches!(layer.source, PlayoutItemSource::Dynamic { .. }))
         {
             return Err(ChannelError::DynamicSourceCannotRecurse);
         }
@@ -2020,7 +2074,11 @@ fn slate_item(item: PlayoutItem, slate_source: PlayoutItemSource) -> PlayoutItem
         source: Some(slate_source),
         tracks: None,
         slate: None,
+        // the slate stands in for the window, so it keeps the window's
+        // decoration: every graphics layer carries over exactly as the
+        // legacy watermark already did
         watermark: item.watermark,
+        graphics: item.graphics,
     }
 }
 
@@ -2522,7 +2580,8 @@ mod tests {
             audio_input: probed("/slate/WeatherSlate.mp4"),
             video_input: probed("/slate/WeatherSlate.mp4"),
             subtitle_input: Some(probed("/slate/WeatherSlate.mp4")),
-            watermark_input: None,
+            graphics_inputs: Vec::new(),
+            playout_offset: Duration::ZERO,
         }
     }
 

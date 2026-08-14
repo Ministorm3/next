@@ -16,7 +16,7 @@ use crate::frame_rate::FrameRate;
 use crate::frame_size::FrameSize;
 use crate::global_option::{GlobalOption, LogLevel};
 use crate::hw_accel::{HardwareAccel, HwAccel};
-use crate::input::{FfmpegInputArgs, InputSettings, InputSource, WatermarkInput};
+use crate::input::{FfmpegInputArgs, GraphicsInput, InputSettings, InputSource};
 use crate::output_option::OutputOption;
 use crate::output_settings::{
     OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions, YadifOptions,
@@ -234,8 +234,9 @@ pub enum PipelineInput {
         path: String,
         seek: Duration,
     },
-    Watermark {
-        input: WatermarkInput,
+    Graphics {
+        input: GraphicsInput,
+        layer_index: usize,
         index: u32,
         path: String,
         extra_input_args: ArgVec,
@@ -243,12 +244,12 @@ pub enum PipelineInput {
 }
 
 impl PipelineInput {
-    fn sort_order(&self) -> u8 {
+    fn sort_order(&self) -> usize {
         match self {
             PipelineInput::Video { .. } => 0,
             PipelineInput::Audio { .. } => 1,
             PipelineInput::Subtitle { .. } => 2,
-            PipelineInput::Watermark { .. } => 3,
+            PipelineInput::Graphics { layer_index, .. } => 3 + *layer_index,
         }
     }
 }
@@ -306,7 +307,11 @@ impl Pipeline {
         let video_stream = input_settings.select_video_stream()?;
         let audio_stream = input_settings.select_audio_stream()?;
         let subtitle_stream = input_settings.select_subtitle_stream();
-        let watermark_stream = input_settings.select_watermark_stream();
+        let graphics_streams: Vec<_> = input_settings
+            .graphics_inputs
+            .iter()
+            .map(|input| input_settings.select_graphics_stream(input))
+            .collect();
 
         // TODO: add target profile to config
         let video_codec = match (
@@ -531,21 +536,36 @@ impl Pipeline {
             }
         }
 
-        if let Some(watermark_stream) = watermark_stream
-            && let Some(watermark_input) = input_settings.watermark_input.as_ref()
-            && let Some(height) = watermark_stream.height
-            && let Some(width) = watermark_stream.width
+        for (graphics_input, graphics_stream) in
+            input_settings.graphics_inputs.iter().zip(graphics_streams)
         {
+            let Some(graphics_stream) = graphics_stream else {
+                return Err(FFPipelineError::GraphicsStreamNotFound(
+                    graphics_input.layer_index,
+                ));
+            };
+            let (Some(height), Some(width)) = (graphics_stream.height, graphics_stream.width)
+            else {
+                return Err(FFPipelineError::GraphicsStreamNotFound(
+                    graphics_input.layer_index,
+                ));
+            };
+            // upstream inlines these three branches. The fork keeps them in
+            // `watermark_input_args` because its still-image branch also
+            // passes `-f image2`, so calling the helper here preserves that.
+            // Dropping it would be a behavior change riding along with a
+            // merge, which is not what this commit is for
             let extra_input_args = watermark_input_args(
-                watermark_stream,
+                graphics_stream,
                 &output_context.media_frame_rate.r_frame_rate,
                 duration,
             );
 
-            inputs.push(PipelineInput::Watermark {
-                input: watermark_input.clone(),
-                index: watermark_stream.stream_index,
-                path: watermark_input.probe_result.path.to_owned(),
+            inputs.push(PipelineInput::Graphics {
+                input: graphics_input.clone(),
+                layer_index: graphics_input.layer_index,
+                index: graphics_stream.stream_index,
+                path: graphics_input.probe_result.path.to_owned(),
                 extra_input_args,
             });
 
@@ -556,10 +576,10 @@ impl Pipeline {
                 sample_aspect_ratio: Some(String::from("1:1")),
                 display_aspect_ratio: None,
                 surface: FrameSurface::System,
-                pixel_format: if watermark_stream.pix_fmt.is_empty() {
+                pixel_format: if graphics_stream.pix_fmt.is_empty() {
                     PixelFormat::Bgra
                 } else {
-                    PixelFormat::parse(&watermark_stream.pix_fmt)
+                    PixelFormat::parse(&graphics_stream.pix_fmt)
                 },
                 hdr_format: HdrFormat::None,
             };
@@ -574,20 +594,17 @@ impl Pipeline {
                 ScalingMode::Crop | ScalingMode::Stretch => *video_size,
             };
 
-            let scaled_size = watermark_input.scaled_size(
+            let scaled_size = graphics_input.scaled_size(
                 FrameSize { width, height },
                 final_output_settings.video_size,
             );
 
-            let location = Some(watermark_input.frame_location(
-                &source_content_size,
-                &scaled_size,
-                video_size,
-            ));
+            let location =
+                Some(graphics_input.frame_location(&source_content_size, &scaled_size, video_size));
 
             let mut secondary_filters: Vec<VideoFilter> = vec![
                 ColorChannelMixerFilter {
-                    alpha: watermark_input.opacity_percent.unwrap_or(100f32) / 100.0f32,
+                    alpha: graphics_input.opacity_percent.unwrap_or(100f32) / 100.0f32,
                 }
                 .into(),
                 FormatFilter {
@@ -606,11 +623,11 @@ impl Pipeline {
                 .into(),
             ];
 
-            let fade_filters = FadeFilter::for_watermark(
-                watermark_input.timing.as_ref(),
+            let fade_filters = FadeFilter::for_graphics(
+                graphics_input.timing.as_ref(),
                 input_settings.start,
-                input_settings.video_input.in_point,
-                input_settings.video_input.out_point,
+                input_settings.playout_offset,
+                duration,
             );
 
             secondary_filters.extend(fade_filters.iter().map(|f| f.clone().into()));
@@ -619,7 +636,7 @@ impl Pipeline {
                 kind: SoftwareOverlay::default().into(),
                 secondary: secondary_filters,
                 secondary_initial_state,
-                secondary_source: OverlaySource::Watermark,
+                secondary_source: OverlaySource::Graphics(graphics_input.layer_index),
                 location,
             }));
         }
@@ -779,9 +796,19 @@ impl Pipeline {
         let mut audio_label = String::from("0:a");
         let mut video_label = String::from("0:v");
         let mut subtitle_label = None;
-        let mut watermark_label = None;
+        let mut graphics_labels = vec![
+            None;
+            self.inputs
+                .iter()
+                .filter_map(|i| match i {
+                    PipelineInput::Graphics { layer_index, .. } => Some(*layer_index),
+                    _ => None,
+                })
+                .max()
+                .map_or(0, |i| i + 1)
+        ];
 
-        let mut distinct_paths: Vec<&str> = Vec::new();
+        let mut input_paths: Vec<&str> = Vec::new();
 
         let mut sorted_inputs: Vec<&PipelineInput> = self.inputs.iter().collect();
         sorted_inputs.sort_by_key(|i| i.sort_order());
@@ -800,12 +827,11 @@ impl Pipeline {
                     loop_when_exhausted,
                     ..
                 } => {
-                    distinct_paths.push(path.as_str());
+                    input_paths.push(path.as_str());
 
                     result.extend(decoder.as_arg());
 
-                    let video_input_index =
-                        distinct_paths.iter().position(|p| p == path).unwrap_or(0);
+                    let video_input_index = input_paths.iter().position(|p| p == path).unwrap_or(0);
                     video_label = format!("{}:{}", video_input_index, index);
 
                     result.extend(loop_input_args(*loop_when_exhausted));
@@ -832,8 +858,8 @@ impl Pipeline {
                     ..
                 } => {
                     // if we haven't yet used this input, add it
-                    if !distinct_paths.contains(&path.as_str()) {
-                        distinct_paths.push(path.as_str());
+                    if !input_paths.contains(&path.as_str()) {
+                        input_paths.push(path.as_str());
 
                         result.extend(decoder.as_arg());
 
@@ -845,8 +871,7 @@ impl Pipeline {
                         result.extend(args!["-i", path.to_owned()]);
                     }
 
-                    let audio_input_index =
-                        distinct_paths.iter().position(|p| p == path).unwrap_or(0);
+                    let audio_input_index = input_paths.iter().position(|p| p == path).unwrap_or(0);
                     audio_label = format!("{}:{}", audio_input_index, index);
                 }
                 PipelineInput::Subtitle {
@@ -856,8 +881,8 @@ impl Pipeline {
                     seek,
                     ..
                 } => {
-                    if !distinct_paths.contains(&path.as_str()) {
-                        distinct_paths.push(path.as_str());
+                    if !input_paths.contains(&path.as_str()) {
+                        input_paths.push(path.as_str());
 
                         if !seek.is_zero() {
                             result.extend(args!["-ss", format!("{}ms", seek.as_millis())]);
@@ -868,26 +893,23 @@ impl Pipeline {
                     }
 
                     let subtitle_input_index =
-                        distinct_paths.iter().position(|p| p == path).unwrap_or(0);
+                        input_paths.iter().position(|p| p == path).unwrap_or(0);
                     subtitle_label = Some(format!("{}:{}", subtitle_input_index, index));
                 }
-                PipelineInput::Watermark {
+                PipelineInput::Graphics {
                     input,
+                    layer_index,
                     index,
                     path,
                     extra_input_args,
                 } => {
-                    if !distinct_paths.contains(&path.as_str()) {
-                        distinct_paths.push(path.as_str());
-
-                        result.extend(input.input_source.args_for_input());
-                        result.extend(extra_input_args.clone());
-                        result.extend(args!["-i", path.to_owned()]);
-                    }
-
-                    let watermark_input_index =
-                        distinct_paths.iter().position(|p| p == path).unwrap_or(0);
-                    watermark_label = Some(format!("{}:{}", watermark_input_index, index))
+                    input_paths.push(path.as_str());
+                    result.extend(input.input_source.args_for_input());
+                    result.extend(extra_input_args.clone());
+                    result.extend(args!["-i", path.to_owned()]);
+                    let graphics_input_index = input_paths.len() - 1;
+                    graphics_labels[*layer_index] =
+                        Some(format!("{}:{}", graphics_input_index, index));
                 }
             }
         }
@@ -897,7 +919,7 @@ impl Pipeline {
             &audio_label,
             &video_label,
             subtitle_label.as_ref(),
-            watermark_label.as_ref(),
+            &graphics_labels,
         );
 
         result.extend(filter_chain.as_arg());
@@ -1005,7 +1027,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::input::{LocalInputSource, ProbedInput};
+    use crate::input::{GraphicsLocation, LocalInputSource, ProbedInput};
     use crate::output_format::OutputFormat;
     use crate::output_settings::AudioOutputSettings;
     use crate::probe::{
@@ -1050,6 +1072,15 @@ mod tests {
     /// single local file standing in for the whole slot, padded to the -t
     /// clamp because the window's PTS envelope has to match every variant's.
     fn slate_pipeline_args(media: Duration, window: Duration, loops: bool) -> ArgVec {
+        slate_pipeline_args_with_graphics(media, window, loops, Vec::new())
+    }
+
+    fn slate_pipeline_args_with_graphics(
+        media: Duration,
+        window: Duration,
+        loops: bool,
+        graphics_inputs: Vec<GraphicsInput>,
+    ) -> ArgVec {
         let probe = slate_probe(media);
         let input_source = InputSource::Local(LocalInputSource {
             path: String::from(SLATE_PATH),
@@ -1069,7 +1100,8 @@ mod tests {
             audio_input: probed(input_source.clone(), probe.clone()),
             video_input: probed(input_source, probe),
             subtitle_input: None,
-            watermark_input: None,
+            graphics_inputs,
+            playout_offset: Duration::ZERO,
         };
 
         let output_settings = OutputSettings {
@@ -1231,6 +1263,49 @@ mod tests {
             );
             assert!(has_pair(&args, "-t", "44000ms"), "{codec} must be bounded");
         }
+    }
+
+    /// The `-f image2` pin has to reach the BUILT PIPELINE, not just the
+    /// helper that formats it.
+    ///
+    /// Upstream inlines these three branches without the pin, so a merge that
+    /// takes its version wholesale drops the demuxer silently: the helper's
+    /// own tests keep passing because they call it directly, and nothing else
+    /// looked at the emitted args. Verified by mutation on the 2026-08-14
+    /// upstream merge, where inlining upstream's version failed no test at
+    /// all. This asserts the wiring rather than the formatting.
+    #[test]
+    fn a_still_image_layer_pins_image2_in_the_built_pipeline() {
+        let args = slate_pipeline_args_with_graphics(
+            Duration::from_secs(15),
+            Duration::from_secs(103),
+            true,
+            vec![GraphicsInput {
+                layer_index: 0,
+                input_source: InputSource::Local(LocalInputSource {
+                    path: String::from("/bumps/logo.png"),
+                }),
+                probe_result: ProbeResult {
+                    path: String::from("/bumps/logo.png"),
+                    streams: vec![ProbeResultStream::Video(Box::new(watermark_stream("png")))],
+                    duration: None,
+                    format_name: Some(String::from("png_pipe")),
+                },
+                stream_index: None,
+                location: GraphicsLocation::TopLeft,
+                width_percent: None,
+                within_source_content: None,
+                horizontal_margin_percent: None,
+                vertical_margin_percent: None,
+                opacity_percent: None,
+                timing: None,
+            }],
+        );
+
+        assert!(
+            has_pair(&args, "-f", "image2"),
+            "the built pipeline must pin -f image2 for a still image layer, got {args:?}"
+        );
     }
 
     #[test]
