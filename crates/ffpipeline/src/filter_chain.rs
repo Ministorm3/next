@@ -1139,6 +1139,112 @@ mod tests {
         );
     }
 
+    /// `tpad` costs one round trip and nothing more: the scale stays on the GPU.
+    ///
+    /// Every templated, variant and slate item sets `pad_to_duration`, so it
+    /// gets `TPadFilter`, whose `required_surface` is `System` because ffmpeg
+    /// has no hardware tpad. A 2026-08-14 audit read that as dragging the whole
+    /// video chain into software for all cohort content. It does not: the
+    /// resolver re-uploads immediately after the pad and the scale still
+    /// resolves to `scale_vaapi`. The download is unavoidable given the filter
+    /// exists only in software; what matters is that it does not spread.
+    ///
+    /// This is the guard for that. If a change ever makes the pad pull the
+    /// scale into software with it, this fails.
+    #[test]
+    fn tpad_costs_one_roundtrip_and_leaves_the_scale_on_the_gpu() {
+        let ffmpeg_info =
+            ffmpeg_info_with_filters(&[KnownVideoFilter::ScaleVaapi, KnownVideoFilter::PadVaapi]);
+        let filter_options = VideoFilterOptions::default();
+        let initial_state = FrameState {
+            size: FrameSize {
+                width: 1920,
+                height: 1080,
+            },
+            is_anamorphic: false,
+            is_interlaced: false,
+            sample_aspect_ratio: None,
+            display_aspect_ratio: None,
+            surface: FrameSurface::Vaapi,
+            pixel_format: PixelFormat::Nv12,
+            hdr_format: HdrFormat::None,
+        };
+
+        let scale = || {
+            PipelineFilter::Video(
+                ScaleFilter {
+                    size: Some(FrameSize {
+                        width: 1280,
+                        height: 720,
+                    }),
+                    scaling_mode: ScalingMode::ScaleAndPad,
+                    input_is_anamorphic: false,
+                    force_original_aspect_ratio: None,
+                }
+                .into(),
+            )
+        };
+
+        // vaapi_accel() reports no VPP formats at all, so nothing would scale
+        // on the GPU with it and the comparison below would be vacuous
+        let capable = HardwareAccel::Vaapi(Vaapi {
+            device: String::from("/dev/dri/renderD128"),
+            driver: VaapiDriver::Ihd,
+            capabilities: VaapiCapabilities {
+                vendor: String::from("test"),
+                supported: HashSet::new(),
+                vpp_pixel_formats: HashSet::from([libva_sys::VA_FOURCC_NV12]),
+                can_hdr_to_sdr_tonemap: HashSet::new(),
+                can_hdr_to_hdr_tonemap: HashSet::new(),
+                can_overlay: false,
+                rate_control: HashMap::new(),
+            },
+            opencl_capabilities: OpenCLCapabilities::default(),
+        });
+
+        let build = |filters: Vec<PipelineFilter>| {
+            let mut chain = FilterChain::new(filters);
+            chain.evaluate(&initial_state, &ffmpeg_info);
+            chain.resolve(
+                &ffmpeg_info,
+                &Some(capable.clone()),
+                &filter_options,
+                &initial_state,
+                &FrameSurface::Vaapi,
+                &Some(PixelFormat::Nv12),
+            );
+            chain.build("0:a", "0:v", None, None);
+            chain.as_arg()[1].to_string()
+        };
+
+        // the same item WITHOUT the pad requirement keeps its scale on the GPU
+        let without_tpad = build(vec![scale()]);
+        assert!(
+            without_tpad.contains("scale_vaapi"),
+            "a hardware channel scales on the GPU when nothing forces it off: {without_tpad}"
+        );
+
+        // and WITH it, exactly as a templated/variant/slate item is built
+        let with_tpad = build(vec![PipelineFilter::Video(TPadFilter.into()), scale()]);
+        assert!(
+            with_tpad.contains("tpad=stop=-1:stop_mode=clone"),
+            "the pad must still be applied: {with_tpad}"
+        );
+        assert!(
+            with_tpad.contains("hwdownload"),
+            "tpad has no hardware form, so one download is expected: {with_tpad}"
+        );
+        assert!(
+            with_tpad.contains("scale_vaapi"),
+            "the pad must not pull the scale into software with it: {with_tpad}"
+        );
+        assert_eq!(
+            with_tpad.matches("hwdownload").count(),
+            1,
+            "exactly one round trip, not one per filter that follows: {with_tpad}"
+        );
+    }
+
     #[test]
     fn resolve_tonemap_vaapi_does_not_insert_hwmap() {
         let vaapi = vaapi_accel_with_tonemap(VaapiDriver::RadeonSI, true, false, false);
