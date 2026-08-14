@@ -59,10 +59,22 @@ pub fn answers_folder(output_folder: &Path) -> PathBuf {
 /// Records that a viewer is asking for this raw query right now. The file
 /// holds the raw query, since only the worker can canonicalize it; its
 /// modified time is the liveness signal, exactly like a heartbeat.
+/// Published by rename, never by truncating the live file. A truncating write
+/// leaves the request present, with a fresh modified time, and momentarily
+/// empty; a worker scanning the folder in that window reads an empty query,
+/// canonicalizes it to the default cohort, and reaps the session of the cohort
+/// the viewer actually asked for. That is not theoretical: it happened three
+/// times over 2026-08-13/14 on a channel being polled every two seconds, each
+/// time recovering on the next tick, and once it cost an item its variant when
+/// the respawn raced the reaped session's exiting worker for the folder lock.
 pub async fn publish_request(output_folder: &Path, raw_query: &str) -> io::Result<()> {
     let folder = requests_folder(output_folder);
     tokio::fs::create_dir_all(&folder).await?;
-    tokio::fs::write(folder.join(stable_name(raw_query)), raw_query).await
+
+    let path = folder.join(stable_name(raw_query));
+    let temporary = path.with_extension("tmp");
+    tokio::fs::write(&temporary, raw_query).await?;
+    tokio::fs::rename(&temporary, &path).await
 }
 
 /// The cohort folder name the worker resolved this raw query to.

@@ -149,7 +149,7 @@ impl VariantManager {
             _ => None,
         };
 
-        let requests = read_requests(channel, &recognized, default_cohort).await;
+        let (requests, torn) = read_requests(channel, &recognized, default_cohort).await;
         let shared = read_sidecar(&channel.output_folder.join("live.m3u8"), "shared").await;
 
         // a live cohort request is a viewer of this channel. during a
@@ -172,14 +172,29 @@ impl VariantManager {
             .filter(|r| !r.cohort_query.is_empty())
             .map(|r| r.cohort_query.clone())
             .collect();
-        reap(
-            &mut sessions,
-            &admitted,
-            &requested,
-            shared.is_some(),
-            channel,
-        )
-        .await;
+
+        // Reaping decides from the ABSENCE of a request, so it may only run on
+        // a complete view. A request caught mid-write is unreadable this tick
+        // but says nothing about whether its viewer is still there, and
+        // dropping a session on that evidence is the reap that kept firing
+        // while a viewer polled every two seconds. Sessions that really have
+        // gone away are still reaped on the next tick with an intact view.
+        if torn {
+            log::debug!(
+                "channel {}: deferring the reap, a cohort request was read mid-write \
+                 so this tick cannot tell an absent viewer from an unreadable one",
+                channel.number
+            );
+        } else {
+            reap(
+                &mut sessions,
+                &admitted,
+                &requested,
+                shared.is_some(),
+                channel,
+            )
+            .await;
+        }
 
         let Some(shared) = shared else {
             return;
@@ -370,17 +385,23 @@ impl VariantSession {
 ///
 /// `default_cohort` is the already-canonicalized cohort that canonical-empty
 /// requests are admitted to, when the operator configured one.
+///
+/// Returns the resolved requests and whether the scan was TORN. A true second
+/// element means the view is incomplete (a request was caught mid-write, or
+/// the folder could not be scanned), so this tick cannot distinguish a viewer
+/// who left from one whose request was momentarily unreadable, and the caller
+/// must not reap on it.
 async fn read_requests(
     channel: &VariantChannel,
     recognized: &BTreeSet<String>,
     default_cohort: Option<&str>,
-) -> Vec<ResolvedRequest> {
+) -> (Vec<ResolvedRequest>, bool) {
     let folder = requests_folder(&channel.output_folder);
     let mut entries = match tokio::fs::read_dir(&folder).await {
         Ok(entries) => entries,
         // absence is the normal no-viewers case; anything else reads as
         // "no viewers" too, which reaps every session, so it has to say so
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false),
         Err(e) => {
             log::warn!(
                 "cannot scan the cohort requests folder {}: {e}; treating channel {} \
@@ -388,11 +409,12 @@ async fn read_requests(
                 folder.display(),
                 channel.number
             );
-            return Vec::new();
+            return (Vec::new(), true);
         }
     };
 
     let mut requests = Vec::new();
+    let mut torn = false;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
@@ -425,6 +447,35 @@ async fn read_requests(
             continue;
         };
 
+        // A request file's NAME is `stable_name` of its own contents, so a
+        // read whose contents do not hash to its name caught the file
+        // mid-write and must be ignored rather than canonicalized.
+        //
+        // A truncating writer (both this crate's `publish_request` and the
+        // legacy app's `File.WriteAllTextAsync`) leaves the file present,
+        // with a fresh modified time, and momentarily EMPTY. Reading that
+        // yields an empty query, which canonicalizes to the default cohort,
+        // so the cohort the viewer actually asked for is missing from this
+        // tick's requests and its session is reaped as unwanted. The fresh
+        // modified time means it is not reported as a stale drop either,
+        // which is exactly how the reap presented: "no cohort was requested
+        // this tick" while a viewer was polling every ~2s. Observed three
+        // times over 2026-08-13/14, each time recovering on the next tick.
+        //
+        // This check cannot swallow a genuine bare query: that request is
+        // named `stable_name("")` and its contents really are empty, so the
+        // two agree and it is admitted exactly as before.
+        if ersatztv_core::variant_request::stable_name(&raw_query) != token {
+            log::debug!(
+                "ignoring a torn cohort request {} on channel {}: contents do not \
+                 match the name, so the file was read mid-write",
+                token,
+                channel.number
+            );
+            torn = true;
+            continue;
+        };
+
         let query_pairs: Vec<(String, String)> = url::form_urlencoded::parse(raw_query.as_bytes())
             .into_owned()
             .collect();
@@ -452,7 +503,7 @@ async fn read_requests(
         });
     }
 
-    requests
+    (requests, torn)
 }
 
 /// Chooses which cohorts get a variant transcode. Cohorts already running keep
@@ -1189,6 +1240,76 @@ mod tests {
         let second = tokio::fs::read_to_string(&playlist_path).await.unwrap();
 
         assert_eq!(first, second);
+    }
+
+    /// A request caught mid-write is ignored for that tick, not read as a
+    /// different cohort.
+    ///
+    /// A truncating writer leaves the file present, freshly modified, and
+    /// empty. Reading that yields an empty query, which canonicalizes to the
+    /// default cohort, so the cohort the viewer asked for goes missing from
+    /// the tick and its session is reaped while the viewer is still polling.
+    /// Observed three times over 2026-08-13/14, each recovering a tick later.
+    #[tokio::test]
+    async fn a_request_caught_mid_write_does_not_reap_its_cohort() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "zip=15216")
+            .await
+            .unwrap();
+
+        let manager = VariantManager::new();
+        let channel = channel(output);
+        let playlist_path = output.join(composed_playlist_name(&stable_name("zip=15216"), false));
+
+        manager.tick(&channel).await;
+        assert!(
+            playlist_path.exists(),
+            "the cohort must be serving before the torn write"
+        );
+
+        // truncate the live request exactly as a non-atomic writer does: the
+        // file stays, its modified time is fresh, its contents are gone
+        let request = requests_folder(output).join(stable_name("zip=15216"));
+        tokio::fs::write(&request, b"").await.unwrap();
+
+        manager.tick(&channel).await;
+
+        assert!(
+            playlist_path.exists(),
+            "a torn request read as an empty query reaped the cohort mid-write"
+        );
+    }
+
+    /// The torn-write check must not swallow a genuine bare query, whose
+    /// contents really are empty and whose name is `stable_name("")`. Those
+    /// agree, so it is a valid request and keeps its session.
+    #[tokio::test]
+    async fn a_genuine_bare_request_is_still_admitted() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        let request = requests_folder(output).join(stable_name(""));
+        assert_eq!(
+            tokio::fs::read_to_string(&request).await.unwrap(),
+            "",
+            "a bare request's contents are genuinely empty"
+        );
+
+        let manager = VariantManager::new();
+        manager.tick(&channel(output)).await;
+
+        assert!(
+            answers_folder(output).join(stable_name("")).exists(),
+            "a genuine bare request must still be answered"
+        );
     }
 
     /// A cohort viewer's polls never touch the shared session's own files
