@@ -1336,6 +1336,51 @@ mod tests {
         }
     }
 
+    /// A ch15-shaped window: a 140000ms templated item, which is the envelope
+    /// logged for item 12216957 on 2026-08-12, inside a channel producing
+    /// either side of it. The item occupies sequences 6 through 40.
+    fn shared_with_long_templated_item() -> PlaylistSidecar {
+        let segments = (0..60i64)
+            .map(|i| {
+                let at = i * 4;
+                let item = match at {
+                    at if at < 24 => "before",
+                    at if at < 164 => "game",
+                    _ => "after",
+                };
+                seg(
+                    &format!("live{i:06}.ts"),
+                    item,
+                    at,
+                    at == 0 || at == 24 || at == 164,
+                )
+            })
+            .collect();
+
+        PlaylistSidecar {
+            segments,
+            pipelines: vec![
+                pipeline("before", 0, false),
+                pipeline("game", 24_000, true),
+                pipeline("after", 164_000, false),
+            ],
+        }
+    }
+
+    /// A variant for that window that has produced `count` segments, spawned
+    /// with `progress_ms`. The pts offset it records is the shared item's
+    /// offset plus that progress, which is what the worker stamps, so this is
+    /// also what sets `anchor_ms` when the composer reads it back.
+    fn long_variant(count: i64, progress_ms: u64) -> PlaylistSidecar {
+        let start = 24 + (progress_ms / 1000) as i64;
+        PlaylistSidecar {
+            segments: (0..count)
+                .map(|i| seg(&format!("live{i:06}.ts"), "game", start + i * 4, i == 0))
+                .collect(),
+            pipelines: vec![pipeline("game", 24_000 + progress_ms, true)],
+        }
+    }
+
     fn continuous_shared_with_templated_item() -> PlaylistSidecar {
         let segments = (0..16i64)
             .map(|i| {
@@ -3425,5 +3470,175 @@ mod tests {
         // and it keeps moving: the stall does not cap the timeline short of
         // the shared feed it fell back to
         assert_eq!(compose(60).last().map(|e| e.sequence), Some(15));
+    }
+
+    /// `anchor_ms` IS the progress the variant was spawned with. The worker
+    /// stamps `pts_offset_ms + progress_ms` on its output, the composer reads
+    /// `variant.pts_offset_ms - shared.pts_offset_ms` back off the sidecar,
+    /// so the two are the same number by construction.
+    ///
+    /// Also: a 60000ms join can be entirely HONEST. Here the session really
+    /// did compose 15 positions of the item before the variant anchored, with
+    /// a base that is the item's own first position, so nothing about the
+    /// span is fictional. Which of the two produced the 2026-08-12 ch15 join
+    /// is not settled here and needs the join-arithmetic line from f24da71.
+    #[test]
+    fn the_variant_anchor_is_the_progress_it_was_spawned_with() {
+        let shared = shared_with_long_templated_item();
+
+        let composed_through = |session: &mut SessionPlaylist, last: u64| {
+            for sequence in 6..=last {
+                session.entries.push_back(ComposedEntry {
+                    path: format!("live{sequence:06}.ts"),
+                    duration: 4.0,
+                    program_date_time: OffsetDateTime::UNIX_EPOCH
+                        + time::Duration::seconds(sequence as i64 * 4),
+                    discontinuity: sequence == 6,
+                    sequence,
+                    variant: false,
+                });
+            }
+            session.head_sequence = 6;
+        };
+
+        let decide = |progress_ms: u64| {
+            let mut session = SessionPlaylist::default();
+            composed_through(&mut session, 20);
+            session.decide_items(
+                &shared,
+                Some(&long_variant(1, progress_ms)),
+                OffsetDateTime::UNIX_EPOCH,
+            );
+            let Some(ItemDecision::Variant { join_ms, anchor_ms }) =
+                session.decisions.get("game").copied()
+            else {
+                panic!("the item is anchored, so it must decide Variant");
+            };
+            (join_ms, anchor_ms)
+        };
+
+        // today: the fallback shortcut spawns at progress 0, so the variant
+        // claims the item's first position while the session has served 15
+        let (join_ms, anchor_ms) = decide(0);
+        assert_eq!(anchor_ms, 0, "progress 0 anchors at the item start");
+        assert_eq!(
+            join_ms, 60_000,
+            "15 positions were composed off a base that is the item's own \
+             first position, so the span is honest"
+        );
+
+        // spawned at the depth the session had already reached, the anchor
+        // follows the progress exactly
+        let (join_ms, anchor_ms) = decide(60_000);
+        assert_eq!(anchor_ms, 60_000, "the anchor is the spawn progress");
+        assert_eq!(join_ms, 60_000, "the join is unchanged: it is not moved");
+    }
+
+    /// REPRODUCTION of the lost window. A variant anchored at 0 is asked for
+    /// the twin of a join it did not start at, that twin is its segment
+    /// `join_ms / 4000`, and it will not reach that index for another
+    /// `join_ms` of wall clock because both sides advance at 1x. The composer
+    /// gives up after `VARIANT_STALL_SECONDS` and serves shared for the rest,
+    /// so the cohort gets NO variant frames at all.
+    ///
+    /// This is the 2026-08-12 ch15 shape: anchor 0ms, join 60000ms, unmet
+    /// demands for segments 15 through 30+ across the whole 140000ms window.
+    #[test]
+    fn a_variant_anchored_at_zero_cannot_serve_a_join_past_its_start() {
+        let shared = shared_with_long_templated_item();
+        // the variant has started and is producing, it is simply at the
+        // beginning of its own output
+        let variant = long_variant(3, 0);
+
+        let composed = compose_timeline(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            "",
+            &decided("game", variant_decision(60_000, 0)),
+            &bases_of(&shared),
+            ComposeResume::default(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200),
+        );
+
+        // by the same arithmetic `render` uses for the twin index
+        let anchor_ms: u64 = 0;
+        let twin_demanded = (60_000 + 750 - anchor_ms) / (1000 * SEGMENT_SECONDS);
+        assert_eq!(twin_demanded, 15, "the join names segment 15");
+        assert!(
+            variant.segments.len() <= twin_demanded as usize,
+            "which the variant has not produced"
+        );
+
+        // NOT vacuous: the window really is composed, and every position of
+        // it past the join is present. It is simply all shared
+        let item_positions: Vec<u64> = composed
+            .iter()
+            .filter(|e| (6..=40).contains(&e.sequence))
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(
+            item_positions.len(),
+            35,
+            "the whole 140000ms window is composed"
+        );
+        assert!(
+            item_positions.contains(&21),
+            "including the position the join names"
+        );
+
+        assert!(
+            !composed.iter().any(|e| e.variant),
+            "TODAY'S BEHAVIOUR: the whole window is served from shared, so \
+             the cohort receives no variant frames: {:?}",
+            composed
+                .iter()
+                .filter(|e| e.variant)
+                .map(|e| e.sequence)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The CONTROL for the reproduction above, differing in one value: the
+    /// variant was spawned at the depth the composer had already reached, so
+    /// `anchor_ms` equals the join and the demanded twin is its FIRST
+    /// segment. Same variant output, same join, window served.
+    ///
+    /// This is the composer-side case for spawning a fallback variant at the
+    /// item's real air progress instead of 0. It does NOT show that the
+    /// worker can produce correct content at that position from a live
+    /// source; that is `channel_session::run_variant`'s side and is not
+    /// covered here.
+    #[test]
+    fn a_variant_anchored_at_the_join_serves_it_from_its_first_segment() {
+        let shared = shared_with_long_templated_item();
+        let variant = long_variant(3, 60_000);
+
+        let composed = compose_timeline(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            "",
+            &decided("game", variant_decision(60_000, 60_000)),
+            &bases_of(&shared),
+            ComposeResume::default(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200),
+        );
+
+        let served: Vec<_> = composed
+            .iter()
+            .filter(|e| e.variant)
+            .map(|e| (e.sequence, e.path.as_str()))
+            .collect();
+
+        assert_eq!(
+            served,
+            vec![
+                (21, "variants/abc/live000000.ts"),
+                (22, "variants/abc/live000001.ts"),
+                (23, "variants/abc/live000002.ts"),
+            ],
+            "the join is served from the variant's first segment onward"
+        );
     }
 }
