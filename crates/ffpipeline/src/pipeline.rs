@@ -550,11 +550,24 @@ impl Pipeline {
                     graphics_input.layer_index,
                 ));
             };
-            // upstream inlines these three branches. The fork keeps them in
-            // `watermark_input_args` because its still-image branch also
-            // passes `-f image2`, so calling the helper here preserves that.
-            // Dropping it would be a behavior change riding along with a
-            // merge, which is not what this commit is for
+            // DELIBERATE DIVERGENCE from upstream #211, which drops `-loop 1`
+            // and `-t` for a still image so decode and scale run once rather
+            // than once per output frame, and lets the overlay's repeatlast
+            // hold the frame.
+            //
+            // The fork keeps the loop and the clamp because they are load
+            // bearing here for a reason that is not about overlays. A still
+            // image input running the item's full `-t` is what holds a
+            // pipeline open past a video stream that ends early, and that is
+            // measured: ch13 carries a watermark on every item and its worst
+            // item drifts -19ms, while ch11 carries none and the same library
+            // file costs it -476ms per airing. Taking upstream's version here
+            // would re-expose ch13 to a drift defect that is currently at
+            // zero, bundled invisibly into a merge.
+            //
+            // Revisit deliberately, with a drift measurement, not as part of
+            // a merge. The `-f image2` pin is orthogonal and survives either
+            // way.
             let extra_input_args = watermark_input_args(
                 graphics_stream,
                 &output_context.media_frame_rate.r_frame_rate,
@@ -602,6 +615,13 @@ impl Pipeline {
             let location =
                 Some(graphics_input.frame_location(&source_content_size, &scaled_size, video_size));
 
+            let fade_filters = FadeFilter::for_graphics(
+                graphics_input.timing.as_ref(),
+                input_settings.start,
+                input_settings.playout_offset,
+                duration,
+            );
+
             let mut secondary_filters: Vec<VideoFilter> = vec![
                 ColorChannelMixerFilter {
                     alpha: graphics_input.opacity_percent.unwrap_or(100f32) / 100.0f32,
@@ -623,12 +643,17 @@ impl Pipeline {
                 .into(),
             ];
 
-            let fade_filters = FadeFilter::for_graphics(
-                graphics_input.timing.as_ref(),
-                input_settings.start,
-                input_settings.playout_offset,
-                duration,
-            );
+            // a still image is decoded as a single frame; only fades need it repeated (they act on
+            // frame timestamps). otherwise the overlay's repeatlast holds it, which keeps the
+            // per-frame format conversion and hwupload out of the chain entirely
+            if !fade_filters.is_empty() {
+                secondary_filters.push(
+                    LoopFilter {
+                        is_still_image: graphics_stream.is_still_image(),
+                    }
+                    .into(),
+                );
+            }
 
             secondary_filters.extend(fade_filters.iter().map(|f| f.clone().into()));
 
