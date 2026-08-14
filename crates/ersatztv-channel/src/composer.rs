@@ -3534,6 +3534,106 @@ mod tests {
         assert_eq!(join_ms, 60_000, "the join is unchanged: it is not moved");
     }
 
+    /// THE JOIN IS A DISPLACEMENT, and nothing else. It measures the distance
+    /// between where the variant anchors and where the composer's numbering
+    /// has already reached when the variant's first segment appears:
+    ///
+    ///     join_ms = (T_anchor - PDT_item_first - COMPOSE_TRAIL) * 1000
+    ///
+    /// Held exactly here across a 72 second spread, slope exactly 1, with
+    /// `anchor_ms` pinned at 0 throughout. Nothing about the variant's own
+    /// content moves it. That is why a large join is never evidence that the
+    /// composer's sums are wrong: it is a faithful readout of how far apart
+    /// the two axes had drifted.
+    ///
+    /// Those axes are the whole defect. The variant air-locks on
+    /// `item.start + join_offset`, a SCHEDULE-axis time
+    /// (`channel_session::run_variant`), while the composer numbers positions
+    /// from the shared session's PDT, a PRODUCTION-axis time. Whenever
+    /// production is displaced from the authored schedule the two disagree,
+    /// and the disagreement lands here in full.
+    ///
+    /// The 2026-08-12 events are two different ways into the same
+    /// displacement. ch11 12206355 got there through a 27.5s production lag
+    /// (a 5760x4320 source that defeated NVDEC and decoded at 0.26x). ch15
+    /// 12216957 got there through a 58s `join_offset`, the shared session
+    /// having joined a 198s item 58s in. The 60s row below reproduces the
+    /// 60000ms that both ch15 and ch11 12206607 logged.
+    ///
+    /// Note the one-tick lag: `decide_items` reads `emitted` from the entries
+    /// as they stood on the PREVIOUS tick, so the join trails the horizon by
+    /// exactly one segment. That is why there is no `+ 1` here.
+    #[test]
+    fn the_join_is_the_displacement_between_the_two_axes() {
+        let shared = shared_with_long_templated_item();
+
+        // the templated item's first position carries pdt 24s, and the walk
+        // stops COMPOSE_TRAIL_SECONDS behind the live edge
+        const ITEM_FIRST_PDT_SECS: i64 = 24;
+
+        let join_at = |anchor_secs: i64| -> u64 {
+            let mut session = SessionPlaylist::default();
+
+            // the variant is missing, so the cohort is served shared and the
+            // composed timeline walks into the item one tick at a time
+            let mut t = ITEM_FIRST_PDT_SECS;
+            while t < anchor_secs {
+                session.advance_and_render(
+                    &shared,
+                    None,
+                    "variants/abc/",
+                    Some(0),
+                    OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(t),
+                    4,
+                    |s| s.to_owned(),
+                );
+                t += 4;
+            }
+
+            // the variant's first segment becomes visible, anchored at the
+            // item start because a fallback pipeline spawns at progress 0
+            session.advance_and_render(
+                &shared,
+                Some(&long_variant(1, 0)),
+                "variants/abc/",
+                Some(0),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(anchor_secs),
+                4,
+                |s| s.to_owned(),
+            );
+
+            let Some(ItemDecision::Variant { join_ms, anchor_ms }) =
+                session.decisions.get("game").copied()
+            else {
+                panic!("the variant is anchored at t={anchor_secs}, so it must decide Variant");
+            };
+            assert_eq!(
+                anchor_ms, 0,
+                "the anchor stays at the item start; only the displacement moves"
+            );
+            join_ms
+        };
+
+        for anchor_secs in [48i64, 60, 72, 92, 120] {
+            let displacement_ms =
+                ((anchor_secs - ITEM_FIRST_PDT_SECS - COMPOSE_TRAIL_SECONDS as i64) * 1000) as u64;
+            assert_eq!(
+                join_at(anchor_secs),
+                displacement_ms,
+                "at T_anchor={anchor_secs}s the join must equal the displacement"
+            );
+        }
+
+        // slope exactly 1: every second of displacement is a second of join,
+        // so nothing amplifies it
+        assert_eq!(join_at(92) - join_at(72), 20_000);
+        assert_eq!(join_at(120) - join_at(92), 28_000);
+
+        // and the shape of the live events: 60s of displacement is the
+        // 60000ms logged on ch15 12216957 and ch11 12206607
+        assert_eq!(join_at(92), 60_000);
+    }
+
     /// REPRODUCTION of the lost window. A variant anchored at 0 is asked for
     /// the twin of a join it did not start at, that twin is its segment
     /// `join_ms / 4000`, and it will not reach that index for another
