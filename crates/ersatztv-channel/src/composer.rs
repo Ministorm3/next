@@ -2446,6 +2446,45 @@ mod tests {
         assert_eq!(session.serve_head, Some(0));
     }
 
+    /// REPRODUCTION of an audit finding, left failing-by-documentation rather
+    /// than fixed here: a session with nothing composed yet still renders a
+    /// playlist, and that playlist has NO segments in it.
+    ///
+    /// It reaches a viewer. `write_atomic` publishes whatever `render` returns
+    /// with no minimum, and the legacy reader's `ReadComposedPlaylist` gates
+    /// only on the file existing and being fresh, never on its contents. So a
+    /// cohort tuning in during the window between its session being created
+    /// and its first entry being composed is handed a playlist with headers
+    /// and nothing to play.
+    ///
+    /// The shared session does not have this problem: upstream #202 gave it a
+    /// `MIN_SEGMENTS` ready gate that counts the PUBLISHED window. The composed
+    /// path has no counterpart, which is the gap.
+    #[test]
+    fn a_session_with_nothing_composed_publishes_an_empty_playlist() {
+        let mut session = SessionPlaylist::default();
+        let shared = PlaylistSidecar {
+            segments: Vec::new(),
+            pipelines: vec![pipeline("before", 0, false)],
+        };
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(68);
+
+        let rendered =
+            session.advance_and_render(&shared, None, "variants/x/", Some(0), now, 4, |s| {
+                s.to_owned()
+            });
+
+        assert!(
+            rendered.contains("#EXTM3U"),
+            "it really is published as a playlist: {rendered}"
+        );
+        assert_eq!(
+            rendered.lines().filter(|l| !l.starts_with('#')).count(),
+            0,
+            "and it carries no segments at all: {rendered}"
+        );
+    }
+
     /// A fresh session joining a lagging timeline starts a full window
     /// behind the emission edge, not at it: a one-segment playlist gives a
     /// player nothing to buffer.
@@ -2577,6 +2616,105 @@ mod tests {
 
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:200\n"));
         assert!(rendered.contains("live000200.ts"));
+    }
+
+    /// EXT-X-DISCONTINUITY-SEQUENCE does not go backwards across a re-anchor,
+    /// which rfc8216bis 6.2.1 forbids between reloads of the same playlist.
+    ///
+    /// A 2026-08-14 audit rated it MEDIUM that `reconcile`'s re-anchor sets
+    /// `head_discontinuity_sequence` back to zero while the media sequence
+    /// jumps forward. The field really is zeroed, but it is not what gets
+    /// published: `render` emits that base PLUS the discontinuities inside the
+    /// window it is serving, so zeroing the base alone does not move the
+    /// published number. Driven through the audit's own scenario the counter
+    /// holds at 3 while the media sequence climbs 0 -> 400.
+    ///
+    /// Kept as the guard the finding implied, since the invariant is real even
+    /// though the defect was not: this fails if any change makes the published
+    /// value decrease.
+    #[test]
+    fn a_reanchor_never_sends_the_discontinuity_sequence_backwards() {
+        let mut session = SessionPlaylist::default();
+
+        // three items, so the composed history carries discontinuities and the
+        // head accumulates a non-zero count as it walks past them
+        let old = PlaylistSidecar {
+            segments: (0..12i64)
+                .map(|i| {
+                    let at = i * 4;
+                    let item = match at {
+                        at if at < 16 => "a",
+                        at if at < 32 => "b",
+                        _ => "c",
+                    };
+                    seg(
+                        &format!("live{i:06}.ts"),
+                        item,
+                        at,
+                        at == 0 || at == 16 || at == 32,
+                    )
+                })
+                .collect(),
+            pipelines: vec![
+                pipeline("a", 0, false),
+                pipeline("b", 16_000, false),
+                pipeline("c", 32_000, false),
+            ],
+        };
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200);
+        let before = session.advance_and_render(&old, None, "variants/x/", Some(11), now, 4, |s| {
+            s.to_owned()
+        });
+        let ds_before = discontinuity_sequence_of(&before);
+        let ms_before = media_sequence_of(&before);
+
+        // the sidecar now holds only far newer segments, so the position this
+        // session still needs can never arrive and it re-anchors
+        let current = PlaylistSidecar {
+            segments: vec![
+                seg("live000400.ts", "d", 1600, true),
+                seg("live000401.ts", "d", 1604, false),
+            ],
+            pipelines: vec![pipeline("d", 1_600_000, false)],
+        };
+        let later = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1620);
+        let after =
+            session.advance_and_render(&current, None, "variants/x/", Some(401), later, 4, |s| {
+                s.to_owned()
+            });
+        let ds_after = discontinuity_sequence_of(&after);
+        let ms_after = media_sequence_of(&after);
+
+        assert!(
+            ms_after > ms_before,
+            "the media sequence must move forward across a re-anchor: {ms_before} -> {ms_after}"
+        );
+        assert!(
+            ds_before > 0,
+            "the session needs a non-zero discontinuity count for this to prove anything"
+        );
+        assert!(
+            ds_after >= ds_before,
+            "the discontinuity sequence went backwards, {ds_before} -> {ds_after}, \
+             while the media sequence went {ms_before} -> {ms_after}. \
+             rfc8216bis 6.2.1 forbids it"
+        );
+    }
+
+    fn media_sequence_of(playlist: &str) -> u64 {
+        tag_value(playlist, "#EXT-X-MEDIA-SEQUENCE:")
+    }
+
+    fn discontinuity_sequence_of(playlist: &str) -> u64 {
+        tag_value(playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:")
+    }
+
+    fn tag_value(playlist: &str, tag: &str) -> u64 {
+        playlist
+            .lines()
+            .find_map(|l| l.strip_prefix(tag))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{tag} missing from playlist:\n{playlist}"))
     }
 
     /// The variant's own playlist trims its history during a window longer
