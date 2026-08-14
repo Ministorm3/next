@@ -434,14 +434,6 @@ impl ChannelSession {
         let join_offset_ms = shared_join_offset_ms(item_duration_ms, shared_duration_ms);
         let anchor = item.start + time::Duration::milliseconds(join_offset_ms as i64);
 
-        self.transcoded_until =
-            (anchor + time::Duration::milliseconds(progress_ms as i64)).min(item.finish);
-        self.state = if progress_ms == 0 {
-            ChannelSessionState::ZeroAndRealtime
-        } else {
-            ChannelSessionState::SeekAndRealtime
-        };
-
         // a live source starts producing on connect, so a variant spawned
         // with lead time must not open it before the position its output
         // claims: connecting early would shift the content off the envelope.
@@ -453,6 +445,27 @@ impl ChannelSession {
         .iter()
         .flatten()
         .any(source_is_live);
+
+        // and by the same token it must not claim a position the wall clock
+        // has already passed: a cohort that tuned in mid-window, or a shared
+        // session that reached the item late, would otherwise order a variant
+        // at position 0 for an item the composer is already deep into
+        let progress_ms = variant_start_progress_ms(
+            progress_ms,
+            anchor,
+            OffsetDateTime::now_local()? + self.start_time_offset,
+            item.finish,
+            live_item,
+        );
+
+        self.transcoded_until =
+            (anchor + time::Duration::milliseconds(progress_ms as i64)).min(item.finish);
+        self.state = if progress_ms == 0 {
+            ChannelSessionState::ZeroAndRealtime
+        } else {
+            ChannelSessionState::SeekAndRealtime
+        };
+
         if live_item {
             let wait_tn = self.timeout_notify.clone();
             loop {
@@ -2211,6 +2224,45 @@ fn shared_join_offset_ms(item_duration_ms: u64, shared_duration_ms: u64) -> u64 
     item_duration_ms.saturating_sub(shared_duration_ms)
 }
 
+/// The envelope position a variant's output may honestly claim when it opens.
+///
+/// A live source produces from the instant it connects, so a variant opening
+/// at wall time `now` is carrying content for position `now - anchor`,
+/// whatever it was spawned believing. Claiming an earlier position does not
+/// move the content back. It only makes the composer demand a twin index this
+/// worker will not reach for exactly that distance, and both sides then
+/// advance at 1x so the gap never closes; the cohort is served shared for the
+/// rest of the window. See the composer's
+/// `the_join_is_the_displacement_between_the_two_axes`, which pins that the
+/// join is precisely this distance.
+///
+/// SCHEDULE DERIVED, deliberately. `anchor` is the item's authored start plus
+/// the declared join offset, and `now` is the wall clock; no measured
+/// presentation timestamp takes part. That keeps `transcoded_until` out from
+/// under measurement, which is the rule that closed PR #187. Nor can it seek:
+/// `input_timing` forces a live item's `in_point` to zero before the state
+/// this progress selects is ever consulted.
+///
+/// A variant that opens at or before its anchor keeps exactly what it was
+/// given, so a cohort present from the item's start is unaffected.
+fn variant_start_progress_ms(
+    spawned_progress_ms: u64,
+    anchor: OffsetDateTime,
+    now: OffsetDateTime,
+    item_finish: OffsetDateTime,
+    live: bool,
+) -> u64 {
+    // a file source seeks, so where it opens says nothing about which
+    // position it will emit
+    if !live {
+        return spawned_progress_ms;
+    }
+
+    let elapsed_ms = (now - anchor).whole_milliseconds().max(0) as u64;
+    let envelope_ms = (item_finish - anchor).whole_milliseconds().max(0) as u64;
+    spawned_progress_ms.max(elapsed_ms).min(envelope_ms)
+}
+
 /// An explicit out_point may narrow what an item plays from its source, but
 /// must never widen it past the item's scheduled slot. Emitted media is
 /// appended to one continuous timeline with no later reconciliation against
@@ -2686,6 +2738,110 @@ mod tests {
     #[test]
     fn a_shared_session_that_started_the_item_has_no_join_offset() {
         assert_eq!(shared_join_offset_ms(113_000, 113_000), 0);
+    }
+
+    /// A 103000ms templated window, the shape every cohort variant runs in.
+    fn window() -> (OffsetDateTime, OffsetDateTime) {
+        let anchor = OffsetDateTime::UNIX_EPOCH;
+        (anchor, anchor + time::Duration::seconds(103))
+    }
+
+    /// THE REGRESSION GUARD for ordering a variant at the position the wall
+    /// clock has reached. A cohort that is present when the item starts must
+    /// be completely unaffected, and that is the case every healthy
+    /// substitution takes: 135 of 135 measured on 2026-08-14 joined at 0.
+    ///
+    /// Both directions matter. Spawned early, the variant waits out the
+    /// air-lock and still opens at its anchor, so nothing moves. Spawned
+    /// exactly at the anchor, likewise.
+    #[test]
+    fn a_variant_that_opens_on_time_keeps_the_progress_it_was_given() {
+        let (anchor, finish) = window();
+
+        for lead in [0i64, 1, 30, 45] {
+            let now = anchor - time::Duration::seconds(lead);
+            assert_eq!(
+                variant_start_progress_ms(0, anchor, now, finish, true),
+                0,
+                "a variant opening {lead}s before its anchor claims the item start"
+            );
+        }
+
+        // and a non-zero progress handed down for a genuine mid-item shared
+        // join is passed through untouched
+        assert_eq!(
+            variant_start_progress_ms(20_000, anchor, anchor, finish, true),
+            20_000
+        );
+    }
+
+    /// A cohort that tuned in partway through the window, or a shared session
+    /// that reached the item late, opens against a wall clock already inside
+    /// the envelope. ch11 item 12206607 on 2026-08-12: cohort 'zip=90210'
+    /// spawned at 21:31:02, about 59s into a window that began airing at
+    /// 21:30:03, and its variant claimed position 0 while the composer was
+    /// demanding 60000ms.
+    #[test]
+    fn a_live_variant_opening_late_claims_where_the_wall_clock_stands() {
+        let (anchor, finish) = window();
+
+        assert_eq!(
+            variant_start_progress_ms(
+                0,
+                anchor,
+                anchor + time::Duration::seconds(59),
+                finish,
+                true
+            ),
+            59_000
+        );
+
+        // it never moves backwards: a larger declared progress wins
+        assert_eq!(
+            variant_start_progress_ms(
+                80_000,
+                anchor,
+                anchor + time::Duration::seconds(59),
+                finish,
+                true
+            ),
+            80_000
+        );
+    }
+
+    /// A file source seeks, so where it opens says nothing about which
+    /// position it emits, and the wall clock must not touch it.
+    #[test]
+    fn a_file_variant_is_never_moved_by_the_wall_clock() {
+        let (anchor, finish) = window();
+        assert_eq!(
+            variant_start_progress_ms(
+                0,
+                anchor,
+                anchor + time::Duration::seconds(59),
+                finish,
+                false
+            ),
+            0
+        );
+    }
+
+    /// Past the end of the envelope there is nothing left to substitute, so
+    /// the claim saturates rather than running past the window. This is what
+    /// makes the caller's skip guard reachable for a slate window at all.
+    #[test]
+    fn a_late_open_cannot_claim_past_the_envelope() {
+        let (anchor, finish) = window();
+        assert_eq!(
+            variant_start_progress_ms(
+                0,
+                anchor,
+                anchor + time::Duration::seconds(500),
+                finish,
+                true
+            ),
+            103_000
+        );
     }
 
     #[test]
