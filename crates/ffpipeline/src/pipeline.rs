@@ -550,24 +550,9 @@ impl Pipeline {
                     graphics_input.layer_index,
                 ));
             };
-            // DELIBERATE DIVERGENCE from upstream #211, which drops `-loop 1`
-            // and `-t` for a still image so decode and scale run once rather
-            // than once per output frame, and lets the overlay's repeatlast
-            // hold the frame.
-            //
-            // The fork keeps the loop and the clamp because they are load
-            // bearing here for a reason that is not about overlays. A still
-            // image input running the item's full `-t` is what holds a
-            // pipeline open past a video stream that ends early, and that is
-            // measured: ch13 carries a watermark on every item and its worst
-            // item drifts -19ms, while ch11 carries none and the same library
-            // file costs it -476ms per airing. Taking upstream's version here
-            // would re-expose ch13 to a drift defect that is currently at
-            // zero, bundled invisibly into a merge.
-            //
-            // Revisit deliberately, with a drift measurement, not as part of
-            // a merge. The `-f image2` pin is orthogonal and survives either
-            // way.
+            // upstream inlines these branches; the fork keeps them in
+            // `watermark_input_args` only so its `-f image2` pin has a home.
+            // The branch contents follow upstream, #211 included
             let extra_input_args = watermark_input_args(
                 graphics_stream,
                 &output_context.media_frame_rate.r_frame_rate,
@@ -1008,26 +993,24 @@ fn loop_input_args(loop_when_exhausted: bool) -> ArgVec {
 /// Still images pin `-f image2`. Without it ffmpeg probes the file and picks a
 /// `*_pipe` demuxer, which reads the input as a stream of concatenated images
 /// rather than one image. Anything the decoder cannot consume as a complete
-/// image is then treated as the start of the next one, and under `-loop 1` that
-/// is retried forever, so the watermark input never yields a frame and the
-/// filter graph starves. Legacy stores channel artwork hash-named with no
-/// extension, so there is no filename for ffmpeg to infer the format from.
+/// image is then treated as the start of the next one, so the watermark input
+/// never yields a usable frame and the filter graph starves. Legacy stores
+/// channel artwork hash-named with no extension, so there is no filename for
+/// ffmpeg to infer the format from. This pin is the fork's only addition here
+/// and is a candidate to send upstream.
+///
+/// Everything else follows upstream. Since #211 a still image is decoded as a
+/// single frame rather than looped for the item's duration, so decode and
+/// scale run once instead of once per output frame; the overlay's repeatlast
+/// holds the frame, and a LoopFilter is added after scaling only when fades
+/// need real timestamps.
 fn watermark_input_args(
     watermark_stream: &ProbeResultVideoStream,
     frame_rate: &str,
     duration: Duration,
 ) -> ArgVec {
     if watermark_stream.is_still_image() {
-        args![
-            "-f",
-            "image2",
-            "-loop",
-            "1",
-            "-framerate",
-            frame_rate.to_owned(),
-            "-t",
-            format!("{}ms", duration.as_millis())
-        ]
+        args!["-f", "image2", "-framerate", frame_rate.to_owned()]
     } else if watermark_stream.codec == "gif" || watermark_stream.codec == "apng" {
         args![
             "-ignore_loop",
@@ -1281,12 +1264,22 @@ mod tests {
                 has_pair(&args, "-f", "image2"),
                 "{codec} watermark must pin -f image2, got {args:?}"
             );
-            assert!(has_pair(&args, "-loop", "1"), "{codec} must loop");
             assert!(
                 has_pair(&args, "-framerate", "24000/1001"),
                 "{codec} must carry the output frame rate"
             );
-            assert!(has_pair(&args, "-t", "44000ms"), "{codec} must be bounded");
+
+            // upstream #211: a still image is decoded once and repeated after
+            // scaling, so the input is no longer looped or bounded. Only the
+            // demuxer pin is the fork's to assert here
+            assert!(
+                !args.iter().any(|a| a.as_ref() == "-loop"),
+                "{codec} must not loop at the input since #211, got {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a.as_ref() == "-t"),
+                "{codec} must not bound the input since #211, got {args:?}"
+            );
         }
     }
 
