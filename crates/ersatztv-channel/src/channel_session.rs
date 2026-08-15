@@ -450,13 +450,34 @@ impl ChannelSession {
         // has already passed: a cohort that tuned in mid-window, or a shared
         // session that reached the item late, would otherwise order a variant
         // at position 0 for an item the composer is already deep into
+        let spawned_progress_ms = progress_ms;
         let progress_ms = variant_start_progress_ms(
-            progress_ms,
+            spawned_progress_ms,
             anchor,
             OffsetDateTime::now_local()? + self.start_time_offset,
             item.finish,
             live_item,
         );
+
+        // the spawn line in variant_manager reports the progress this worker
+        // was ORDERED with, which is not what it ends up claiming once the
+        // clock has moved. Reading a join off that line alone is how a
+        // misdiagnosis starts, so say where the claim actually landed
+        if progress_ms != spawned_progress_ms {
+            let envelope_ms = (item.finish - anchor).whole_milliseconds().max(0) as u64;
+            if progress_ms >= envelope_ms {
+                log::info!(
+                    "variant for item {item_id} opened past its {envelope_ms}ms envelope; \
+                     there is nothing left to substitute, so no transcode is started"
+                );
+            } else {
+                log::info!(
+                    "variant for item {item_id} opened {progress_ms}ms into its {envelope_ms}ms \
+                     envelope and claims that position, not the {spawned_progress_ms}ms it was \
+                     spawned with"
+                );
+            }
+        }
 
         self.transcoded_until =
             (anchor + time::Duration::milliseconds(progress_ms as i64)).min(item.finish);
@@ -2836,20 +2857,33 @@ mod tests {
     }
 
     /// Past the end of the envelope there is nothing left to substitute, so
-    /// the claim saturates rather than running past the window. This is what
-    /// makes the caller's skip guard reachable for a slate window at all.
+    /// the claim saturates rather than running past the window.
+    ///
+    /// That saturation is what stops the wasted encode. `run_variant` sets
+    /// `transcoded_until` to `(anchor + progress).min(item.finish)` and then
+    /// loops `while transcoded_until < item.finish`, so a claim that reaches
+    /// the envelope leaves the loop with nothing to do and no ffmpeg is
+    /// started at all. On 2026-08-12 item 12206607 a full 105s GPU encode ran
+    /// to completion and was discarded because the variant was ordered at
+    /// position 0 for a window the cohort had almost entirely missed.
     #[test]
     fn a_late_open_cannot_claim_past_the_envelope() {
         let (anchor, finish) = window();
+        let progress = variant_start_progress_ms(
+            0,
+            anchor,
+            anchor + time::Duration::seconds(500),
+            finish,
+            true,
+        );
+        assert_eq!(progress, 103_000);
+
+        // the consequence: transcoded_until lands exactly on the item's
+        // finish, so the transcode loop never runs
+        let transcoded_until = (anchor + time::Duration::milliseconds(progress as i64)).min(finish);
         assert_eq!(
-            variant_start_progress_ms(
-                0,
-                anchor,
-                anchor + time::Duration::seconds(500),
-                finish,
-                true
-            ),
-            103_000
+            transcoded_until, finish,
+            "a variant with nothing left to cover must start no encode"
         );
     }
 
