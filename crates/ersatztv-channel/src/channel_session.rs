@@ -370,25 +370,11 @@ impl ChannelSession {
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
                 // filling a schedule gap with black is normal; log it so black
                 // air is explainable
-                match next_start {
-                    Some(start) => {
-                        let gap = start - self.transcoded_until;
-                        log::debug!(
-                            "no playout item covers {}; filling with black/silence for {}m {}s until the next item",
-                            self.transcoded_until,
-                            gap.whole_minutes(),
-                            gap.whole_seconds() % 60
-                        );
-                    }
-                    None => log::debug!(
-                        "no playout item covers {} and none is scheduled after it; filling with black/silence",
-                        self.transcoded_until
-                    ),
-                }
+                log::debug!("{}", no_item_message(self.transcoded_until, next_start));
                 self.fake_playout_item(next_start)
             }
             Err(err) => {
-                log::error!("{}", err);
+                log::error!("{}", item_unselectable_message(self.transcoded_until, &err));
                 self.fake_playout_item(None)
             }
         };
@@ -405,7 +391,7 @@ impl ChannelSession {
             Err(e @ ChannelError::Stalled(_)) => return Err(e),
             Err(e) if troubleshoot => return Err(e),
             Err(e) => {
-                log::error!("item failed, replacing with black/silence: {e}");
+                log::error!("{}", item_failed_message(&current_item, &e));
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
                 self.transcode_item(&fake_item, realtime, troubleshoot, pts_duration)
                     .await?
@@ -1329,6 +1315,32 @@ impl ChannelSession {
     }
 }
 
+/// The three ways a slot airs black, worded so one grep for
+/// `replacing with black/silence` is a complete census and each line names
+/// the slot it lost. They are separate faults with separate remedies: a
+/// schedule gap is expected, an unreadable playout and a failed transcode
+/// are not.
+fn no_item_message(at: OffsetDateTime, next_start: Option<OffsetDateTime>) -> String {
+    format!(
+        "no playout item covers {at}, replacing with black/silence until {}",
+        next_start.map_or_else(
+            || String::from("the next reload"),
+            |start| start.to_string()
+        )
+    )
+}
+
+fn item_unselectable_message(at: OffsetDateTime, error: &ChannelError) -> String {
+    format!("no item could be selected for {at}, replacing with black/silence: {error}")
+}
+
+fn item_failed_message(item: &PlayoutItem, error: &ChannelError) -> String {
+    format!(
+        "item {} ({} .. {}) failed, replacing with black/silence: {error}",
+        item.id, item.start, item.finish
+    )
+}
+
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
     match value {
         WatermarkLocation::TopLeft => ffpipeline::input::WatermarkLocation::TopLeft,
@@ -1446,5 +1458,60 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One grep has to find every black-air line, and each has to say which
+    /// slot it lost: 144 anonymous lines cannot be told apart from one slot
+    /// failing 144 times.
+    #[test]
+    fn every_black_air_line_names_its_slot_and_shares_one_phrase() {
+        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
+            "id": "item-12345",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:00:11.021-04:00",
+            "source": { "source_type": "local", "path": "/media/item.mp4" }
+        }))
+        .expect("a local file item deserializes");
+        let at = item.start;
+
+        let messages = [
+            no_item_message(at, Some(item.finish)),
+            item_unselectable_message(at, &ChannelError::CaptureFFmpegStderrFailure),
+            item_failed_message(&item, &ChannelError::CaptureFFmpegStderrFailure),
+        ];
+
+        for message in &messages {
+            assert!(
+                message.contains("replacing with black/silence"),
+                "black-air line is not greppable: {message}"
+            );
+        }
+
+        assert!(messages[0].contains(&at.to_string()));
+        assert!(messages[0].contains(&item.finish.to_string()));
+        assert!(messages[1].contains(&at.to_string()));
+        assert!(messages[2].contains(&item.id));
+        assert!(messages[2].contains(&item.start.to_string()));
+        assert!(messages[2].contains(&item.finish.to_string()));
+    }
+
+    /// A gap with nothing scheduled after it still says when it can end:
+    /// the playout is reloaded, so black air lasts at most until then.
+    #[test]
+    fn an_open_ended_gap_names_the_reload_as_its_bound() {
+        let at = OffsetDateTime::parse(
+            "2026-08-15T12:00:00.000-04:00",
+            &time::format_description::well_known::Iso8601::DEFAULT,
+        )
+        .unwrap();
+
+        let message = no_item_message(at, None);
+        assert!(message.contains("replacing with black/silence"));
+        assert!(message.contains("until the next reload"));
     }
 }
