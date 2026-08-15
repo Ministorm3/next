@@ -1400,14 +1400,13 @@ impl ChannelSession {
             _ => 0,
         };
 
-        // live content never seeks and is always a complete transcode; a
-        // session joining mid-item covers only the remainder, so its output
-        // stays inside the item's PTS envelope
+        // live content never seeks. limit it to the remaining schedule interval
+        // so pipeline duration and graphics timing end at the same point.
         if is_live {
             let live_now = if start_at_zero {
                 item_start
             } else {
-                transcoded_until.clamp(item_start, item_finish)
+                transcoded_until
             };
             let remaining = item_finish - live_now;
 
