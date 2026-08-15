@@ -967,45 +967,35 @@ impl ChannelSession {
                 troubleshoot,
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
-            // A templated item may be transcoded in parallel by variant
-            // sessions with different query values; padding both transcodes to
-            // the -t clamp keeps their PTS envelopes identical, so one can be
-            // substituted for the other at the playlist layer.
+            // Two jobs. A templated item may be transcoded in parallel by
+            // variant sessions with different query values; padding both
+            // transcodes to the -t clamp keeps their PTS envelopes identical,
+            // so one can be substituted for the other at the playlist layer.
             //
-            // THIS WAS UNCONDITIONAL FOR ELEVEN HOURS ON 2026-08-14 AND IS
-            // REVERTED. Do not set it everywhere again without reading this.
+            // Every other item needs it too. A file whose video stream ends
+            // before its container does books more slot than the video can
+            // fill, and the shortfall is lost permanently because
+            // last_segment_end only advances by emitted EXTINF; about 20% of
+            // the bumps library is built that way. ch13 had looked immune only
+            // because its watermark input was looped and clamped to the item's
+            // -t, which incidentally held the pipeline open; upstream #211
+            // made a still image a single frame, so that masking is gone.
             //
-            // The reasoning was sound and the bench measurement held up. A file
-            // whose video stream ends before its container does books more slot
-            // than the video can fill, and the shortfall is lost permanently
-            // because last_segment_end only advances by emitted EXTINF; about
-            // 20% of the bumps library is built that way. ch13 had looked
-            // immune only because its watermark input was looped and clamped to
-            // the item's -t, which incidentally held the pipeline open, and
-            // upstream #211 made a still image a single frame so that masking
-            // went away. On the production hardware in the production pipeline
-            // shape, /bumps/logo/Philips LaserVision went from 261 frames and
-            // 10.42s of output to 273 frames and 10.90s, recovering the whole
-            // ~480ms shortfall for 0.04s of wall clock.
-            //
-            // IN PRODUCTION IT RAN THE TIMELINE LONG INSTEAD. Drift is
-            // `first_segment_pdt - scheduled_start`, and on ch11 it went:
-            //   before padding  19:51-21:19  mean    +4ms  max    +36ms
-            //   padding in      21:19-22:22  mean  +175ms  max   +414ms
-            //                   00:00-04:00  mean +1811ms  max  +2782ms
-            //                   08:00-10:16  mean +5591ms  max  +6118ms
-            // Monotonic, about +500ms per hour, starting exactly at the deploy.
-            // That is the OPPOSITE sign from the defect it was meant to fix and
-            // roughly twenty times faster: the old shortfall reached -5.2s over
-            // three days, this reached +6.1s in twelve hours.
-            //
-            // The mechanism is NOT understood. The bench showed tpad
-            // UNDERSHOOTING its slot (10.90s of 11.021s), so whatever makes
-            // every item emit slightly long in production was not reproduced
-            // there. Find that before trying again, and watch drift within the
-            // first hour rather than overnight: the slope was already visible
-            // at +175ms in the first sixty minutes.
-            pad_to_duration: is_templated,
+            // Unconditional padding alone RAN THE TIMELINE LONG at +531ms/hour
+            // (2026-08-14 overnight, reverted that morning): with tpad the
+            // video never reaches EOF, so the -t cut decides the emitted
+            // duration, and that cut is frame-quantized UPWARD because the
+            // frame straddling it is emitted whole. Every item whose slot is
+            // not frame-aligned emits ceil(slot * fps) / fps, up to one frame
+            // long, verified per-item against the drift meter to 0.2ms mean
+            // error. The emission trim (emission_trim_ms, applied to this
+            // pipeline's timings further down) is what makes this flag safe: it
+            // measures the accumulated stamp-clock error and hands it back on
+            // the next pipeline's -t, so the quantization can no longer
+            // integrate. Do not set this to a condition again; the trim
+            // assumes every non-templated pipeline is padded, because only a
+            // padded pipeline can EXTEND to cover a negative error.
+            pad_to_duration: true,
             // Slate is not readrate-paced. The original reason recorded that a
             // padded pipeline runs below realtime when paced (0.65x live, 0.80x
             // in isolation, 3.5x unpaced), and that measurement is WITHDRAWN:
@@ -1079,6 +1069,32 @@ impl ChannelSession {
         let subtitle_timing = subtitle_source
             .as_ref()
             .map(|s| self.input_timing(current_item, s, start_at_zero, whole_window, is_live));
+
+        // measure how far the stamp clock has run past the schedule clock,
+        // and give it back on this pipeline's output duration. update()
+        // first: the previous pipeline's final segments may not have been
+        // scanned yet, and an unscanned segment would hide exactly the
+        // error this is measuring
+        let stamp_error_ms = {
+            let mut playlist_manager = self.playlist_manager.lock().await;
+            playlist_manager.update().await?;
+            (playlist_manager.last_segment_end() - self.transcoded_until).whole_milliseconds()
+                as i64
+        };
+        let pipeline_ms = std::cmp::min(
+            audio_timing.out_point.saturating_sub(audio_timing.in_point),
+            video_timing.out_point.saturating_sub(video_timing.in_point),
+        )
+        .as_millis() as u64;
+        let trim_ms = Self::emission_trim_ms(stamp_error_ms, pipeline_ms, is_templated);
+        if trim_ms != 0 {
+            log::debug!(
+                "emission trim {trim_ms}ms for item {} (stamp clock is {stamp_error_ms}ms past the schedule)",
+                current_item.id
+            );
+        }
+        let audio_timing = Self::apply_emission_trim(audio_timing, trim_ms);
+        let video_timing = Self::apply_emission_trim(video_timing, trim_ms);
 
         let video_index = current_item
             .tracks
@@ -1585,6 +1601,56 @@ impl ChannelSession {
             out_point,
             finish,
             is_complete,
+        }
+    }
+
+    /// How much of this pipeline's output duration to give back to the
+    /// schedule, in milliseconds. Positive shortens the pipeline's -t,
+    /// negative lengthens it.
+    ///
+    /// `stamp_error_ms` is `last_segment_end - transcoded_until`: the same
+    /// timeline position read on the stamp clock and on the schedule clock.
+    /// The -t cut is frame-quantized upward (the frame straddling the cut is
+    /// emitted whole), so with every pipeline padded to its clamp each item
+    /// emits up to one frame more than its slot, and the stamp clock
+    /// integrates that forever: +531ms/hour on ch11, +262ms/hour on ch13,
+    /// live on 2026-08-14/15. Handing the measured error back to the next
+    /// pipeline's output duration bounds it at about one frame instead.
+    ///
+    /// Templated items are exempt: a variant transcode must fill exactly the
+    /// envelope the shared session declares, so their -t stays a pure
+    /// function of the item. They cost nothing to exempt; their slate slots
+    /// are frame-aligned and contribute no quantization error.
+    ///
+    /// The correction is clamped so a wild clock (a failed pipeline, a
+    /// corrupted playlist) slews back over several items instead of opening
+    /// one large hole, and it never eats more than half the pipeline it is
+    /// applied to.
+    fn emission_trim_ms(stamp_error_ms: i64, pipeline_ms: u64, is_templated: bool) -> i64 {
+        const MAX_CORRECTION_MS: i64 = 500;
+        if is_templated {
+            return 0;
+        }
+        stamp_error_ms
+            .clamp(-MAX_CORRECTION_MS, MAX_CORRECTION_MS)
+            .min((pipeline_ms / 2) as i64)
+    }
+
+    /// Applies an emission trim to one input's timing. Only the emitted
+    /// duration moves: `in_point` (where reading starts) and `finish` (how
+    /// far the schedule advances) are schedule-derived and stay untouched,
+    /// which is what keeps this on the right side of the PR #187 line.
+    fn apply_emission_trim(timing: TimingResult, trim_ms: i64) -> TimingResult {
+        let out_point = if trim_ms >= 0 {
+            timing
+                .out_point
+                .saturating_sub(Duration::from_millis(trim_ms as u64))
+        } else {
+            timing.out_point + Duration::from_millis(trim_ms.unsigned_abs())
+        };
+        TimingResult {
+            out_point,
+            ..timing
         }
     }
 
@@ -2435,6 +2501,77 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The steady state the trim exists for: each padded item overshoots its
+    /// slot by up to one frame, and the whole accumulated error comes back on
+    /// the very next pipeline.
+    #[test]
+    fn a_small_stamp_clock_error_is_returned_in_full() {
+        assert_eq!(ChannelSession::emission_trim_ms(27, 11_021, false), 27);
+        assert_eq!(ChannelSession::emission_trim_ms(-31, 11_021, false), -31);
+        assert_eq!(ChannelSession::emission_trim_ms(0, 11_021, false), 0);
+    }
+
+    /// A wild clock slews back over several items rather than opening one
+    /// large hole in a single pipeline.
+    #[test]
+    fn a_large_stamp_clock_error_is_clamped_in_both_directions() {
+        assert_eq!(ChannelSession::emission_trim_ms(6_500, 60_000, false), 500);
+        assert_eq!(
+            ChannelSession::emission_trim_ms(-6_500, 60_000, false),
+            -500
+        );
+    }
+
+    /// A short pipeline gives back at most half of itself, so a bump can
+    /// never be trimmed into nothing.
+    #[test]
+    fn a_trim_never_eats_more_than_half_the_pipeline() {
+        assert_eq!(ChannelSession::emission_trim_ms(400, 600, false), 300);
+    }
+
+    /// A variant transcode must fill exactly the envelope the shared session
+    /// declares, so a templated item's -t stays a pure function of the item.
+    #[test]
+    fn a_templated_item_is_never_trimmed() {
+        assert_eq!(ChannelSession::emission_trim_ms(400, 103_000, true), 0);
+    }
+
+    /// Only the emitted duration moves. `in_point` is where reading starts
+    /// and `finish` is how far the schedule advances; a trim that touched
+    /// either would be a measurement driving a seek, the PR #187 pattern.
+    #[test]
+    fn a_trim_moves_only_the_out_point() {
+        let finish = OffsetDateTime::parse(
+            "2026-08-15T12:00:11.021-04:00",
+            &time::format_description::well_known::Iso8601::DEFAULT,
+        )
+        .unwrap();
+        let timing = TimingResult {
+            in_point: Duration::from_millis(2_000),
+            out_point: Duration::from_millis(13_021),
+            finish,
+            is_complete: true,
+        };
+
+        let trimmed = ChannelSession::apply_emission_trim(timing, 27);
+        assert_eq!(trimmed.in_point, Duration::from_millis(2_000));
+        assert_eq!(trimmed.out_point, Duration::from_millis(12_994));
+        assert_eq!(trimmed.finish, finish);
+        assert!(trimmed.is_complete);
+
+        let extended = ChannelSession::apply_emission_trim(
+            TimingResult {
+                in_point: Duration::from_millis(2_000),
+                out_point: Duration::from_millis(13_021),
+                finish,
+                is_complete: true,
+            },
+            -40,
+        );
+        assert_eq!(extended.in_point, Duration::from_millis(2_000));
+        assert_eq!(extended.out_point, Duration::from_millis(13_061));
+    }
 
     /// What a variant ends up producing, given the item and what the shared
     /// session declared and has published so far. Mirrors what `run_variant`
