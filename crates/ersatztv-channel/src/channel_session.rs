@@ -946,11 +946,36 @@ impl ChannelSession {
                 troubleshoot,
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
-            // a templated item may be transcoded in parallel by variant
+            // Two jobs, and the second is why this is unconditional.
+            //
+            // A templated item may be transcoded in parallel by variant
             // sessions with different query values; padding both transcodes to
             // the -t clamp keeps their PTS envelopes identical, so one can be
-            // substituted for the other at the playlist layer
-            pad_to_duration: is_templated,
+            // substituted for the other at the playlist layer.
+            //
+            // Every other item needs it too. A file whose video stream ends
+            // before its container does books more slot than the video can
+            // fill, and the shortfall is lost permanently because
+            // last_segment_end only advances by emitted EXTINF. About 20% of
+            // the bumps library is built that way. ch13 appeared immune only
+            // because its watermark input was looped and clamped to the item's
+            // -t, which incidentally held the pipeline open; upstream #211
+            // makes a still image a single frame, so that masking is gone and
+            // ch13 now drifts like every other channel.
+            //
+            // Measured on this file, on the production hardware, in the
+            // production pipeline shape (cuda decode, scale_cuda, overlay_cuda,
+            // nvenc, readrate 1.0), /bumps/logo/Philips LaserVision:
+            //   no tpad    261 frames  10.42s out  1.02x  elapsed 10.21s
+            //   with tpad  273 frames  10.90s out  1.06x  elapsed 10.25s
+            // so it recovers the whole ~480ms shortfall for 0.04s of wall time.
+            //
+            // The comment below records 0.65x for a padded pipeline under
+            // readrate pacing, which is why slate turns pacing off. That did
+            // not reproduce in either measurement above and is left in place
+            // for slate on its own terms; if throughput ever regresses, this
+            // flag is the first thing to look at.
+            pad_to_duration: true,
             // slate is never readrate-paced: pacing this padded pipeline runs
             // measurably BELOW realtime on real hardware (0.65x live, 0.80x
             // in isolation, 3.5x unpaced on the same box), which starves the

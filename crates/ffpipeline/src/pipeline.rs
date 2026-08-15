@@ -1089,6 +1089,16 @@ mod tests {
         loops: bool,
         graphics_inputs: Vec<GraphicsInput>,
     ) -> ArgVec {
+        slate_pipeline_args_full(media, window, loops, graphics_inputs, true)
+    }
+
+    fn slate_pipeline_args_full(
+        media: Duration,
+        window: Duration,
+        loops: bool,
+        graphics_inputs: Vec<GraphicsInput>,
+        pad_to_duration: bool,
+    ) -> ArgVec {
         let probe = slate_probe(media);
         let input_source = InputSource::Local(LocalInputSource {
             path: String::from(SLATE_PATH),
@@ -1136,7 +1146,7 @@ mod tests {
                 troubleshoot: false,
             },
             pts_offset: None,
-            pad_to_duration: true,
+            pad_to_duration,
             realtime: false,
             is_live: false,
             frame_rate: None,
@@ -1323,6 +1333,54 @@ mod tests {
         assert!(
             has_pair(&args, "-f", "image2"),
             "the built pipeline must pin -f image2 for a still image layer, got {args:?}"
+        );
+    }
+
+    /// `pad_to_duration` fills a source whose video stream ends before its
+    /// container does, and since 2026-08-14 every item carries it rather than
+    /// only templated ones.
+    ///
+    /// ch13 looked immune to that shortfall for months, but only because its
+    /// watermark input was looped and clamped to the item's `-t`, which
+    /// incidentally held the pipeline open past the short video. Upstream #211
+    /// makes a still image a single frame, so the masking is gone and the
+    /// defect is visible on every channel. Measured on
+    /// /bumps/logo/Philips LaserVision (video 10.560s inside an 11.021s
+    /// container), in the production pipeline shape and readrate paced:
+    ///
+    ///   no tpad    261 frames  10.42s out  1.02x  elapsed 10.21s
+    ///   with tpad  273 frames  10.90s out  1.06x  elapsed 10.25s
+    ///
+    /// so the pad recovers the whole shortfall for 0.04s of wall clock. That
+    /// also refutes the 0.65x figure recorded beside the slate pacing flag, at
+    /// least for this shape.
+    ///
+    /// This guards the wiring rather than the arithmetic: the flag has to
+    /// reach the filter chain, and nothing else in these tests would notice if
+    /// it stopped.
+    #[test]
+    fn padding_to_duration_puts_tpad_in_the_chain() {
+        let build = |pad: bool| {
+            slate_pipeline_args_full(
+                Duration::from_secs(15),
+                Duration::from_secs(103),
+                true,
+                Vec::new(),
+                pad,
+            )
+        };
+        let has_tpad = |args: &ArgVec| args.iter().any(|a| a.as_ref().contains("tpad="));
+
+        let padded = build(true);
+        let unpadded = build(false);
+
+        assert!(
+            has_tpad(&padded),
+            "a padded pipeline must carry tpad, got {padded:?}"
+        );
+        assert!(
+            !has_tpad(&unpadded),
+            "an unpadded pipeline must not, got {unpadded:?}"
         );
     }
 
