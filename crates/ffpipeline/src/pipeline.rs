@@ -551,7 +551,7 @@ impl Pipeline {
                 ));
             };
             // upstream inlines these branches; the fork keeps them in
-            // `watermark_input_args` only so its `-f image2` pin has a home.
+            // `watermark_input_args` so the demuxer decision stays testable.
             // The branch contents follow upstream, #211 included
             let extra_input_args = watermark_input_args(
                 graphics_stream,
@@ -990,27 +990,25 @@ fn loop_input_args(loop_when_exhausted: bool) -> ArgVec {
 
 /// Input arguments for a watermark, chosen by how the watermark decodes.
 ///
-/// Still images pin `-f image2`. Without it ffmpeg probes the file and picks a
-/// `*_pipe` demuxer, which reads the input as a stream of concatenated images
-/// rather than one image. Anything the decoder cannot consume as a complete
-/// image is then treated as the start of the next one, so the watermark input
-/// never yields a usable frame and the filter graph starves. Legacy stores
-/// channel artwork hash-named with no extension, so there is no filename for
-/// ffmpeg to infer the format from. This pin is the fork's only addition here
-/// and is a candidate to send upstream.
+/// Every branch follows upstream. The fork's `-f image2` pin for still
+/// images (extensionless cached artwork probes as a fragile `*_pipe`
+/// demuxer, and one malformed chunk then starves the filter graph) was
+/// separated out to the standalone branch fix/still-image-watermark-demuxer
+/// pending upstream review; it returns here when that lands upstream. Until
+/// then a corrupt cached logo can take its item down again, the pre-pin
+/// behavior this fork lived with before 2026-08.
 ///
-/// Everything else follows upstream. Since #211 a still image is decoded as a
-/// single frame rather than looped for the item's duration, so decode and
-/// scale run once instead of once per output frame; the overlay's repeatlast
-/// holds the frame, and a LoopFilter is added after scaling only when fades
-/// need real timestamps.
+/// Since #211 a still image is decoded as a single frame rather than looped
+/// for the item's duration, so decode and scale run once instead of once
+/// per output frame; the overlay's repeatlast holds the frame, and a
+/// LoopFilter is added after scaling only when fades need real timestamps.
 fn watermark_input_args(
     watermark_stream: &ProbeResultVideoStream,
     frame_rate: &str,
     duration: Duration,
 ) -> ArgVec {
     if watermark_stream.is_still_image() {
-        args!["-f", "image2", "-framerate", frame_rate.to_owned()]
+        args!["-framerate", frame_rate.to_owned()]
     } else if watermark_stream.codec == "gif" || watermark_stream.codec == "apng" {
         args![
             "-ignore_loop",
@@ -1261,8 +1259,12 @@ mod tests {
             .any(|w| w[0].as_ref() == flag && w[1].as_ref() == value)
     }
 
+    /// The still-image branch follows upstream while the `-f image2` pin
+    /// waits on the standalone branch: the demuxer follows the probe, the
+    /// frame rate is declared, and since #211 the input is neither looped
+    /// nor bounded.
     #[test]
-    fn still_image_watermark_pins_the_image2_demuxer() {
+    fn still_image_watermarks_follow_the_probed_demuxer() {
         for codec in ["png", "mjpeg", "bmp", "tiff"] {
             let args = watermark_input_args(
                 &watermark_stream(codec),
@@ -1271,17 +1273,14 @@ mod tests {
             );
 
             assert!(
-                has_pair(&args, "-f", "image2"),
-                "{codec} watermark must pin -f image2, got {args:?}"
+                !args.iter().any(|a| a.as_ref() == "image2"),
+                "{codec} watermark must not pin a demuxer while the pin lives \
+                 on its own branch, got {args:?}"
             );
             assert!(
                 has_pair(&args, "-framerate", "24000/1001"),
                 "{codec} must carry the output frame rate"
             );
-
-            // upstream #211: a still image is decoded once and repeated after
-            // scaling, so the input is no longer looped or bounded. Only the
-            // demuxer pin is the fork's to assert here
             assert!(
                 !args.iter().any(|a| a.as_ref() == "-loop"),
                 "{codec} must not loop at the input since #211, got {args:?}"
@@ -1293,17 +1292,10 @@ mod tests {
         }
     }
 
-    /// The `-f image2` pin has to reach the BUILT PIPELINE, not just the
-    /// helper that formats it.
-    ///
-    /// Upstream inlines these three branches without the pin, so a merge that
-    /// takes its version wholesale drops the demuxer silently: the helper's
-    /// own tests keep passing because they call it directly, and nothing else
-    /// looked at the emitted args. Verified by mutation on the 2026-08-14
-    /// upstream merge, where inlining upstream's version failed no test at
-    /// all. This asserts the wiring rather than the formatting.
+    /// The wiring twin of the helper test above: the BUILT PIPELINE for a
+    /// still image layer carries the frame rate and no pinned demuxer.
     #[test]
-    fn a_still_image_layer_pins_image2_in_the_built_pipeline() {
+    fn a_still_image_layer_follows_the_probed_demuxer_in_the_built_pipeline() {
         let args = slate_pipeline_args_with_graphics(
             Duration::from_secs(15),
             Duration::from_secs(103),
@@ -1331,8 +1323,13 @@ mod tests {
         );
 
         assert!(
-            has_pair(&args, "-f", "image2"),
-            "the built pipeline must pin -f image2 for a still image layer, got {args:?}"
+            !args.iter().any(|a| a.as_ref() == "image2"),
+            "the built pipeline must not pin a demuxer while the pin lives \
+             on its own branch, got {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.as_ref() == "-framerate"),
+            "the still image layer must still carry the output frame rate, got {args:?}"
         );
     }
 
