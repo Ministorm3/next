@@ -540,8 +540,19 @@ impl Pipeline {
             };
             let extra_input_args = if graphics_stream.is_still_image() {
                 // decode a single frame; the loop filter below repeats it *after* scaling, so
-                // decode and scale happen once instead of once per output frame
+                // decode and scale happen once instead of once per output frame.
+                //
+                // -f image2 pins the demuxer. Without it ffmpeg probes the
+                // file and can pick a *_pipe demuxer, which reads the input as
+                // a stream of concatenated images rather than one image;
+                // anything the decoder cannot consume as a complete image is
+                // then treated as the start of the next one, the input never
+                // yields a usable frame, and the filter graph starves. The
+                // probe has nothing else to go on when artwork is stored
+                // hash-named with no file extension.
                 args![
+                    "-f",
+                    "image2",
                     "-framerate",
                     output_context.media_frame_rate.r_frame_rate.clone()
                 ]
@@ -969,7 +980,20 @@ pub fn generate_pipeline(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use time::OffsetDateTime;
+
     use super::*;
+    use crate::input::{GraphicsLocation, LocalInputSource, ProbedInput};
+    use crate::output_format::OutputFormat;
+    use crate::output_settings::{
+        AudioOutputSettings, OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions,
+    };
+    use crate::probe::{
+        CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams, ProbeResultStream,
+        ProbeResultVideoStream,
+    };
 
     #[test]
     fn device_name_returns_correct_ffmpeg_device_strings() {
@@ -983,5 +1007,153 @@ mod tests {
             Some("videotoolbox")
         );
         assert_eq!(FrameSurface::System.device_name(), None);
+    }
+
+    fn video_probe(path: &str, codec: &str, format_name: &str) -> ProbeResult {
+        ProbeResult {
+            path: String::from(path),
+            streams: vec![
+                ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+                    stream_index: 0,
+                    codec: String::from(codec),
+                    codec_type: CodecType::Video,
+                    profile: String::new(),
+                    height: Some(1080),
+                    width: Some(1920),
+                    frame_rate: FrameRate::parse("30"),
+                    sample_aspect_ratio: None,
+                    display_aspect_ratio: None,
+                    pix_fmt: String::from("yuv420p"),
+                    color_params: ProbeResultColorParams::default(),
+                    field_order: None,
+                    dv_profile: None,
+                })),
+                ProbeResultStream::Audio(ProbeResultAudioStream {
+                    stream_index: 1,
+                    codec: String::from("aac"),
+                    channels: 2,
+                }),
+            ],
+            duration: Some(Duration::from_secs(10)),
+            format_name: Some(String::from(format_name)),
+        }
+    }
+
+    /// A pipeline for a plain file item carrying one graphics layer of the
+    /// given codec, probed the way artwork with no file extension probes.
+    fn graphics_pipeline_args(layer_codec: &str, layer_format_name: &str) -> ArgVec {
+        let probe = video_probe("/media/item.mp4", "h264", "mov,mp4,m4a");
+        let input_source = InputSource::Local(LocalInputSource {
+            path: String::from("/media/item.mp4"),
+        });
+
+        let probed = |source: InputSource, probe: ProbeResult| ProbedInput {
+            input_source: source,
+            probe_result: probe,
+            in_point: Duration::ZERO,
+            out_point: Duration::from_secs(10),
+            stream_index: None,
+        };
+
+        let graphics_probe = video_probe("/artwork/1a2b3c", layer_codec, layer_format_name);
+        let graphics_input = GraphicsInput {
+            layer_index: 0,
+            input_source: InputSource::Local(LocalInputSource {
+                path: String::from("/artwork/1a2b3c"),
+            }),
+            probe_result: graphics_probe,
+            stream_index: None,
+            location: GraphicsLocation::TopLeft,
+            width_percent: None,
+            within_source_content: None,
+            horizontal_margin_percent: None,
+            vertical_margin_percent: None,
+            opacity_percent: None,
+            timing: None,
+        };
+
+        let input_settings = InputSettings {
+            start: OffsetDateTime::UNIX_EPOCH,
+            playout_offset: Duration::ZERO,
+            audio_input: probed(input_source.clone(), probe.clone()),
+            video_input: probed(input_source, probe),
+            subtitle_input: None,
+            graphics_inputs: vec![graphics_input],
+        };
+
+        let output_settings = OutputSettings {
+            audio: AudioOutputSettings {
+                format: Some(AudioFormat::Aac),
+                bitrate: Some(Kbps(192)),
+                buffer: Some(Kbps(384)),
+                channels: Some(2),
+                sample_rate: Some(Hz(48000)),
+                loudness: None,
+            },
+            video_format: Some(VideoFormat::H264),
+            bit_depth: Some(8),
+            video_bitrate: Some(Kbps(5000)),
+            video_buffer: Some(Kbps(10000)),
+            video_size: None,
+            scaling_mode: ScalingMode::ScaleAndPad,
+            filter_options: VideoFilterOptions::default(),
+            deinterlace: false,
+            accel: None,
+            format: OutputFormat::Hls {
+                playlist: String::from("/session/live.m3u8"),
+                segment_template: String::from("/session/live%05d.ts"),
+                troubleshoot: false,
+            },
+            pts_offset: None,
+            realtime: false,
+            is_live: false,
+            frame_rate: None,
+            subtitle_mode: SubtitleMode::Burn,
+            fonts_folder: None,
+            subtitle_force_style: None,
+            reports_folder: None,
+            report_id: None,
+        };
+
+        let ffmpeg_info = FfmpegInfo {
+            hwaccels: HashSet::new(),
+            video_filters: HashSet::new(),
+            preferred_filters: HashMap::new(),
+        };
+
+        let mut pipeline =
+            generate_pipeline(&ffmpeg_info, input_settings, output_settings).unwrap();
+        pipeline.optimize();
+        pipeline.args()
+    }
+
+    fn has_pair(args: &ArgVec, flag: &str, value: &str) -> bool {
+        args.windows(2)
+            .any(|w| w[0].as_ref() == flag && w[1].as_ref() == value)
+    }
+
+    /// Artwork is often stored hash-named with no file extension, so ffmpeg's
+    /// probe can pick a *_pipe demuxer for a still image and the input never
+    /// yields a frame. The built pipeline must pin -f image2 for it.
+    #[test]
+    fn a_still_image_graphics_layer_pins_the_image2_demuxer() {
+        let args = graphics_pipeline_args("png", "png_pipe");
+        assert!(
+            has_pair(&args, "-f", "image2"),
+            "a still image layer must pin -f image2, got {args:?}"
+        );
+    }
+
+    /// The pin belongs to still images alone: animated and video layers keep
+    /// their probed demuxers.
+    #[test]
+    fn animated_and_video_graphics_layers_do_not_pin_a_demuxer() {
+        for (codec, format_name) in [("gif", "gif"), ("h264", "mov,mp4,m4a")] {
+            let args = graphics_pipeline_args(codec, format_name);
+            assert!(
+                !args.iter().any(|a| a.as_ref() == "image2"),
+                "{codec} is not a still image and must not pin image2, got {args:?}"
+            );
+        }
     }
 }

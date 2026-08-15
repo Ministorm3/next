@@ -482,10 +482,11 @@ impl ChannelSession {
 
         let graphics_fut = try_join_all(current_item.effective_graphics().enumerate().map(
             |(layer_index, layer)| async move {
-                let input_source = session.playout_source_to_input_source(layer.source.clone())?;
+                let source = cosmetic_source(layer.source.clone());
+                let input_source = session.playout_source_to_input_source(source.clone())?;
                 let location = playout_location_to_pipeline(&layer.location);
                 let timing = playout_timing_to_pipeline(layer.timing.as_ref());
-                let probe_result = session.resolve_probe(&layer.source, &input_source).await?;
+                let probe_result = session.resolve_probe(&source, &input_source).await?;
                 Ok::<_, ChannelError>(GraphicsInput {
                     layer_index,
                     input_source,
@@ -1329,6 +1330,42 @@ impl ChannelSession {
     }
 }
 
+/// A graphics layer is artwork to composite, not a stream to play, so its
+/// fetch drops the streaming options an item source carries by default.
+///
+/// The exact failure this guards against: `reconnect` defaults on for http
+/// sources, the image2 demuxer rejects the reconnect options, and ffmpeg
+/// refuses to start rather than ignore them, taking the item down with it.
+/// Liveness and keep-alive are dropped for the same reason: none of them
+/// mean anything for a file fetched once and composited.
+fn cosmetic_source(source: PlayoutItemSource) -> PlayoutItemSource {
+    match source {
+        PlayoutItemSource::Http {
+            uri,
+            in_point_ms,
+            out_point_ms,
+            headers,
+            user_agent,
+            timeout_us,
+            probe_hint,
+            ..
+        } => PlayoutItemSource::Http {
+            uri,
+            is_live: None,
+            in_point_ms,
+            out_point_ms,
+            headers,
+            user_agent,
+            timeout_us,
+            reconnect: Some(false),
+            reconnect_delay_max: None,
+            keep_alive: None,
+            probe_hint,
+        },
+        other => other,
+    }
+}
+
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
     match value {
         WatermarkLocation::TopLeft => ffpipeline::input::WatermarkLocation::TopLeft,
@@ -1446,5 +1483,68 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_source_tests {
+    use super::*;
+
+    /// The exact failure this guards against: an artwork url inherits
+    /// `reconnect` (which defaults on for http sources), the image2 demuxer
+    /// rejects the option, and ffmpeg refuses to start, taking the item
+    /// down with it.
+    #[test]
+    fn a_cosmetic_http_source_carries_no_streaming_options() {
+        let source = PlayoutItemSource::Http {
+            uri: String::from("http://host:8409/artwork/logo"),
+            is_live: Some(true),
+            in_point_ms: None,
+            out_point_ms: None,
+            headers: None,
+            user_agent: None,
+            timeout_us: Some(5_000_000),
+            reconnect: None,
+            reconnect_delay_max: Some(2),
+            keep_alive: Some(true),
+            probe_hint: None,
+        };
+
+        match cosmetic_source(source) {
+            PlayoutItemSource::Http {
+                uri,
+                is_live,
+                timeout_us,
+                reconnect,
+                reconnect_delay_max,
+                keep_alive,
+                ..
+            } => {
+                assert_eq!(uri, "http://host:8409/artwork/logo");
+                assert_eq!(is_live, None, "artwork is not a live stream");
+                assert_eq!(reconnect, Some(false), "image2 rejects reconnect");
+                assert_eq!(reconnect_delay_max, None);
+                assert_eq!(keep_alive, None);
+                assert_eq!(timeout_us, Some(5_000_000), "the timeout still applies");
+            }
+            other => panic!("an http source must stay http, got {other:?}"),
+        }
+    }
+
+    /// A local file has no streaming options to drop; it passes through
+    /// unchanged.
+    #[test]
+    fn a_local_source_passes_through_unchanged() {
+        let source = PlayoutItemSource::Local {
+            path: String::from("/artwork/1a2b3c"),
+            in_point_ms: None,
+            out_point_ms: None,
+            probe_hint: None,
+        };
+
+        match cosmetic_source(source) {
+            PlayoutItemSource::Local { path, .. } => assert_eq!(path, "/artwork/1a2b3c"),
+            other => panic!("a local source must stay local, got {other:?}"),
+        }
     }
 }
