@@ -76,6 +76,51 @@ struct TimingResult {
     is_complete: bool,
 }
 
+/// Plain-data inputs for [`ChannelSession::build_output_settings`]. Every
+/// field is something a test can construct, which is the point: while this
+/// construction lived inline in `transcode_item`, reverting a decision in it
+/// failed nothing, and the 2026-08-14 padding regression shipped through
+/// exactly that blindness.
+struct OutputSettingsPlan<'a> {
+    channel_config: &'a ChannelConfig,
+    accel: Option<ffpipeline::hw_accel::HardwareAccel>,
+    output_file: String,
+    output_segment_template: String,
+    troubleshoot: bool,
+    pts_duration: Option<Duration>,
+    realtime: bool,
+    slate: bool,
+    is_live: bool,
+    video_is_still_image: bool,
+}
+
+/// Plain-data inputs for [`ChannelSession::plan_timings`].
+struct TimingPlan<'a> {
+    current_item: &'a PlayoutItem,
+    audio_source: &'a PlayoutItemSource,
+    video_source: &'a PlayoutItemSource,
+    subtitle_source: Option<&'a PlayoutItemSource>,
+    start_at_zero: bool,
+    realtime: bool,
+    slate: bool,
+    is_live: bool,
+    is_templated: bool,
+    transcoded_until: OffsetDateTime,
+    stamp_error_ms: i64,
+}
+
+/// What [`ChannelSession::plan_timings`] decided: the per-stream input
+/// timings with the emission trim already applied, and the envelope the
+/// sidecar will declare, computed the same way the pipeline computes its
+/// own -t.
+struct PlannedTimings {
+    audio: TimingResult,
+    video: TimingResult,
+    subtitle: Option<TimingResult>,
+    declared_duration_ms: u64,
+    trim_ms: i64,
+}
+
 pub struct ChannelSession {
     channel_config: ChannelConfig,
     playout_loader: PlayoutLoader,
@@ -914,14 +959,6 @@ impl ChannelSession {
             subtitle_probe_opt
         };
 
-        let audio_norm = &self.channel_config.normalization.audio;
-        let video_norm = &self.channel_config.normalization.video;
-
-        let video_size = match (video_norm.width, video_norm.height) {
-            (Some(width), Some(height)) => Some(FrameSize { width, height }),
-            _ => None,
-        };
-
         // consider an item to be live if any of its sources are live;
         // live sources can never seek or work ahead
         let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
@@ -933,147 +970,28 @@ impl ChannelSession {
             slate || source_is_templated(&video_source) || source_is_templated(&audio_source);
 
         // generate pipeline
-        let output_settings = OutputSettings {
-            audio: AudioOutputSettings {
-                format: audio_norm.format.clone().map(AudioFormat::from),
-                bitrate: audio_norm.bitrate_kbps.map(Kbps),
-                buffer: audio_norm.buffer_kbps.map(Kbps),
-                channels: audio_norm.channels,
-                sample_rate: audio_norm.sample_rate_hz.map(Hz),
-                loudness: if audio_norm.normalize_loudness {
-                    Some(
-                        audio_norm
-                            .loudness
-                            .as_ref()
-                            .map(|l| l.into())
-                            .unwrap_or_default(),
-                    )
-                } else {
-                    None
-                },
-            },
-            video_format: video_norm.format.clone().map(VideoFormat::from),
-            bit_depth: video_norm.bit_depth,
-            video_bitrate: video_norm.bitrate_kbps.map(Kbps),
-            video_buffer: video_norm.buffer_kbps.map(Kbps),
-            video_size,
-            scaling_mode: video_norm.scaling_mode.into(),
-            filter_options: video_norm.filters.clone().into(),
-            deinterlace: video_norm.deinterlace,
+        let output_settings = Self::build_output_settings(OutputSettingsPlan {
+            channel_config: &self.channel_config,
             accel: self.hw_accel.clone(),
-            format: ffpipeline::output_format::OutputFormat::Hls {
-                playlist: self.output_file.clone(),
-                segment_template: self.output_segment_template.clone(),
-                troubleshoot,
-            },
-            pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
-            // Two jobs. A templated item may be transcoded in parallel by
-            // variant sessions with different query values; padding both
-            // transcodes to the -t clamp keeps their PTS envelopes identical,
-            // so one can be substituted for the other at the playlist layer.
-            //
-            // Every other item needs it too. A file whose video stream ends
-            // before its container does books more slot than the video can
-            // fill, and the shortfall is lost permanently because
-            // last_segment_end only advances by emitted EXTINF; about 20% of
-            // the bumps library is built that way. ch13 had looked immune only
-            // because its watermark input was looped and clamped to the item's
-            // -t, which incidentally held the pipeline open; upstream #211
-            // made a still image a single frame, so that masking is gone.
-            //
-            // Unconditional padding alone RAN THE TIMELINE LONG at +531ms/hour
-            // (2026-08-14 overnight, reverted that morning): with tpad the
-            // video never reaches EOF, so the -t cut decides the emitted
-            // duration, and that cut is frame-quantized UPWARD because the
-            // frame straddling it is emitted whole. Every item whose slot is
-            // not frame-aligned emits ceil(slot * fps) / fps, up to one frame
-            // long, verified per-item against the drift meter to 0.2ms mean
-            // error. The emission trim (emission_trim_ms, applied to this
-            // pipeline's timings further down) is what makes this flag safe: it
-            // measures the accumulated stamp-clock error and hands it back on
-            // the next pipeline's -t, so the quantization can no longer
-            // integrate. Do not set this to a condition again; the trim
-            // assumes every non-templated pipeline is padded, because only a
-            // padded pipeline can EXTEND to cover a negative error.
-            pad_to_duration: true,
-            // Slate is not readrate-paced. The original reason recorded that a
-            // padded pipeline runs below realtime when paced (0.65x live, 0.80x
-            // in isolation, 3.5x unpaced), and that measurement is WITHDRAWN:
-            // it was a library file that could not decode in hardware, not the
-            // padding. /bumps/commercials/kids/Fruitomic Punch Gushers is
-            // 5760x4320, past NVDEC's 4096 limit for h264, so it fell back to
-            // software and ran at 0.258x, dragging whatever was measured
-            // alongside it. Re-encoded to 1440x1080 on 2026-08-14, after which
-            // it runs at 7.13x.
-            //
-            // Padding under pacing has since failed to reproduce any slowdown
-            // three times: in isolation, in the production pipeline shape
-            // (1.02x unpadded versus 1.06x padded, identical wall time), and
-            // live across every channel at once once padding went unconditional
-            // (work-ahead 8s to 150s, zero lag over 10s).
-            //
-            // So this flag no longer has a justification behind it. Removing it
-            // is a real change to how slate is produced rather than a comment
-            // fix, so it wants its own image and its own measurement, and it is
-            // left alone here deliberately.
-            realtime: realtime && !slate,
+            output_file: self.output_file.clone(),
+            output_segment_template: self.output_segment_template.clone(),
+            troubleshoot,
+            pts_duration,
+            realtime,
+            slate,
             is_live,
-            frame_rate: if video_probe_result.is_still_image() {
-                Some(FrameRate::default())
-            } else {
-                None
-            },
-            subtitle_mode: self.channel_config.normalization.subtitle.mode.into(),
-            fonts_folder: self
-                .channel_config
-                .normalization
-                .subtitle
-                .fonts_folder
-                .clone(),
-            subtitle_force_style: self
-                .channel_config
-                .normalization
-                .subtitle
-                .force_style
-                .clone(),
-            reports_folder: self.channel_config.ffmpeg.reports_folder.clone(),
-            report_id: Some(self.channel_config.number().to_owned()),
-        };
+            video_is_still_image: video_probe_result.is_still_image(),
+        });
 
         let start_at_zero = matches!(
             self.state,
             ChannelSessionState::ZeroAndWorkAhead | ChannelSessionState::ZeroAndRealtime
         );
 
-        // a slate item must fill its whole remaining window in one pipeline
-        // invocation: work-ahead chunking would declare one sidecar envelope
-        // per chunk, and a variant reading the first chunk's duration would
-        // mistake it for a mid-item join. input_timing's realtime flag only
-        // controls that chunking, so slate forces it; output pacing below
-        // still follows the real `realtime`
-        let whole_window = realtime || slate;
-        let audio_timing = self.input_timing(
-            current_item,
-            &audio_source,
-            start_at_zero,
-            whole_window,
-            is_live,
-        );
-        let video_timing = self.input_timing(
-            current_item,
-            &video_source,
-            start_at_zero,
-            whole_window,
-            is_live,
-        );
-        let subtitle_timing = subtitle_source
-            .as_ref()
-            .map(|s| self.input_timing(current_item, s, start_at_zero, whole_window, is_live));
-
-        // measure how far the stamp clock has run past the schedule clock,
-        // and give it back on this pipeline's output duration. update()
-        // first: the previous pipeline's final segments may not have been
-        // scanned yet, and an unscanned segment would hide exactly the
+        // measure how far the stamp clock has run past the schedule clock;
+        // plan_timings hands it back on this pipeline's output duration.
+        // update() first: the previous pipeline's final segments may not have
+        // been scanned yet, and an unscanned segment would hide exactly the
         // error this is measuring
         let stamp_error_ms = {
             let mut playlist_manager = self.playlist_manager.lock().await;
@@ -1081,20 +999,31 @@ impl ChannelSession {
             (playlist_manager.last_segment_end() - self.transcoded_until).whole_milliseconds()
                 as i64
         };
-        let pipeline_ms = std::cmp::min(
-            audio_timing.out_point.saturating_sub(audio_timing.in_point),
-            video_timing.out_point.saturating_sub(video_timing.in_point),
-        )
-        .as_millis() as u64;
-        let trim_ms = Self::emission_trim_ms(stamp_error_ms, pipeline_ms, is_templated);
+        let PlannedTimings {
+            audio: audio_timing,
+            video: video_timing,
+            subtitle: subtitle_timing,
+            declared_duration_ms,
+            trim_ms,
+        } = Self::plan_timings(TimingPlan {
+            current_item,
+            audio_source: &audio_source,
+            video_source: &video_source,
+            subtitle_source: subtitle_source.as_ref(),
+            start_at_zero,
+            realtime,
+            slate,
+            is_live,
+            is_templated,
+            transcoded_until: self.transcoded_until,
+            stamp_error_ms,
+        });
         if trim_ms != 0 {
             log::debug!(
                 "emission trim {trim_ms}ms for item {} (stamp clock is {stamp_error_ms}ms past the schedule)",
                 current_item.id
             );
         }
-        let audio_timing = Self::apply_emission_trim(audio_timing, trim_ms);
-        let video_timing = Self::apply_emission_trim(video_timing, trim_ms);
 
         let video_index = current_item
             .tracks
@@ -1213,16 +1142,6 @@ impl ChannelSession {
         let envs = pipeline_result.envs();
         log::debug!("optimized pipeline: {}", args.join(" "));
 
-        // the envelope this pipeline will fill, computed the same way the
-        // pipeline computes its own -t. A variant of this item has to fill
-        // the same range, and cannot work it out from the item alone once
-        // this session has joined the item partway through
-        let pipeline_duration_ms = std::cmp::min(
-            audio_timing.out_point.saturating_sub(audio_timing.in_point),
-            video_timing.out_point.saturating_sub(video_timing.in_point),
-        )
-        .as_millis() as u64;
-
         self.playlist_manager
             .lock()
             .await
@@ -1230,7 +1149,7 @@ impl ChannelSession {
                 pts_offset,
                 subtitle_source,
                 &current_item.id,
-                pipeline_duration_ms,
+                declared_duration_ms,
                 is_templated,
                 slate,
             )
@@ -1472,24 +1391,6 @@ impl ChannelSession {
         }
     }
 
-    fn input_timing(
-        &self,
-        current_item: &PlayoutItem,
-        source: &PlayoutItemSource,
-        start_at_zero: bool,
-        realtime: bool,
-        is_live: bool,
-    ) -> TimingResult {
-        Self::input_timing_at(
-            current_item,
-            source,
-            start_at_zero,
-            realtime,
-            is_live,
-            self.transcoded_until,
-        )
-    }
-
     /// The timing decision, split out from the session so it can be tested.
     /// `transcoded_until` was the only session state it ever read.
     ///
@@ -1651,6 +1552,198 @@ impl ChannelSession {
         TimingResult {
             out_point,
             ..timing
+        }
+    }
+
+    /// The output side of the pipeline as a pure function of plain inputs,
+    /// split out of `transcode_item` so the decisions in it can be pinned by
+    /// tests. `transcode_item` launches a real ffmpeg, so while a decision
+    /// lived inline there, reverting it failed nothing: that is how the
+    /// 2026-08-14 padding regression shipped, and the drift meter in
+    /// production was the first thing able to see it.
+    fn build_output_settings(plan: OutputSettingsPlan) -> OutputSettings {
+        let audio_norm = &plan.channel_config.normalization.audio;
+        let video_norm = &plan.channel_config.normalization.video;
+
+        let video_size = match (video_norm.width, video_norm.height) {
+            (Some(width), Some(height)) => Some(FrameSize { width, height }),
+            _ => None,
+        };
+
+        OutputSettings {
+            audio: AudioOutputSettings {
+                format: audio_norm.format.clone().map(AudioFormat::from),
+                bitrate: audio_norm.bitrate_kbps.map(Kbps),
+                buffer: audio_norm.buffer_kbps.map(Kbps),
+                channels: audio_norm.channels,
+                sample_rate: audio_norm.sample_rate_hz.map(Hz),
+                loudness: if audio_norm.normalize_loudness {
+                    Some(
+                        audio_norm
+                            .loudness
+                            .as_ref()
+                            .map(|l| l.into())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                },
+            },
+            video_format: video_norm.format.clone().map(VideoFormat::from),
+            bit_depth: video_norm.bit_depth,
+            video_bitrate: video_norm.bitrate_kbps.map(Kbps),
+            video_buffer: video_norm.buffer_kbps.map(Kbps),
+            video_size,
+            scaling_mode: video_norm.scaling_mode.into(),
+            filter_options: video_norm.filters.clone().into(),
+            deinterlace: video_norm.deinterlace,
+            accel: plan.accel,
+            format: ffpipeline::output_format::OutputFormat::Hls {
+                playlist: plan.output_file,
+                segment_template: plan.output_segment_template,
+                troubleshoot: plan.troubleshoot,
+            },
+            pts_offset: plan.pts_duration.map(|duration| PtsOffset { duration }),
+            // Two jobs. A templated item may be transcoded in parallel by
+            // variant sessions with different query values; padding both
+            // transcodes to the -t clamp keeps their PTS envelopes identical,
+            // so one can be substituted for the other at the playlist layer.
+            //
+            // Every other item needs it too. A file whose video stream ends
+            // before its container does books more slot than the video can
+            // fill, and the shortfall is lost permanently because
+            // last_segment_end only advances by emitted EXTINF; about 20% of
+            // the bumps library is built that way. ch13 had looked immune only
+            // because its watermark input was looped and clamped to the item's
+            // -t, which incidentally held the pipeline open; upstream #211
+            // made a still image a single frame, so that masking is gone.
+            //
+            // Unconditional padding alone RAN THE TIMELINE LONG at +531ms/hour
+            // (2026-08-14 overnight, reverted that morning): with tpad the
+            // video never reaches EOF, so the -t cut decides the emitted
+            // duration, and that cut is frame-quantized UPWARD because the
+            // frame straddling it is emitted whole. Every item whose slot is
+            // not frame-aligned emits ceil(slot * fps) / fps, up to one frame
+            // long, verified per-item against the drift meter to 0.2ms mean
+            // error. The emission trim (emission_trim_ms, applied by
+            // plan_timings) is what makes this flag safe: it measures the
+            // accumulated stamp-clock error and hands it back on the next
+            // pipeline's -t, so the quantization can no longer integrate. Do
+            // not set this to a condition again; the trim assumes every
+            // non-templated pipeline is padded, because only a padded
+            // pipeline can EXTEND to cover a negative error.
+            pad_to_duration: true,
+            // Slate is not readrate-paced. The original reason recorded that a
+            // padded pipeline runs below realtime when paced (0.65x live, 0.80x
+            // in isolation, 3.5x unpaced), and that measurement is WITHDRAWN:
+            // it was a library file that could not decode in hardware, not the
+            // padding. /bumps/commercials/kids/Fruitomic Punch Gushers is
+            // 5760x4320, past NVDEC's 4096 limit for h264, so it fell back to
+            // software and ran at 0.258x, dragging whatever was measured
+            // alongside it. Re-encoded to 1440x1080 on 2026-08-14, after which
+            // it runs at 7.13x.
+            //
+            // Padding under pacing has since failed to reproduce any slowdown
+            // three times: in isolation, in the production pipeline shape
+            // (1.02x unpadded versus 1.06x padded, identical wall time), and
+            // live across every channel at once once padding went unconditional
+            // (work-ahead 8s to 150s, zero lag over 10s).
+            //
+            // So this flag no longer has a justification behind it. Removing it
+            // is a real change to how slate is produced rather than a comment
+            // fix, so it wants its own image and its own measurement, and it is
+            // left alone here deliberately.
+            realtime: plan.realtime && !plan.slate,
+            is_live: plan.is_live,
+            frame_rate: if plan.video_is_still_image {
+                Some(FrameRate::default())
+            } else {
+                None
+            },
+            subtitle_mode: plan.channel_config.normalization.subtitle.mode.into(),
+            fonts_folder: plan
+                .channel_config
+                .normalization
+                .subtitle
+                .fonts_folder
+                .clone(),
+            subtitle_force_style: plan
+                .channel_config
+                .normalization
+                .subtitle
+                .force_style
+                .clone(),
+            reports_folder: plan.channel_config.ffmpeg.reports_folder.clone(),
+            report_id: Some(plan.channel_config.number().to_owned()),
+        }
+    }
+
+    /// The input timings and declared envelope for one pipeline, as a pure
+    /// function of plain inputs. Same seam and same reason as
+    /// [`Self::build_output_settings`]: the emission trim wiring lived
+    /// inline in `transcode_item`, where no test could observe whether it
+    /// was actually applied to what the -t consumes.
+    fn plan_timings(plan: TimingPlan) -> PlannedTimings {
+        // a slate item must fill its whole remaining window in one pipeline
+        // invocation: work-ahead chunking would declare one sidecar envelope
+        // per chunk, and a variant reading the first chunk's duration would
+        // mistake it for a mid-item join. input_timing_at's realtime flag
+        // only controls that chunking, so slate forces it; output pacing
+        // (build_output_settings) still follows the real `realtime`
+        let whole_window = plan.realtime || plan.slate;
+
+        let audio = Self::input_timing_at(
+            plan.current_item,
+            plan.audio_source,
+            plan.start_at_zero,
+            whole_window,
+            plan.is_live,
+            plan.transcoded_until,
+        );
+        let video = Self::input_timing_at(
+            plan.current_item,
+            plan.video_source,
+            plan.start_at_zero,
+            whole_window,
+            plan.is_live,
+            plan.transcoded_until,
+        );
+        let subtitle = plan.subtitle_source.map(|s| {
+            Self::input_timing_at(
+                plan.current_item,
+                s,
+                plan.start_at_zero,
+                whole_window,
+                plan.is_live,
+                plan.transcoded_until,
+            )
+        });
+
+        let pipeline_ms = std::cmp::min(
+            audio.out_point.saturating_sub(audio.in_point),
+            video.out_point.saturating_sub(video.in_point),
+        )
+        .as_millis() as u64;
+        let trim_ms = Self::emission_trim_ms(plan.stamp_error_ms, pipeline_ms, plan.is_templated);
+        let audio = Self::apply_emission_trim(audio, trim_ms);
+        let video = Self::apply_emission_trim(video, trim_ms);
+
+        // the envelope this pipeline will fill, computed the same way the
+        // pipeline computes its own -t. A variant of this item has to fill
+        // the same range, and cannot work it out from the item alone once
+        // this session has joined the item partway through
+        let declared_duration_ms = std::cmp::min(
+            audio.out_point.saturating_sub(audio.in_point),
+            video.out_point.saturating_sub(video.in_point),
+        )
+        .as_millis() as u64;
+
+        PlannedTimings {
+            audio,
+            video,
+            subtitle,
+            declared_duration_ms,
+            trim_ms,
         }
     }
 
@@ -2571,6 +2664,206 @@ mod tests {
         );
         assert_eq!(extended.in_point, Duration::from_millis(2_000));
         assert_eq!(extended.out_point, Duration::from_millis(13_061));
+    }
+
+    /// The channel configuration exactly as the scaffolder writes it, which
+    /// is the shape every deployment starts from.
+    fn test_channel_config() -> ChannelConfig {
+        serde_json::from_value(serde_json::json!({
+            "playout": { "folder": "/tmp/playout" },
+            "ffmpeg": {},
+            "normalization": {
+                "audio": {
+                    "format": "aac", "bitrate_kbps": 192, "buffer_kbps": 384,
+                    "channels": 2, "sample_rate_hz": 48000,
+                    "normalize_loudness": false
+                },
+                "video": {
+                    "format": "h264", "bit_depth": 8,
+                    "width": 1920, "height": 1080,
+                    "bitrate_kbps": 2000, "buffer_kbps": 4000
+                },
+                "subtitle": { "mode": "burn" }
+            }
+        }))
+        .expect("the scaffolded channel config shape deserializes")
+    }
+
+    fn output_settings(realtime: bool, slate: bool, is_live: bool, still: bool) -> OutputSettings {
+        ChannelSession::build_output_settings(OutputSettingsPlan {
+            channel_config: &test_channel_config(),
+            accel: None,
+            output_file: String::from("/tmp/out/live.m3u8"),
+            output_segment_template: String::from("/tmp/out/live%06d.ts"),
+            troubleshoot: false,
+            pts_duration: Some(Duration::from_millis(1234)),
+            realtime,
+            slate,
+            is_live,
+            video_is_still_image: still,
+        })
+    }
+
+    /// The one-line caller change behind the 2026-08-14 regression, now
+    /// pinned: every pipeline is padded, whatever kind of item it is.
+    #[test]
+    fn every_pipeline_is_padded_to_its_clamp() {
+        for realtime in [false, true] {
+            for slate in [false, true] {
+                for is_live in [false, true] {
+                    assert!(
+                        output_settings(realtime, slate, is_live, false).pad_to_duration,
+                        "realtime={realtime} slate={slate} is_live={is_live} must be padded"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Slate ignores readrate pacing; everything else follows the caller.
+    #[test]
+    fn slate_is_never_readrate_paced() {
+        assert!(!output_settings(true, true, false, false).realtime);
+        assert!(output_settings(true, false, false, false).realtime);
+        assert!(!output_settings(false, false, false, false).realtime);
+    }
+
+    /// A still image decodes as a single frame since #211, so the encoder
+    /// must be told a rate to emit it at.
+    #[test]
+    fn a_still_image_forces_an_output_frame_rate() {
+        assert!(
+            output_settings(true, false, false, true)
+                .frame_rate
+                .is_some()
+        );
+        assert!(
+            output_settings(true, false, false, false)
+                .frame_rate
+                .is_none()
+        );
+    }
+
+    /// The scanned pts offset must reach the encoder unchanged; it is the
+    /// only thing keeping output timestamps monotonic across items.
+    #[test]
+    fn the_pts_offset_reaches_the_encoder() {
+        let settings = output_settings(true, false, false, false);
+        assert_eq!(
+            settings.pts_offset.expect("offset is declared").duration,
+            Duration::from_millis(1234)
+        );
+    }
+
+    /// A plain file item occupying an 11.021s slot, the shape of the logo
+    /// bump whose shortfall started the drift investigation.
+    fn file_item() -> PlayoutItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "file-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:00:11.021-04:00",
+            "source": { "source_type": "local", "path": "/bumps/logo.mp4" }
+        }))
+        .expect("a local file item deserializes")
+    }
+
+    fn plan_for(
+        item: &PlayoutItem,
+        slate: bool,
+        is_templated: bool,
+        stamp_error_ms: i64,
+    ) -> PlannedTimings {
+        let audio_source =
+            ChannelSession::resolve_source(item, |t| t.audio.as_ref()).expect("audio source");
+        let video_source =
+            ChannelSession::resolve_source(item, |t| t.video.as_ref()).expect("video source");
+        let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
+        ChannelSession::plan_timings(TimingPlan {
+            current_item: item,
+            audio_source: &audio_source,
+            video_source: &video_source,
+            subtitle_source: None,
+            start_at_zero: true,
+            realtime: true,
+            slate,
+            is_live,
+            is_templated,
+            transcoded_until: item.start,
+            stamp_error_ms,
+        })
+    }
+
+    /// The trim must land on what the -t actually consumes: both streams'
+    /// out points, and the envelope the sidecar declares. A trim that was
+    /// computed but not applied here is exactly the wiring gap that made
+    /// the padding regression invisible to the test suite.
+    #[test]
+    fn the_trim_reaches_every_stream_the_t_reads() {
+        let item = file_item();
+        let planned = plan_for(&item, false, false, 27);
+        assert_eq!(planned.trim_ms, 27);
+        assert_eq!(planned.audio.out_point, Duration::from_millis(10_994));
+        assert_eq!(planned.video.out_point, Duration::from_millis(10_994));
+        assert_eq!(planned.declared_duration_ms, 10_994);
+        assert_eq!(planned.audio.in_point, Duration::ZERO);
+        assert_eq!(planned.video.in_point, Duration::ZERO);
+    }
+
+    /// A templated item's envelope is a pure function of the item, whatever
+    /// the stamp clock says: a variant must be able to compute the same
+    /// envelope from the item alone.
+    #[test]
+    fn a_templated_plan_ignores_the_stamp_error() {
+        let item = templated_item_with_slate(None);
+        let planned = plan_for(&item, false, true, 400);
+        assert_eq!(planned.trim_ms, 0);
+        assert_eq!(planned.declared_duration_ms, 150_000);
+        assert_eq!(planned.video.out_point, Duration::from_millis(150_000));
+    }
+
+    /// Slate must fill its whole remaining window in one pipeline even in a
+    /// work-ahead state: chunking would declare one sidecar envelope per
+    /// chunk, and a variant reading the first chunk's duration would mistake
+    /// it for a mid-item join.
+    #[test]
+    fn slate_fills_its_whole_window_in_one_pipeline() {
+        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
+            "id": "slate-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:05:00.000-04:00",
+            "source": { "source_type": "local", "path": "/bumps/fallback/slate.mp4" }
+        }))
+        .expect("a slate stand-in deserializes");
+
+        let audio_source =
+            ChannelSession::resolve_source(&item, |t| t.audio.as_ref()).expect("audio source");
+        let video_source =
+            ChannelSession::resolve_source(&item, |t| t.video.as_ref()).expect("video source");
+        for (slate, expect_whole) in [(true, true), (false, false)] {
+            let planned = ChannelSession::plan_timings(TimingPlan {
+                current_item: &item,
+                audio_source: &audio_source,
+                video_source: &video_source,
+                subtitle_source: None,
+                start_at_zero: true,
+                realtime: false,
+                slate,
+                is_live: false,
+                is_templated: slate,
+                transcoded_until: item.start,
+                stamp_error_ms: 0,
+            });
+            if expect_whole {
+                assert!(planned.video.is_complete, "slate must not be chunked");
+                assert_eq!(planned.declared_duration_ms, 300_000);
+            } else {
+                assert!(
+                    !planned.video.is_complete,
+                    "work-ahead chunks a long file item"
+                );
+                assert_eq!(planned.declared_duration_ms, 44_000);
+            }
+        }
     }
 
     /// What a variant ends up producing, given the item and what the shared
