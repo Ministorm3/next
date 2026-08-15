@@ -970,18 +970,27 @@ impl ChannelSession {
             //   with tpad  273 frames  10.90s out  1.06x  elapsed 10.25s
             // so it recovers the whole ~480ms shortfall for 0.04s of wall time.
             //
-            // The comment below records 0.65x for a padded pipeline under
-            // readrate pacing, which is why slate turns pacing off. That did
-            // not reproduce in either measurement above and is left in place
-            // for slate on its own terms; if throughput ever regresses, this
-            // flag is the first thing to look at.
             pad_to_duration: true,
-            // slate is never readrate-paced: pacing this padded pipeline runs
-            // measurably BELOW realtime on real hardware (0.65x live, 0.80x
-            // in isolation, 3.5x unpaced on the same box), which starves the
-            // served window for the whole slate slot. Unpaced production is
-            // safe here because the run loop's schedule-coordinate throttle
-            // sleeps once the completed slot puts the buffer over its cap
+            // Slate is not readrate-paced. The original reason recorded that a
+            // padded pipeline runs below realtime when paced (0.65x live, 0.80x
+            // in isolation, 3.5x unpaced), and that measurement is WITHDRAWN:
+            // it was a library file that could not decode in hardware, not the
+            // padding. /bumps/commercials/kids/Fruitomic Punch Gushers is
+            // 5760x4320, past NVDEC's 4096 limit for h264, so it fell back to
+            // software and ran at 0.258x, dragging whatever was measured
+            // alongside it. Re-encoded to 1440x1080 on 2026-08-14, after which
+            // it runs at 7.13x.
+            //
+            // Padding under pacing has since failed to reproduce any slowdown
+            // three times: in isolation, in the production pipeline shape
+            // (1.02x unpadded versus 1.06x padded, identical wall time), and
+            // live across every channel at once once padding went unconditional
+            // (work-ahead 8s to 150s, zero lag over 10s).
+            //
+            // So this flag no longer has a justification behind it. Removing it
+            // is a real change to how slate is produced rather than a comment
+            // fix, so it wants its own image and its own measurement, and it is
+            // left alone here deliberately.
             realtime: realtime && !slate,
             is_live,
             frame_rate: if video_probe_result.is_still_image() {
