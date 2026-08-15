@@ -903,66 +903,28 @@ impl ChannelSession {
             }
         };
 
-        let graphics_fut = async {
-            let prepared =
-                try_join_all(current_item.effective_graphics().map(|layer| async move {
-                    // a graphics layer is cosmetic: an unreadable or unprobeable
-                    // artwork file must not take down the item it decorates. The
-                    // fork carried this for the single watermark, and upstream's
-                    // multi-layer model needs it once per layer
-                    let prepared = async {
-                        let source = cosmetic_source(layer.source.clone());
-                        let input_source =
-                            session.playout_source_to_input_source(source.clone())?;
-                        let probe_result = session.resolve_probe(&source, &input_source).await?;
-                        Ok::<_, ChannelError>((input_source, probe_result))
-                    }
-                    .await;
-
-                    match prepared {
-                        Ok((input_source, probe_result)) => {
-                            Ok::<_, ChannelError>(Some((layer, input_source, probe_result)))
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "skipping a graphics layer for item {}: {e}",
-                                current_item.id
-                            );
-                            Ok(None)
-                        }
-                    }
-                }))
-                .await?;
-
-            // `layer_index` is an ffmpeg input offset (`3 + layer_index`) and
-            // indexes `graphics_labels` directly, so a skipped layer must be
-            // closed over rather than left as a hole
-            Ok::<_, ChannelError>(
-                prepared
-                    .into_iter()
-                    .flatten()
-                    .enumerate()
-                    .map(|(layer_index, (layer, input_source, probe_result))| {
-                        let location = playout_location_to_pipeline(&layer.location);
-                        let timing = playout_timing_to_pipeline(layer.timing.as_ref());
-
-                        GraphicsInput {
-                            layer_index,
-                            input_source,
-                            probe_result,
-                            stream_index: layer.stream_index,
-                            location,
-                            width_percent: layer.width_percent,
-                            within_source_content: layer.within_source_content,
-                            horizontal_margin_percent: layer.horizontal_margin_percent,
-                            vertical_margin_percent: layer.vertical_margin_percent,
-                            opacity_percent: layer.opacity_percent,
-                            timing,
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
+        let graphics_fut = try_join_all(current_item.effective_graphics().enumerate().map(
+            |(layer_index, layer)| async move {
+                let source = cosmetic_source(layer.source.clone());
+                let input_source = session.playout_source_to_input_source(source.clone())?;
+                let location = playout_location_to_pipeline(&layer.location);
+                let timing = playout_timing_to_pipeline(layer.timing.as_ref());
+                let probe_result = session.resolve_probe(&source, &input_source).await?;
+                Ok::<_, ChannelError>(GraphicsInput {
+                    layer_index,
+                    input_source,
+                    probe_result,
+                    stream_index: layer.stream_index,
+                    location,
+                    width_percent: layer.width_percent,
+                    within_source_content: layer.within_source_content,
+                    horizontal_margin_percent: layer.horizontal_margin_percent,
+                    vertical_margin_percent: layer.vertical_margin_percent,
+                    opacity_percent: layer.opacity_percent,
+                    timing,
+                })
+            },
+        ));
 
         let (audio_probe_result, video_probe_opt, subtitle_probe_opt, graphics_inputs) =
             tokio::try_join!(audio_fut, video_fut, subtitle_fut, graphics_fut)?;
