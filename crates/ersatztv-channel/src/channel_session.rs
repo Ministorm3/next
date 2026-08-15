@@ -553,6 +553,21 @@ impl ChannelSession {
             }
         }
 
+        // the claim was measured at open; everything between it and ffmpeg
+        // actually connecting is startup the claim does not cover, and the
+        // window's content-to-stamp offset is this gap plus ffmpeg's own
+        // connect and keyframe wait. Hand-traced 2026-08-15: 45ms on a late
+        // open, 3ms on an early one. This line exists so the instruments can
+        // watch the whole distribution instead of two traced events; a value
+        // that grows is a variant startup problem coming back
+        {
+            let now = OffsetDateTime::now_local()? + self.start_time_offset;
+            let claim_lag_ms = (now - self.transcoded_until).whole_milliseconds();
+            log::info!(
+                "variant for item {item_id} begins transcoding {claim_lag_ms}ms past its claimed position"
+            );
+        }
+
         let base_offset = Duration::from_millis(pts_offset_ms);
 
         while self.transcoded_until < item.finish {
