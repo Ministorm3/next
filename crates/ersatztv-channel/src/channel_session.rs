@@ -967,31 +967,45 @@ impl ChannelSession {
                 troubleshoot,
             },
             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
-            // Two jobs, and the second is why this is unconditional.
-            //
             // A templated item may be transcoded in parallel by variant
             // sessions with different query values; padding both transcodes to
             // the -t clamp keeps their PTS envelopes identical, so one can be
             // substituted for the other at the playlist layer.
             //
-            // Every other item needs it too. A file whose video stream ends
-            // before its container does books more slot than the video can
-            // fill, and the shortfall is lost permanently because
-            // last_segment_end only advances by emitted EXTINF. About 20% of
-            // the bumps library is built that way. ch13 appeared immune only
-            // because its watermark input was looped and clamped to the item's
-            // -t, which incidentally held the pipeline open; upstream #211
-            // makes a still image a single frame, so that masking is gone and
-            // ch13 now drifts like every other channel.
+            // THIS WAS UNCONDITIONAL FOR ELEVEN HOURS ON 2026-08-14 AND IS
+            // REVERTED. Do not set it everywhere again without reading this.
             //
-            // Measured on this file, on the production hardware, in the
-            // production pipeline shape (cuda decode, scale_cuda, overlay_cuda,
-            // nvenc, readrate 1.0), /bumps/logo/Philips LaserVision:
-            //   no tpad    261 frames  10.42s out  1.02x  elapsed 10.21s
-            //   with tpad  273 frames  10.90s out  1.06x  elapsed 10.25s
-            // so it recovers the whole ~480ms shortfall for 0.04s of wall time.
+            // The reasoning was sound and the bench measurement held up. A file
+            // whose video stream ends before its container does books more slot
+            // than the video can fill, and the shortfall is lost permanently
+            // because last_segment_end only advances by emitted EXTINF; about
+            // 20% of the bumps library is built that way. ch13 had looked
+            // immune only because its watermark input was looped and clamped to
+            // the item's -t, which incidentally held the pipeline open, and
+            // upstream #211 made a still image a single frame so that masking
+            // went away. On the production hardware in the production pipeline
+            // shape, /bumps/logo/Philips LaserVision went from 261 frames and
+            // 10.42s of output to 273 frames and 10.90s, recovering the whole
+            // ~480ms shortfall for 0.04s of wall clock.
             //
-            pad_to_duration: true,
+            // IN PRODUCTION IT RAN THE TIMELINE LONG INSTEAD. Drift is
+            // `first_segment_pdt - scheduled_start`, and on ch11 it went:
+            //   before padding  19:51-21:19  mean    +4ms  max    +36ms
+            //   padding in      21:19-22:22  mean  +175ms  max   +414ms
+            //                   00:00-04:00  mean +1811ms  max  +2782ms
+            //                   08:00-10:16  mean +5591ms  max  +6118ms
+            // Monotonic, about +500ms per hour, starting exactly at the deploy.
+            // That is the OPPOSITE sign from the defect it was meant to fix and
+            // roughly twenty times faster: the old shortfall reached -5.2s over
+            // three days, this reached +6.1s in twelve hours.
+            //
+            // The mechanism is NOT understood. The bench showed tpad
+            // UNDERSHOOTING its slot (10.90s of 11.021s), so whatever makes
+            // every item emit slightly long in production was not reproduced
+            // there. Find that before trying again, and watch drift within the
+            // first hour rather than overnight: the slope was already visible
+            // at +175ms in the first sixty minutes.
+            pad_to_duration: is_templated,
             // Slate is not readrate-paced. The original reason recorded that a
             // padded pipeline runs below realtime when paced (0.65x live, 0.80x
             // in isolation, 3.5x unpaced), and that measurement is WITHDRAWN:
