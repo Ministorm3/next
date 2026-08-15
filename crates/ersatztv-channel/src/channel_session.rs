@@ -1648,27 +1648,15 @@ impl ChannelSession {
             // non-templated pipeline is padded, because only a padded
             // pipeline can EXTEND to cover a negative error.
             pad_to_duration: true,
-            // Slate is not readrate-paced. The original reason recorded that a
-            // padded pipeline runs below realtime when paced (0.65x live, 0.80x
-            // in isolation, 3.5x unpaced), and that measurement is WITHDRAWN:
-            // it was a library file that could not decode in hardware, not the
-            // padding. /bumps/commercials/kids/Fruitomic Punch Gushers is
-            // 5760x4320, past NVDEC's 4096 limit for h264, so it fell back to
-            // software and ran at 0.258x, dragging whatever was measured
-            // alongside it. Re-encoded to 1440x1080 on 2026-08-14, after which
-            // it runs at 7.13x.
-            //
-            // Padding under pacing has since failed to reproduce any slowdown
-            // three times: in isolation, in the production pipeline shape
-            // (1.02x unpadded versus 1.06x padded, identical wall time), and
-            // live across every channel at once once padding went unconditional
-            // (work-ahead 8s to 150s, zero lag over 10s).
-            //
-            // So this flag no longer has a justification behind it. Removing it
-            // is a real change to how slate is produced rather than a comment
-            // fix, so it wants its own image and its own measurement, and it is
-            // left alone here deliberately.
-            realtime: plan.realtime && !plan.slate,
+            // Slate paces like every other pipeline. It ran unpaced for
+            // months on the strength of a 0.65x padded-under-pacing
+            // measurement that was withdrawn on 2026-08-14 (it was one
+            // oversized file failing hardware decode, not the padding), and
+            // since 2026-08-15 every production pipeline runs padded and
+            // paced at 1x, which is the same combination at far larger
+            // scale. If slate pacing ever regresses, the symptom is the
+            // transcoded buffer shrinking during templated windows.
+            realtime: plan.realtime,
             is_live: plan.is_live,
             frame_rate: if plan.video_is_still_image {
                 Some(FrameRate::default())
@@ -2735,12 +2723,15 @@ mod tests {
         }
     }
 
-    /// Slate ignores readrate pacing; everything else follows the caller.
+    /// Slate paces like every other pipeline: the unpaced special case
+    /// rested on a withdrawn measurement, and a padded paced pipeline is
+    /// what all of production runs. Pacing follows the caller alone.
     #[test]
-    fn slate_is_never_readrate_paced() {
-        assert!(!output_settings(true, true, false, false).realtime);
+    fn slate_paces_like_every_other_pipeline() {
+        assert!(output_settings(true, true, false, false).realtime);
         assert!(output_settings(true, false, false, false).realtime);
         assert!(!output_settings(false, false, false, false).realtime);
+        assert!(!output_settings(false, true, false, false).realtime);
     }
 
     /// A still image decodes as a single frame since #211, so the encoder
