@@ -1450,6 +1450,36 @@ impl ChannelSession {
         realtime: bool,
         is_live: bool,
     ) -> TimingResult {
+        Self::input_timing_at(
+            current_item,
+            source,
+            start_at_zero,
+            realtime,
+            is_live,
+            self.transcoded_until,
+        )
+    }
+
+    /// The timing decision, split out from the session so it can be tested.
+    /// `transcoded_until` was the only session state it ever read.
+    ///
+    /// The live branch below is load bearing beyond its own correctness: it is
+    /// what keeps a non-zero `progress_ms` from turning into an input seek.
+    /// Such a progress selects `SeekAndRealtime`, which makes `start_at_zero`
+    /// false, which would otherwise derive `in_point` from `transcoded_until`.
+    /// That is output offset driving input seeking, the pattern that closed
+    /// PR #187. Live sources return `in_point: ZERO` before any of that is
+    /// consulted, and every templated source is live (9716 of 9716 across the
+    /// install on 2026-08-14), so the rule holds. It holds because of this
+    /// branch, not because of the data, and there is now a test on it.
+    fn input_timing_at(
+        current_item: &PlayoutItem,
+        source: &PlayoutItemSource,
+        start_at_zero: bool,
+        realtime: bool,
+        is_live: bool,
+        transcoded_until: OffsetDateTime,
+    ) -> TimingResult {
         let mut is_complete = true;
 
         let item_start = current_item.start;
@@ -1469,7 +1499,7 @@ impl ChannelSession {
             let live_now = if start_at_zero {
                 item_start
             } else {
-                self.transcoded_until.clamp(item_start, item_finish)
+                transcoded_until.clamp(item_start, item_finish)
             };
             let remaining = item_finish - live_now;
 
@@ -1500,21 +1530,16 @@ impl ChannelSession {
         let effective_now = if start_at_zero {
             item_start
         } else {
-            self.transcoded_until
+            transcoded_until
         };
 
-        // live content never seeks. limit it to the remaining schedule interval
-        // so pipeline duration and graphics timing end at the same point.
-        if is_live {
-            return TimingResult {
-                in_point: Duration::ZERO,
-                out_point: Duration::from_millis(
-                    (item_finish - effective_now).whole_milliseconds().max(0) as u64,
-                ),
-                finish: item_finish,
-                is_complete: true,
-            };
-        }
+        // the live guard used to be repeated here, upstream's copy sitting
+        // below the fork's. It was unreachable, because the branch above
+        // returns for every live source before this point, and it was the
+        // weaker of the two: it read `transcoded_until` raw where the branch
+        // above clamps it into the item. Two guards also meant neither could
+        // be pinned by a test, since deleting either one left the other
+        // covering for it.
 
         let progress_ms = if start_at_zero {
             0
@@ -2837,6 +2862,65 @@ mod tests {
             ),
             80_000
         );
+    }
+
+    /// THE PR #187 GUARD, and the reason it now needs to be a test rather than
+    /// an argument.
+    ///
+    /// A non-zero `progress_ms` selects `SeekAndRealtime`, which makes
+    /// `start_at_zero` false, which would otherwise derive `in_point` from
+    /// `transcoded_until`. That is an output offset driving an input seek, and
+    /// it is the pattern jasongdove rejected when he closed PR #187: output
+    /// timestamp offsets and source read positions are deliberately decoupled,
+    /// and the read position comes from the SCHEDULE, never from a
+    /// measurement.
+    ///
+    /// Before 02a05f7 nothing reached that branch, because a fallback pipeline
+    /// always spawned at progress 0. `variant_start_progress_ms` is what makes
+    /// progress non-zero, so the decoupling is now load bearing. What holds it
+    /// is the live branch in `input_timing_at`, which returns `in_point` ZERO
+    /// before the state is consulted at all.
+    ///
+    /// It is worth being precise about why this is safe today: every templated
+    /// source is live, 9716 of 9716 across the install on 2026-08-14. But that
+    /// is a property of what the scheduler emits, not of this worker, so the
+    /// guard has to be the branch and not the data.
+    #[test]
+    fn a_live_source_never_seeks_however_far_the_session_has_progressed() {
+        let item = templated_item();
+        let source = item.source.clone().expect("the fixture carries a source");
+
+        for elapsed in [0i64, 8, 59, 149] {
+            let timing = ChannelSession::input_timing_at(
+                &item,
+                &source,
+                // false is the seeking branch: this is what a non-zero
+                // progress selects
+                false,
+                true,
+                true,
+                item.start + time::Duration::seconds(elapsed),
+            );
+
+            assert_eq!(
+                timing.in_point,
+                Duration::ZERO,
+                "a live source must not seek, {elapsed}s into the item"
+            );
+        }
+
+        // and it covers only the remainder, so a session joining partway
+        // through keeps its output inside the item's envelope. The fixture
+        // window is 150s
+        let at_59 = ChannelSession::input_timing_at(
+            &item,
+            &source,
+            false,
+            true,
+            true,
+            item.start + time::Duration::seconds(59),
+        );
+        assert_eq!(at_59.out_point, Duration::from_millis(91_000));
     }
 
     /// A file source seeks, so where it opens says nothing about which
