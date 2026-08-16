@@ -3,6 +3,12 @@ name = "ersatztv-channel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# See ersatztv-core::clock_trace. Off by default, and dormant when on until
+# ETV_CLOCK_TRACE names a folder.
+clock-trace = ["ersatztv-core/clock-trace"]
+
 [dependencies]
 axum = { workspace = true }
 clap = { workspace = true }
