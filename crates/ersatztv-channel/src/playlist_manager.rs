@@ -16,6 +16,9 @@ const MIN_SEGMENTS: usize = 4;
 const PUBLISH_LEAD: Duration =
     Duration::from_secs(ffpipeline::pipeline::SEGMENT_SECONDS as u64 * 3);
 
+/// How much media to keep behind the segment the published window starts at.
+const HISTORY_DURATION: Duration = Duration::from_mins(2);
+
 #[derive(Clone)]
 pub struct SubtitleSource {
     pub cues: Arc<Vec<Cue>>,
@@ -226,7 +229,7 @@ impl PlaylistManager {
         }
 
         // trim old segments
-        let cutoff = OffsetDateTime::now_utc() - Duration::from_mins(2);
+        let cutoff = self.trim_cutoff();
         while !self.segments.is_empty() && self.segments[0].program_date_time < cutoff {
             if let Some(removed) = self.segments.remove(0) {
                 self.media_sequence += 1;
@@ -276,6 +279,40 @@ impl PlaylistManager {
         }
 
         Ok(())
+    }
+
+    /// The oldest program date time to keep on disk.
+    ///
+    /// Segment program date times run on the media timeline. `last_segment_end`
+    /// is seeded from the channel start time and only ever moves forward by a
+    /// segment duration, so it tracks produced media and not the wall clock.
+    /// Comparing those timestamps against a wall clock cutoff mixes the two,
+    /// and the retained history becomes the budget minus however far the
+    /// channel runs behind realtime.
+    ///
+    /// Measuring from the newest segment has the opposite failure. A file item
+    /// transcodes faster than realtime, so produced media runs ahead of the
+    /// segment the window starts at, and the budget is spent on segments no
+    /// viewer has reached. What survives behind the window start is the
+    /// budget minus the work-ahead depth.
+    ///
+    /// `last_served_media_sequence` is the media sequence the last published
+    /// window started at, which is the oldest segment a viewer can be
+    /// positioned at. Measuring from there bounds history where viewers
+    /// actually are, under both. Before the first window is published it is
+    /// zero, which selects the oldest segment held and so trims nothing.
+    fn trim_cutoff(&self) -> OffsetDateTime {
+        let start_index = self
+            .last_served_media_sequence
+            .saturating_sub(self.media_sequence) as usize;
+
+        let window_start = self
+            .segments
+            .get(start_index)
+            .map(|segment| segment.program_date_time)
+            .unwrap_or(self.last_segment_end);
+
+        window_start - HISTORY_DURATION
     }
 
     fn generate_playlist(
@@ -419,4 +456,151 @@ fn render_subtitle_segment(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager(channel_start_time: OffsetDateTime) -> PlaylistManager {
+        PlaylistManager::new(
+            channel_start_time,
+            4,
+            std::env::temp_dir(),
+            std::env::temp_dir().join("ready"),
+            PlaylistManagerOutputFiles {
+                generated_playlist_file: String::new(),
+                ffmpeg_playlist_file: String::new(),
+                generated_subtitle_playlist_file: String::new(),
+            },
+        )
+    }
+
+    /// Appends `count` four second segments on the media timeline, exactly as
+    /// the publish loop does.
+    fn push_segments(m: &mut PlaylistManager, count: usize) {
+        for i in 0..count {
+            m.segments.push_back(Segment {
+                path: format!("live{i:06}.ts"),
+                duration: 4.0,
+                program_date_time: m.last_segment_end,
+            });
+            m.last_segment_end += Duration::from_secs(4);
+        }
+    }
+
+    /// Applies the trim, exactly as the publish loop does minus the file io.
+    fn trim(m: &mut PlaylistManager) {
+        let cutoff = m.trim_cutoff();
+        while !m.segments.is_empty() && m.segments[0].program_date_time < cutoff {
+            m.segments.pop_front();
+            m.media_sequence += 1;
+        }
+    }
+
+    /// How many leading segments the trim loop would delete.
+    fn would_trim(m: &PlaylistManager) -> usize {
+        let cutoff = m.trim_cutoff();
+        m.segments
+            .iter()
+            .take_while(|s| s.program_date_time < cutoff)
+            .count()
+    }
+
+    #[test]
+    fn trims_nothing_before_a_window_is_published() {
+        let mut m = manager(OffsetDateTime::UNIX_EPOCH);
+        push_segments(&mut m, 100);
+
+        assert_eq!(would_trim(&m), 0);
+    }
+
+    #[test]
+    fn a_channel_behind_the_wall_clock_keeps_its_history() {
+        // media timestamps an hour behind the wall clock, which is what a
+        // channel that cannot sustain realtime looks like
+        let mut m = manager(OffsetDateTime::now_utc() - Duration::from_secs(3600));
+        push_segments(&mut m, 60);
+        m.last_served_media_sequence = 50;
+
+        // 120s of history behind segment 50 is 30 segments, so 20 expire
+        assert_eq!(would_trim(&m), 20);
+    }
+
+    #[test]
+    fn retained_history_does_not_move_with_the_wall_clock() {
+        // the same media, presented at six different lags behind the wall
+        // clock, has to retain the same history every time
+        let retained: Vec<usize> = [0u64, 30, 60, 97, 119, 130]
+            .into_iter()
+            .map(|lag| {
+                let mut m = manager(
+                    OffsetDateTime::now_utc() - Duration::from_secs(lag) - Duration::from_secs(400),
+                );
+                push_segments(&mut m, 100);
+                m.last_served_media_sequence = 85;
+                100 - would_trim(&m)
+            })
+            .collect();
+
+        assert_eq!(retained, vec![45; 6], "retained history varied with lag");
+    }
+
+    #[test]
+    fn history_survives_production_running_ahead_of_the_window_start() {
+        let mut m = manager(OffsetDateTime::UNIX_EPOCH);
+        push_segments(&mut m, 100);
+        m.last_served_media_sequence = 40;
+
+        // measured behind segment 40, not behind the newest segment produced
+        assert_eq!(would_trim(&m), 10);
+    }
+
+    #[test]
+    fn never_trims_the_window_start() {
+        let mut m = manager(OffsetDateTime::UNIX_EPOCH);
+        push_segments(&mut m, 100);
+
+        for start in [0, 1, 30, 60, 99] {
+            m.last_served_media_sequence = start;
+            let trimmed = would_trim(&m) as u64;
+            assert!(
+                trimmed <= start,
+                "trimmed {trimmed} segments with the window starting at {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_stays_bounded_over_many_publish_cycles() {
+        // the window front is set by the publish horizon and only moves
+        // forward, so retention has to reach a steady state and hold it
+        // however long the channel runs
+        let mut m = manager(OffsetDateTime::UNIX_EPOCH);
+        let mut steady = Vec::new();
+
+        for cycle in 0..1000 {
+            push_segments(&mut m, 1);
+            let newest = m.media_sequence + m.segments.len() as u64;
+            m.last_served_media_sequence = newest.saturating_sub(10);
+            trim(&mut m);
+            if cycle > 200 {
+                steady.push(m.segments.len());
+            }
+        }
+
+        let low = *steady.iter().min().unwrap();
+        let high = *steady.iter().max().unwrap();
+        assert_eq!(low, high, "retained segment count drifted over time");
+        assert!(high <= 45, "retained {high} segments, which is not bounded");
+    }
+
+    #[test]
+    fn falls_back_to_the_newest_media_when_the_window_start_is_missing() {
+        let mut m = manager(OffsetDateTime::UNIX_EPOCH);
+        push_segments(&mut m, 10);
+        m.last_served_media_sequence = 999;
+
+        assert_eq!(m.trim_cutoff(), m.last_segment_end - HISTORY_DURATION);
+    }
 }
