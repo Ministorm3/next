@@ -291,7 +291,8 @@ impl PlaylistManager {
                     q_media_sequence: self.media_sequence,
                     q_segments_held: self.segments.len(),
                     e_program_date_time: removed.program_date_time,
-                    w_cutoff: cutoff,
+                    w_cutoff: Some(cutoff),
+                    e_trim_cutoff: None,
                 });
 
                 let path = self.output_folder.join(&removed.path);

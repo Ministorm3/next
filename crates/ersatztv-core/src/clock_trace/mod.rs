@@ -400,7 +400,8 @@ mod tests {
             q_media_sequence: 1,
             q_segments_held: 0,
             e_program_date_time: OffsetDateTime::UNIX_EPOCH,
-            w_cutoff: OffsetDateTime::UNIX_EPOCH,
+            w_cutoff: Some(OffsetDateTime::UNIX_EPOCH),
+            e_trim_cutoff: None,
         });
 
         let body = std::fs::read_to_string(folder.path().join("clock-7.jsonl")).expect("trace");

@@ -122,7 +122,12 @@ pub struct Segment {
 #[derive(Debug, Clone)]
 pub struct Trim {
     pub w_utc: OffsetDateTime,
-    pub w_cutoff: OffsetDateTime,
+    /// Set when the trim compares against the wall clock, which is the
+    /// crossing that is not sound.
+    pub w_cutoff: Option<OffsetDateTime>,
+    /// Set when the trim compares against the served position instead, which
+    /// keeps both sides on the emitted clock.
+    pub e_trim_cutoff: Option<OffsetDateTime>,
     pub q_path: String,
     pub q_media_sequence: u64,
     pub q_segments_held: usize,
@@ -499,10 +504,12 @@ pub fn fold(channel: String, records: Vec<ClockRecord>) -> Timeline {
                 q_segments_held,
                 e_program_date_time,
                 w_cutoff,
+                e_trim_cutoff,
             } => {
                 timeline.trims.push(Trim {
                     w_utc: record.w_utc,
                     w_cutoff,
+                    e_trim_cutoff,
                     q_path,
                     q_media_sequence,
                     q_segments_held,

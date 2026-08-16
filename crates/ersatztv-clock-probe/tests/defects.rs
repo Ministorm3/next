@@ -311,7 +311,8 @@ fn a_trim_inside_the_published_window_is_caught() {
         q_media_sequence: 25,
         q_segments_held: 9,
         e_program_date_time: published_tail + Duration::seconds(4),
-        w_cutoff: builder.w - Duration::minutes(2),
+        w_cutoff: Some(builder.w - Duration::minutes(2)),
+        e_trim_cutoff: None,
     });
 
     let timeline = builder.build();
@@ -349,7 +350,8 @@ fn a_trim_behind_the_window_is_not_a_failure() {
         q_segments_held: 9,
         // safely older than anything a client was handed
         e_program_date_time: published_tail - Duration::seconds(8),
-        w_cutoff: builder.w - Duration::minutes(2),
+        w_cutoff: Some(builder.w - Duration::minutes(2)),
+        e_trim_cutoff: None,
     });
 
     let timeline = builder.build();

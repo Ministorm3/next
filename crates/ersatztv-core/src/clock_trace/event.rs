@@ -177,17 +177,29 @@ pub enum ClockEvent {
 
     /// A segment was deleted from disk.
     ///
-    /// The cutoff is a wall clock reading and the segment stamp is an emitted
-    /// one. That comparison is the one crossing in the worker that is not
-    /// sound, and this record exists to measure what it costs.
+    /// Exactly one of the two cutoffs is present, and which one says how the
+    /// trim is implemented on the build that wrote the record.
+    ///
+    /// `w_cutoff` means the trim measured an emitted stamp against the wall
+    /// clock. That crossing is not sound: the cutoff walks forward with real
+    /// time while the stamps do not, so retained history is the budget minus
+    /// the channel's lag and reaches zero once the lag reaches the budget.
+    ///
+    /// `e_trim_cutoff` means the trim measured against the position being
+    /// served, which is an emitted reading on both sides and therefore sound.
+    ///
+    /// Recording them under separate names rather than one is what lets a
+    /// reader tell from the trace alone which trim a channel is running.
     SegmentTrimmed {
         q_path: String,
         q_media_sequence: u64,
         q_segments_held: usize,
         #[serde(with = "time::serde::rfc3339")]
         e_program_date_time: OffsetDateTime,
-        #[serde(with = "time::serde::rfc3339")]
-        w_cutoff: OffsetDateTime,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        w_cutoff: Option<OffsetDateTime>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        e_trim_cutoff: Option<OffsetDateTime>,
     },
 
     /// A window was published to clients.

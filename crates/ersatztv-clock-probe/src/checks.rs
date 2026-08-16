@@ -388,6 +388,41 @@ fn trim_safety(timeline: &Timeline) -> Vec<Finding> {
         ));
     }
 
+    // which trim this build runs, read from the trace rather than assumed
+    let on_wall = timeline
+        .trims
+        .iter()
+        .filter(|t| t.w_cutoff.is_some())
+        .count();
+    let on_emitted = timeline
+        .trims
+        .iter()
+        .filter(|t| t.e_trim_cutoff.is_some())
+        .count();
+
+    if on_wall > 0 {
+        findings.push(Finding::new(
+            "trim-domain",
+            Severity::Warn,
+            format!(
+                "{on_wall} trims measured an emitted stamp against the wall clock, so retained \
+                 history is the budget minus this channel's lag and reaches zero once the lag \
+                 reaches the budget"
+            ),
+        ));
+    }
+
+    if on_emitted > 0 {
+        findings.push(Finding::new(
+            "trim-domain",
+            Severity::Info,
+            format!(
+                "{on_emitted} trims measured against the served position, keeping both sides on \
+                 the emitted clock"
+            ),
+        ));
+    }
+
     findings
 }
 

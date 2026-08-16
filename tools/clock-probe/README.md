@@ -101,6 +101,7 @@ folder picks up whichever channels were recording. Add `--channel N` to narrow.
 | `stamp-drift` | the emitted clock does not walk away from the schedule, by total, by rate per hour, and by how many steps moved the same way |
 | `seek-purity` | no measured value reaches an input seek. Take the schedule progress back out of a seek and the remainder cannot move while an item plays. |
 | `trim-safety` | nothing was deleted from inside the published window |
+| `trim-domain` | which trim the build runs, read from the trace: a wall clock cutoff against an emitted stamp is the unsound crossing, a served position cutoff keeps both sides emitted |
 | `retention` | held history against the lag of the live edge behind real time |
 | `publish-horizon` | no window carried a stamp from past the horizon |
 | `sequence` | the media sequence and the name order stayed in step |

@@ -140,7 +140,8 @@ fn a_channel_that_is_ahead_is_not_reported_as_starved() {
         q_media_sequence: 1,
         q_segments_held: 30,
         e_program_date_time: builder.w - Duration::minutes(3),
-        w_cutoff: builder.w - Duration::minutes(2),
+        w_cutoff: Some(builder.w - Duration::minutes(2)),
+        e_trim_cutoff: None,
     });
 
     let timeline = builder.build();
