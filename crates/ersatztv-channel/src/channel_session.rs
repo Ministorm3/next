@@ -94,8 +94,77 @@ pub struct ChannelSession {
 
     timeout_notify: Arc<tokio::sync::Notify>,
 
+    /// The drift last reported at an item boundary, so each report can name
+    /// what the item that just ended contributed.
+    last_reported_drift: Option<time::Duration>,
+
     cached_subtitles: Option<(String, Arc<Vec<Cue>>)>,
     dynamic_http_client: reqwest::Client,
+}
+
+/// A published window holds ten segments. Drift at or past that size means the
+/// schedule and the stream disagree by more than the whole window a client
+/// holds.
+const DRIFT_WINDOW_SEGMENTS: i64 = 10;
+
+/// How far emitted media has drifted from the schedule.
+///
+/// `last_segment_end` advances by the durations ffmpeg reports for the segments
+/// it wrote. `transcoded_until` advances by the scheduled finish of each item.
+///
+/// Both are seeded from the same clock reading at channel start, but
+/// `transcoded_until` also carries `start_time_offset`, the distance to a
+/// configured `virtual_start`. That offset is deliberate and permanent, so it
+/// has to be added back before the two can be compared. Subtracting them raw
+/// would report the whole virtual start offset as drift on every channel that
+/// sets one.
+///
+/// What is left is the total amount by which emitted media has run long or
+/// short against the schedule. Positive means the channel airs its content
+/// late by that much.
+fn schedule_drift(
+    last_segment_end: OffsetDateTime,
+    transcoded_until: OffsetDateTime,
+    start_time_offset: time::Duration,
+) -> time::Duration {
+    last_segment_end + start_time_offset - transcoded_until
+}
+
+/// How loudly to report a drift.
+///
+/// The thresholds come from the segment grid, not from taste. A segment is
+/// the granularity a client selects media at, so drift below one segment
+/// cannot change which segment covers a given moment, and it is the
+/// quantization noise every channel carries anyway. One published window of
+/// drift means the schedule and the stream disagree by more than the whole
+/// window a client holds, which is an operational problem rather than an
+/// observation.
+fn drift_report_level(drift: time::Duration) -> log::Level {
+    let magnitude = if drift.is_negative() { -drift } else { drift };
+
+    if magnitude >= time::Duration::seconds(DRIFT_WINDOW_SEGMENTS * SEGMENT_SECONDS as i64) {
+        log::Level::Warn
+    } else if magnitude >= time::Duration::seconds(SEGMENT_SECONDS as i64) {
+        log::Level::Info
+    } else {
+        log::Level::Debug
+    }
+}
+
+/// Renders a drift and the amount the last item added to it.
+fn format_drift(drift: time::Duration, previous: Option<time::Duration>) -> String {
+    let sense = if drift.is_negative() { "early" } else { "late" };
+    let magnitude = if drift.is_negative() { -drift } else { drift };
+
+    match previous {
+        Some(previous) => format!(
+            "airing {:.1}s {} ({:+.1}s over the last item)",
+            magnitude.as_seconds_f64(),
+            sense,
+            (drift - previous).as_seconds_f64()
+        ),
+        None => format!("airing {:.1}s {}", magnitude.as_seconds_f64(), sense),
+    }
 }
 
 impl ChannelSession {
@@ -188,6 +257,7 @@ impl ChannelSession {
             start_time_offset,
             state: ChannelSessionState::SeekAndWorkAhead,
             timeout_notify: Arc::new(tokio::sync::Notify::new()),
+            last_reported_drift: None,
             cached_subtitles: None,
             dynamic_http_client,
         })
@@ -717,11 +787,31 @@ impl ChannelSession {
         let envs = pipeline_result.envs();
         log::debug!("optimized pipeline: {}", args.join(" "));
 
-        self.playlist_manager
-            .lock()
-            .await
-            .before_new_pipeline(pts_offset, subtitle_source)
-            .await?;
+        let last_segment_end = {
+            let mut manager = self.playlist_manager.lock().await;
+            manager
+                .before_new_pipeline(pts_offset, subtitle_source)
+                .await?;
+            manager.last_segment_end()
+        };
+
+        // `before_new_pipeline` has just taken in every segment the previous
+        // pipeline wrote, so this is the one point in the loop where emitted
+        // media and the schedule can be compared without a stale reading
+        if start_at_zero {
+            let drift = schedule_drift(
+                last_segment_end,
+                self.transcoded_until,
+                self.start_time_offset,
+            );
+            log::log!(
+                drift_report_level(drift),
+                "channel {} {}",
+                self.channel_config.number(),
+                format_drift(drift, self.last_reported_drift)
+            );
+            self.last_reported_drift = Some(drift);
+        }
 
         // stream current item
         let mut ffmpeg_child = tokio::process::Command::new(&self.ffmpeg_path)
@@ -1446,5 +1536,132 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    #[test]
+    fn emitting_more_than_scheduled_airs_late() {
+        // 25s more media emitted than the schedule called for
+        let drift = schedule_drift(at(1025), at(1000), time::Duration::ZERO);
+        assert_eq!(drift, time::Duration::seconds(25));
+    }
+
+    #[test]
+    fn emitting_less_than_scheduled_airs_early() {
+        let drift = schedule_drift(at(995), at(1000), time::Duration::ZERO);
+        assert_eq!(drift, time::Duration::seconds(-5));
+    }
+
+    #[test]
+    fn a_virtual_start_offset_is_not_drift() {
+        // a channel with virtual_start set seeds transcoded_until at
+        // `now + offset` and last_segment_end at `now`, so the offset is
+        // present from the first pipeline and never goes away. it is
+        // configuration, not drift, and reporting it would warn forever
+        for offset_secs in [-604_800i64, -3600, -1, 1, 3600, 604_800] {
+            let offset = time::Duration::seconds(offset_secs);
+            assert_eq!(
+                schedule_drift(at(1000), at(1000) + offset, offset),
+                time::Duration::ZERO,
+                "a {offset_secs}s virtual start offset was reported as drift"
+            );
+        }
+    }
+
+    #[test]
+    fn drift_is_measured_through_a_virtual_start_offset() {
+        // the same 25s of overrun as above, on a channel whose schedule sits
+        // an hour ahead of the wall clock
+        let offset = time::Duration::hours(1);
+        let drift = schedule_drift(at(1025), at(1000) + offset, offset);
+        assert_eq!(drift, time::Duration::seconds(25));
+    }
+
+    #[test]
+    fn drift_under_one_segment_stays_at_debug() {
+        // smaller than a segment cannot be expressed in the playlist at all
+        for ms in [0i64, 1, 500, 3_999] {
+            assert_eq!(
+                drift_report_level(time::Duration::milliseconds(ms)),
+                log::Level::Debug,
+                "{ms}ms should be debug"
+            );
+        }
+    }
+
+    #[test]
+    fn one_segment_of_drift_is_reported() {
+        assert_eq!(
+            drift_report_level(time::Duration::seconds(4)),
+            log::Level::Info
+        );
+        assert_eq!(
+            drift_report_level(time::Duration::seconds(39)),
+            log::Level::Info
+        );
+    }
+
+    #[test]
+    fn a_whole_window_of_drift_warns() {
+        assert_eq!(
+            drift_report_level(time::Duration::seconds(40)),
+            log::Level::Warn
+        );
+    }
+
+    #[test]
+    fn drift_is_judged_by_magnitude_in_both_directions() {
+        // running early is just as wrong as running late
+        assert_eq!(
+            drift_report_level(time::Duration::seconds(-40)),
+            log::Level::Warn
+        );
+        assert_eq!(
+            drift_report_level(time::Duration::seconds(-4)),
+            log::Level::Info
+        );
+        assert_eq!(
+            drift_report_level(time::Duration::seconds(-3)),
+            log::Level::Debug
+        );
+    }
+
+    #[test]
+    fn the_first_report_has_nothing_to_compare_against() {
+        assert_eq!(
+            format_drift(time::Duration::seconds(20), None),
+            "airing 20.0s late"
+        );
+    }
+
+    #[test]
+    fn a_later_report_names_what_the_last_item_added() {
+        // the worked example: 20s entering the item, 25s leaving it
+        assert_eq!(
+            format_drift(
+                time::Duration::seconds(25),
+                Some(time::Duration::seconds(20))
+            ),
+            "airing 25.0s late (+5.0s over the last item)"
+        );
+    }
+
+    #[test]
+    fn an_item_that_recovers_time_shows_a_negative_contribution() {
+        assert_eq!(
+            format_drift(
+                time::Duration::seconds(18),
+                Some(time::Duration::seconds(25))
+            ),
+            "airing 18.0s late (-7.0s over the last item)"
+        );
     }
 }

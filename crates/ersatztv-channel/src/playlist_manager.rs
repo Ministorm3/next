@@ -116,6 +116,12 @@ impl PlaylistManager {
         &self.ready
     }
 
+    /// Where the next segment's program date time will land, which is the end
+    /// of all media emitted so far.
+    pub fn last_segment_end(&self) -> OffsetDateTime {
+        self.last_segment_end
+    }
+
     pub async fn before_new_pipeline(
         &mut self,
         new_pts_offset: Option<PtsOffset>,
