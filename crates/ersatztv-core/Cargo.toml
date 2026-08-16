@@ -3,7 +3,18 @@ name = "ersatztv-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# A structured record of every clock reading a channel worker takes. Off by
+# default. With it on the seam stays dormant until ETV_CLOCK_TRACE is set.
+clock-trace = ["dep:serde", "dep:time"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [dependencies]
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
 simple-expand-tilde = { workspace = true }
+time = { workspace = true, optional = true }
 tokio = { workspace = true }
