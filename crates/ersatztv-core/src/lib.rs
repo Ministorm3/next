@@ -2,6 +2,8 @@ use std::time::{Duration, Instant};
 
 use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
 
+#[cfg(feature = "clock-trace")]
+pub mod clock_trace;
 pub mod cohort;
 mod folder_lock;
 mod merge;

@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ersatztv_channel::error::{ChannelError, IoContext};
+#[cfg(feature = "clock-trace")]
+use ersatztv_core::clock_trace::{ClockEvent, ClockSnapshot, ClockTrace};
 use ersatztv_core::sidecar::{PlaylistSidecar, SidecarPipeline, SidecarSegment};
 use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT};
 use ffpipeline::pipeline::PtsOffset;
@@ -134,6 +136,9 @@ pub struct PlaylistManager {
     heartbeat_missing_warned: bool,
 
     last_progress: OffsetDateTime,
+
+    #[cfg(feature = "clock-trace")]
+    trace: ClockTrace,
 }
 
 #[derive(Clone)]
@@ -198,6 +203,31 @@ impl PlaylistManager {
             heartbeat_missing_warned: true,
 
             last_progress: OffsetDateTime::now_utc(),
+
+            #[cfg(feature = "clock-trace")]
+            trace: ClockTrace::disabled(),
+        }
+    }
+
+    /// Hands the manager the session's trace, so that emitted and sequence
+    /// readings come from the same file as the schedule readings.
+    #[cfg(feature = "clock-trace")]
+    pub fn set_clock_trace(&mut self, trace: ClockTrace) {
+        self.trace = trace;
+    }
+
+    /// The emitted and sequence readings at this instant.
+    ///
+    /// Callers that already hold the lock use this to stamp a record made
+    /// elsewhere, which is how a pipeline record carries E and Q without the
+    /// schedule side having to take the lock for itself.
+    #[cfg(feature = "clock-trace")]
+    pub fn clock_snapshot(&self) -> ClockSnapshot {
+        ClockSnapshot {
+            e_last_segment_end: self.last_segment_end,
+            e_session_start: self.current_session_start,
+            q_media_sequence: self.media_sequence,
+            q_segments_held: self.segments.len(),
         }
     }
 
@@ -341,6 +371,23 @@ impl PlaylistManager {
                 + (program_date_time - self.current_session_start).as_seconds_f64())
                 * 90_000.0) as u64)
                 % 8589934592;
+
+            // the one place the emitted clock moves, and it moves only by what
+            // ffmpeg reported
+            #[cfg(feature = "clock-trace")]
+            self.trace.emit(|| ClockEvent::SegmentAdded {
+                q_path: file.clone(),
+                q_media_sequence: self.media_sequence,
+                q_segments_held: self.segments.len(),
+                e_program_date_time: program_date_time,
+                e_duration_s: duration,
+                e_last_segment_end: self.last_segment_end,
+                e_session_start: self.current_session_start,
+                p_pts_offset_ms: self.pts_offset.unwrap_or_default().duration.as_millis() as u64,
+                p_mpegts_90khz: mpegts_90khz,
+                discontinuity: self.discontinuity_before.contains(&file),
+            });
+
             if let Some(src) = &mut self.subtitle_source {
                 let body = render_subtitle_segment(
                     src,
@@ -393,6 +440,21 @@ impl PlaylistManager {
                     self.discontinuity_before.remove(&removed.path);
                     self.discontinuity_sequence += 1;
                 }
+
+                // both sides of this comparison are emitted readings, because
+                // trim_cutoff measures back from the position being served
+                // rather than from the wall clock. the record says so, so that
+                // a reader can tell this build apart from one where the cutoff
+                // walks forward with real time and eats the retention
+                #[cfg(feature = "clock-trace")]
+                self.trace.emit(|| ClockEvent::SegmentTrimmed {
+                    q_path: removed.path.clone(),
+                    q_media_sequence: self.media_sequence,
+                    q_segments_held: self.segments.len(),
+                    e_program_date_time: removed.program_date_time,
+                    w_cutoff: None,
+                    e_trim_cutoff: Some(cutoff),
+                });
 
                 let path = self.output_folder.join(&removed.path);
                 tokio::fs::remove_file(&path)
@@ -609,10 +671,35 @@ impl PlaylistManager {
                 // monotonic clamp, in absolute media-sequence space
                 let candidate_ms = self.media_sequence + head.saturating_sub(max) as u64;
                 let clamped_ms = candidate_ms.max(self.last_served_media_sequence);
+
+                let skip = ((clamped_ms - self.media_sequence) as usize).min(head);
+
+                // read before the clamp floor moves, so a record shows what the
+                // window would have been as well as what it became
+                #[cfg(feature = "clock-trace")]
+                self.trace.emit(|| ClockEvent::Publish {
+                    w_horizon: horizon,
+                    q_media_sequence: self.media_sequence,
+                    q_candidate: candidate_ms,
+                    q_clamped: clamped_ms,
+                    q_last_served: self.last_served_media_sequence,
+                    q_skip: skip,
+                    q_limit: head - skip,
+                    q_head: head,
+                    q_segments_held: self.segments.len(),
+                    e_head_pdt: (head > skip)
+                        .then(|| self.segments.get(head - 1).map(|s| s.program_date_time))
+                        .flatten(),
+                    e_tail_pdt: (head > skip)
+                        .then(|| self.segments.get(skip).map(|s| s.program_date_time))
+                        .flatten(),
+                    e_oldest_pdt: self.segments.front().map(|s| s.program_date_time),
+                    e_last_segment_end: self.last_segment_end,
+                });
+
                 self.last_served_media_sequence = clamped_ms;
                 self.served_head = Some(clamped_ms);
 
-                let skip = ((clamped_ms - self.media_sequence) as usize).min(head);
                 (skip, head - skip)
             }
             None => (0, self.segments.len()),

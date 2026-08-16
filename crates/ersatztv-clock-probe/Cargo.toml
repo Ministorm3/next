@@ -1,0 +1,17 @@
+[package]
+name = "ersatztv-clock-probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { workspace = true }
+ersatztv-core = { workspace = true, features = ["clock-trace"] }
+serde_json = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "ersatztv-clock-probe"
+path = "src/main.rs"

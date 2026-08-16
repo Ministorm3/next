@@ -2,6 +2,7 @@
 members = [
     "crates/ersatztv",
     "crates/ersatztv-channel",
+    "crates/ersatztv-clock-probe",
     "crates/ersatztv-core",
     "crates/ersatztv-playout",
     "crates/ersatztv-playout-generator",
@@ -25,6 +26,7 @@ enum_dispatch = "0.3.13"
 env_logger = "0.11"
 ersatztv = { path = "crates/ersatztv" }
 ersatztv-channel = { path = "crates/ersatztv-channel" }
+ersatztv-clock-probe = { path = "crates/ersatztv-clock-probe" }
 ersatztv-core = { path = "crates/ersatztv-core" }
 ersatztv-playout = { path = "crates/ersatztv-playout" }
 ffpipeline = { path = "crates/ffpipeline" }

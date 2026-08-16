@@ -10,6 +10,8 @@ use ersatztv_channel::error::{ChannelError, IoContext};
 use ersatztv_channel::slate::{self, SlateFile};
 use ersatztv_channel::variant_manager;
 use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
+#[cfg(feature = "clock-trace")]
+use ersatztv_core::clock_trace::{ClockEvent, ClockTrace, Level, TracedInput};
 use ersatztv_core::{READY_FILE_NAME, empty_folder};
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -156,6 +158,13 @@ pub struct ChannelSession {
     /// Exclusive ownership of the output folder, held for the life of this
     /// session so a second worker for the same folder refuses to start.
     _output_folder_lock: ersatztv_core::FolderLock,
+
+    #[cfg(feature = "clock-trace")]
+    trace: ClockTrace,
+    /// Counts pipelines so that a start record and its end record can be
+    /// paired even when several items share a name.
+    #[cfg(feature = "clock-trace")]
+    pipeline_seq: u64,
 }
 
 impl ChannelSession {
@@ -227,7 +236,11 @@ impl ChannelSession {
 
         let playout_loader = PlayoutLoader::new(&channel_config);
         let pts_scanner = PtsScanner::new(&channel_config);
-        let playlist_manager = PlaylistManager::new(
+        // the emitted clock is seeded from the unshifted reading while the
+        // schedule cursor below takes the shifted one; a virtual start moves
+        // item selection without moving the stamps clients see
+        #[cfg_attr(not(feature = "clock-trace"), allow(unused_mut))]
+        let mut playlist_manager = PlaylistManager::new(
             now,
             SEGMENT_SECONDS,
             output_folder.to_owned(),
@@ -238,6 +251,11 @@ impl ChannelSession {
                 ffmpeg_playlist_file: ffmpeg_output_file.to_owned(),
             },
         );
+
+        #[cfg(feature = "clock-trace")]
+        let trace = ClockTrace::from_env(channel_config.number());
+        #[cfg(feature = "clock-trace")]
+        playlist_manager.set_clock_trace(trace.clone());
 
         let playlist_manager = Arc::new(Mutex::new(playlist_manager));
 
@@ -261,6 +279,15 @@ impl ChannelSession {
             .build()
             .map_err(|e| ChannelError::ChannelStartup(format!("http client: {e}")))?;
 
+        #[cfg(feature = "clock-trace")]
+        trace.emit(|| ClockEvent::SessionStart {
+            w_local: now,
+            start_time_offset_ms: start_time_offset.whole_milliseconds() as i64,
+            s_transcoded_until: now + start_time_offset,
+            e_last_segment_end: now,
+            segment_seconds: SEGMENT_SECONDS,
+        });
+
         Ok(ChannelSession {
             channel_config,
             playout_loader,
@@ -283,6 +310,10 @@ impl ChannelSession {
             published_recognized_params: None,
             query_parameters: std::collections::HashMap::new(),
             _output_folder_lock: output_folder_lock,
+            #[cfg(feature = "clock-trace")]
+            trace,
+            #[cfg(feature = "clock-trace")]
+            pipeline_seq: 0,
         })
     }
 
@@ -766,6 +797,11 @@ impl ChannelSession {
                 .await;
         }
 
+        // true when nothing covered the cursor, or resolving what did failed,
+        // so black filled the slot instead
+        #[cfg_attr(not(feature = "clock-trace"), allow(unused_variables))]
+        let filler = current_item_result.is_err();
+
         let current_item = match current_item_result {
             Ok(playout_item) => playout_item,
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
@@ -816,6 +852,18 @@ impl ChannelSession {
         };
 
         let pts_duration = pts_time.map(|p| p.duration);
+
+        #[cfg(feature = "clock-trace")]
+        self.trace.emit(|| ClockEvent::ItemSelected {
+            item_id: current_item.id.clone(),
+            s_transcoded_until: self.transcoded_until,
+            s_item_start: current_item.start,
+            s_item_finish: current_item.finish,
+            p_scanned_pts_ms: pts_duration.map(|d| d.as_millis() as u64),
+            state: self.state.to_string(),
+            realtime,
+            filler,
+        });
 
         let result = self
             .transcode_item(&current_item, realtime, troubleshoot, pts_duration, slate)
@@ -1112,6 +1160,19 @@ impl ChannelSession {
         }
 
         let pts_offset = output_settings.pts_offset;
+
+        // the source positions have to be read before generate_pipeline
+        // consumes the settings, but the emitted clock has to be read after
+        // the boundary below, so the two halves of the record are gathered at
+        // different points
+        #[cfg(feature = "clock-trace")]
+        let planned = self.trace.wants(Level::Items).then(|| {
+            (
+                traced_inputs(&input_settings),
+                input_settings.playout_offset.as_millis() as u64,
+            )
+        });
+
         let mut pipeline_result =
             pipeline::generate_pipeline(&self.ffmpeg_info, input_settings, output_settings)?;
         pipeline_result.optimize();
@@ -1131,6 +1192,30 @@ impl ChannelSession {
                 slate,
             )
             .await?;
+
+        // read after the boundary on purpose. before it, the outgoing
+        // pipeline's last segments have not been absorbed yet, so the emitted
+        // clock still stands where the previous item left it and the gap
+        // against the schedule reads as a swing that is not there
+        #[cfg(feature = "clock-trace")]
+        if let Some((inputs, s_playout_offset_ms)) = planned {
+            self.pipeline_seq += 1;
+            let snapshot = self.playlist_manager.lock().await.clock_snapshot();
+            self.trace.emit(|| ClockEvent::PipelineStart {
+                pipeline_seq: self.pipeline_seq,
+                item_id: current_item.id.clone(),
+                start_at_zero,
+                is_live,
+                s_playout_offset_ms,
+                s_item_start: current_item.start,
+                s_timing_finish: std::cmp::min(audio_timing.finish, video_timing.finish),
+                p_pts_offset_ms: pts_offset.map(|o| o.duration.as_millis() as u64),
+                inputs,
+                is_complete_expected: is_live
+                    || (audio_timing.is_complete && video_timing.is_complete),
+                snapshot,
+            });
+        }
 
         // stream current item
         let mut ffmpeg_child = tokio::process::Command::new(&self.ffmpeg_path)
@@ -1182,6 +1267,7 @@ impl ChannelSession {
                 let status = status.map_err(|e| ChannelError::StreamFailure(e.to_string()))?;
                 let _ = reader_handle.await;
                 if !status.success() {
+                    self.trace_pipeline_end(current_item, None, false, "failed");
                     self.write_dossier(                        current_item,
                         &video_probe_result,                        &audio_probe_result,
                         subtitle_probe_result.as_ref(),
@@ -1201,6 +1287,7 @@ impl ChannelSession {
             _ = self.timeout_notify.notified() => {
                 ffmpeg_child.kill().await.ok();
                 let _ = reader_handle.await;
+                self.trace_pipeline_end(current_item, None, false, "idle_timeout");
                 self.cleanup_old_report().await;
                 return Err(ChannelError::IdleTimeout(self.channel_config.number().to_owned()));
             }
@@ -1216,6 +1303,7 @@ impl ChannelSession {
                 } => {
                 ffmpeg_child.kill().await.ok();
                 let _ = reader_handle.await;
+                self.trace_pipeline_end(current_item, None, false, "stalled");
                 self.write_dossier(current_item, &video_probe_result, &audio_probe_result,
                     subtitle_probe_result.as_ref(), &ring, "ffmpeg stalled".to_string()).await;
                 return Err(ChannelError::Stalled(self.channel_config.number().to_owned()));
@@ -1225,7 +1313,29 @@ impl ChannelSession {
         let finish = std::cmp::min(audio_timing.finish, video_timing.finish);
         let is_complete = is_live || (audio_timing.is_complete && video_timing.is_complete);
 
+        self.trace_pipeline_end(current_item, Some(finish), is_complete, "ok");
+
         Ok((finish, is_complete))
+    }
+
+    /// Records where a pipeline left the schedule cursor, or that it ended
+    /// without moving it.
+    #[cfg_attr(not(feature = "clock-trace"), allow(unused_variables))]
+    fn trace_pipeline_end(
+        &self,
+        current_item: &PlayoutItem,
+        s_finish: Option<OffsetDateTime>,
+        is_complete: bool,
+        outcome: &str,
+    ) {
+        #[cfg(feature = "clock-trace")]
+        self.trace.emit(|| ClockEvent::PipelineEnd {
+            pipeline_seq: self.pipeline_seq,
+            item_id: current_item.id.clone(),
+            s_finish,
+            is_complete,
+            outcome: outcome.to_owned(),
+        });
     }
 
     fn next_state(state: ChannelSessionState, is_complete: bool) -> ChannelSessionState {
@@ -2108,6 +2218,55 @@ fn item_failed_message(item: &PlayoutItem, error: &ChannelError) -> String {
         "item {} ({} .. {}) failed, replacing with black/silence: {error}",
         item.id, item.start, item.finish
     )
+}
+
+/// Every input as the encoder was told to read it, on the source content
+/// clock. The video entry carries the frame rate because the law that governs
+/// how a source duration turns into an emitted one needs it.
+#[cfg(feature = "clock-trace")]
+fn traced_inputs(input_settings: &InputSettings) -> Vec<TracedInput> {
+    let frame_rate = input_settings
+        .select_video_stream()
+        .ok()
+        .map(|v| v.frame_rate.r_frame_rate.clone());
+
+    let mut inputs = vec![
+        traced_input("video", &input_settings.video_input, frame_rate),
+        traced_input("audio", &input_settings.audio_input, None),
+    ];
+
+    if let Some(subtitle) = input_settings.subtitle_input.as_ref() {
+        inputs.push(traced_input("subtitle", subtitle, None));
+    }
+
+    inputs
+}
+
+#[cfg(feature = "clock-trace")]
+fn traced_input(role: &str, input: &ProbedInput, c_frame_rate: Option<String>) -> TracedInput {
+    // a file name is enough to identify a source in a trace, and a full path
+    // or a host would put an operator's install into a file meant for sharing
+    let (kind, name) = match &input.input_source {
+        InputSource::Local(local) => (
+            "local",
+            Path::new(&local.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+        ),
+        InputSource::Lavfi(lavfi) => ("lavfi", Some(lavfi.params.clone())),
+        InputSource::Http(_) => ("http", None),
+        InputSource::Rtsp(_) => ("rtsp", None),
+    };
+
+    TracedInput {
+        role: role.to_owned(),
+        kind: kind.to_owned(),
+        name,
+        c_in_point_ms: input.in_point.as_millis() as u64,
+        c_out_point_ms: input.out_point.as_millis() as u64,
+        c_frame_rate,
+        c_probed_duration_ms: input.probe_result.duration.map(|d| d.as_millis() as u64),
+    }
 }
 
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
