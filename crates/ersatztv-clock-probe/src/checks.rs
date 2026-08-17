@@ -74,6 +74,13 @@ impl Default for Limits {
     }
 }
 
+/// How much schedule a run must cover before a drift rate means anything.
+///
+/// Below this the rate is mostly the extrapolation: a few milliseconds of
+/// ordinary jitter over a minute scales to hundreds per hour and looks exactly
+/// like the ratchet the rate exists to catch.
+const MIN_RATE_WINDOW_HOURS: f64 = 5.0 / 60.0;
+
 pub fn run(timeline: &Timeline, limits: Limits) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -212,6 +219,12 @@ fn stamp_drift(timeline: &Timeline, limits: Limits) -> Vec<Finding> {
         0
     };
 
+    // a rate read off a window this short is mostly the extrapolation. A few
+    // milliseconds of ordinary jitter over a minute scales to hundreds per
+    // hour, which is indistinguishable from the ratchet the rate exists to
+    // catch, so below the floor the total is the only thing judged.
+    let rate_is_meaningful = elapsed_hours >= MIN_RATE_WINDOW_HOURS;
+
     // a defect moves the same way every item; jitter does not. counting the
     // signs separates the two without needing a long run
     let mut up = 0;
@@ -225,20 +238,29 @@ fn stamp_drift(timeline: &Timeline, limits: Limits) -> Vec<Finding> {
     }
     let ratchet = up.max(down);
 
-    let severity =
-        if total.abs() > limits.max_drift_ms || rate.abs() > limits.max_drift_rate_ms_per_hour {
-            Severity::Fail
-        } else {
-            Severity::Info
-        };
+    let severity = if total.abs() > limits.max_drift_ms
+        || (rate_is_meaningful && rate.abs() > limits.max_drift_rate_ms_per_hour)
+    {
+        Severity::Fail
+    } else {
+        Severity::Info
+    };
+
+    let rate_note = if rate_is_meaningful {
+        format!("{rate:+}ms per hour of schedule")
+    } else {
+        format!(
+            "{rate:+}ms per hour extrapolated, not judged over only {:.0}s of schedule",
+            elapsed_hours * 3_600.0
+        )
+    };
 
     let mut findings = vec![Finding::new(
         "stamp-drift",
         severity,
         format!(
             "emitted media ran {total:+}ms against the schedule over {steps} steps, {per_item:+}ms \
-             per item, {rate:+}ms per hour of schedule; {ratchet} of {steps} steps moved the same \
-             way"
+             per item, {rate_note}; {ratchet} of {steps} steps moved the same way"
         ),
     )];
 
@@ -438,6 +460,21 @@ fn trim_safety(timeline: &Timeline) -> Vec<Finding> {
 /// The cutoff walks forward with the wall clock while the stamps do not, so
 /// retention is the budget minus that lag, and zero once the lag reaches it.
 fn retention(timeline: &Timeline, limits: Limits) -> Vec<Finding> {
+    // until the first trim, held history is simply everything the channel has
+    // made and is still growing toward the budget. Judging it then reports a
+    // channel that has discarded nothing as having discarded too much, which
+    // is what a short run does.
+    if timeline.trims.is_empty() {
+        return vec![Finding::new(
+            "retention",
+            Severity::Info,
+            String::from(
+                "nothing has been trimmed yet, so held history is still filling and says nothing \
+                 about what this channel retains",
+            ),
+        )];
+    }
+
     let held: Vec<(i128, i128)> = timeline
         .publishes
         .iter()

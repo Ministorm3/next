@@ -159,6 +159,16 @@ fn a_channel_that_has_fallen_behind_loses_its_history() {
     let mut builder = Builder::new();
     for _ in 0..20 {
         builder.publish(8_000, 112_000);
+        // the collapse is the cutoff walking into live content, so this
+        // channel is necessarily trimming while it happens
+        builder.push(ClockEvent::SegmentTrimmed {
+            q_path: String::from("live000001.ts"),
+            q_media_sequence: 1,
+            q_segments_held: 2,
+            e_program_date_time: builder.w - Duration::minutes(3),
+            w_cutoff: Some(builder.w - Duration::minutes(2)),
+            e_trim_cutoff: None,
+        });
         builder.tick(2_000);
     }
 

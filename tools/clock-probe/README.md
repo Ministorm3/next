@@ -110,6 +110,14 @@ Thresholds are flags on `check`. `--max-drift-rate-ms-per-hour` matters most:
 a rate catches a ratchet that any tolerable absolute limit lets through. The
 2026-08-14 padding regression was 113ms over seventeen items.
 
+**Run for at least five minutes.** Below that the rate is reported but not
+judged, and the reading says so, because a few milliseconds of ordinary jitter
+over a minute extrapolates to hundreds per hour and is indistinguishable from
+a real ratchet. A short run still fails on the total, so a gross defect is
+caught either way, but a subtle one needs the window. Retention likewise says
+nothing until the first trim, because before that the held history is simply
+everything the channel has made and is still climbing toward the budget.
+
 ## Running a bench
 
 ```bash
