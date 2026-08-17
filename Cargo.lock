@@ -464,6 +464,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ersatztv-clock-probe"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ersatztv-core",
+ "serde_json",
+ "tempfile",
+ "time",
+]
+
+[[package]]
 name = "ersatztv-core"
 version = "0.1.0"
 dependencies = [
@@ -474,6 +485,7 @@ dependencies = [
  "serde_json",
  "simple-expand-tilde",
  "tempfile",
+ "time",
  "tokio",
 ]
 

@@ -164,7 +164,15 @@ Taken on `origin/main` at 4eec042, 640x360, roughly 200 seconds per run.
 
 | run | result |
 |---|---|
-| default | `stamp-drift` fails, about -60000ms per hour. Only `b1` and `b2` rows carry a nonzero `err`, at -407 and -380ms, which is the shortfall staircase. |
-| `virtual_start` one hour ahead | corrected -3169ms, uncorrected -3598491ms. The difference is the whole offset. |
+| default | `stamp-drift` fails, about -54000ms per hour. Only `b1` and `b2` rows carry a nonzero `err`, at -407 and -380ms, which is the shortfall staircase. `trim-domain` warns, because the cutoff is a wall clock reading. |
+| `virtual_start` one hour ahead | corrected -3169ms, uncorrected -3598491ms. The difference is the whole offset, and acting on the uncorrected number is what PR #212 does. |
+| a build carrying the padding and trim fixes | -1ms over 33 steps, 0ms per item, and `trim-domain` reports the served position instead. |
 
-A change to padding, to the duration cut, or to the trim should rerun both.
+The third row is the point. The same bench and the same content separate a
+build that has the fixes from one that does not, in one line each, which is
+what makes this usable as a gate rather than only as a microscope.
+
+A change to padding, to the duration cut, or to the trim should rerun all
+three. The failing arm matters as much as the passing one: a green result from
+an instrument that has not reproduced the defect is what shipped the
+regression.
