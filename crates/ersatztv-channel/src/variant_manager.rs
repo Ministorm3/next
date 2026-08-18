@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::composer::{SEGMENT_SECONDS, SessionPlaylist};
+use crate::composer::{ComposedEntry, SEGMENT_SECONDS, SessionPlaylist, parse_pdt};
 use crate::slate::{SlateFile, read_slate_file};
 
 /// How many cohorts one channel transcodes variants for at once. Cohorts
@@ -114,6 +114,16 @@ struct VariantSession {
     playlist: SessionPlaylist,
     subtitle_playlist: SessionPlaylist,
     spawned_items: HashSet<String>,
+    /// References the served-window audit has already reported missing, so a
+    /// gone file is one warning instead of one per tick. Pruned to the
+    /// current window, so it cannot grow with the life of the session.
+    audit_warned_missing: HashSet<String>,
+    /// The deepest reach behind the wall clock among the substituted entries
+    /// served so far in the current variant-content stretch, in ms. Logged
+    /// and cleared when the window returns to all-shared content. This is
+    /// the measured answer to how much retention a variant actually needs
+    /// (see `VARIANT_HISTORY_DURATION` in the playlist manager).
+    audit_reach_max_ms: Option<u64>,
 }
 
 /// A cohort request found in the output folder: the token naming it, and the
@@ -328,6 +338,8 @@ impl VariantSession {
             )),
             subtitle_playlist: SessionPlaylist::default(),
             spawned_items: HashSet::new(),
+            audit_warned_missing: HashSet::new(),
+            audit_reach_max_ms: None,
         }
     }
 
@@ -375,7 +387,110 @@ impl VariantSession {
             &subtitles,
         )
         .await;
+
+        self.audit_served_window(channel, variant.as_ref(), now)
+            .await;
     }
+
+    /// Audits what the media playlist just published against what actually
+    /// backs it. Nothing else can see this failure: the server's static file
+    /// handler serves a bare 404 without logging, and any monitor that reads
+    /// the playlist sees a perfectly healthy window even while a file behind
+    /// it is gone.
+    ///
+    /// Two measurements. Every referenced file must still exist on disk; a
+    /// missing one is the trim-under-reference failure actually happening
+    /// (or a twin that was never produced), warned once per file. And the
+    /// deepest reach behind the wall clock into variant content, measured on
+    /// the variant's own stamps because those are the clock its retention
+    /// trim runs on; the maximum over a substituted stretch, logged when the
+    /// stretch leaves the window, is the observed answer to how much
+    /// retention a variant actually needs (see `VARIANT_HISTORY_DURATION`).
+    /// Only the media window is audited: the subtitle playlist mirrors its
+    /// decisions, and trims delete both files together.
+    async fn audit_served_window(
+        &mut self,
+        channel: &VariantChannel,
+        variant: Option<&PlaylistSidecar>,
+        now: OffsetDateTime,
+    ) {
+        let entries: Vec<(String, u64, bool)> = self
+            .playlist
+            .served_window()
+            .map(|e| (e.path.clone(), e.sequence, e.variant))
+            .collect();
+
+        let mut has_variant_entries = false;
+        for (path, sequence, is_variant) in &entries {
+            has_variant_entries |= is_variant;
+            let file = channel.output_folder.join(path);
+            let exists = tokio::fs::try_exists(&file).await.unwrap_or(false);
+            if !exists && self.audit_warned_missing.insert(path.clone()) {
+                log::warn!(
+                    "[{}] composed window references {path} (position {sequence}, {}) but \
+                     no file backs it on disk; every viewer of this cohort gets a 404 at \
+                     this position",
+                    self.playlist.label(),
+                    if *is_variant {
+                        "a variant twin"
+                    } else {
+                        "a shared segment"
+                    },
+                );
+            }
+        }
+        self.audit_warned_missing
+            .retain(|warned| entries.iter().any(|(path, ..)| path == warned));
+
+        if has_variant_entries {
+            let reach = variant.and_then(|v| {
+                deepest_variant_reach_ms(
+                    self.playlist.served_window(),
+                    v,
+                    &self.variant_prefix,
+                    now,
+                )
+            });
+            if let Some(reach) = reach {
+                self.audit_reach_max_ms =
+                    Some(self.audit_reach_max_ms.map_or(reach, |max| max.max(reach)));
+            }
+        } else if let Some(max) = self.audit_reach_max_ms.take() {
+            log::info!(
+                "[{}] substituted stretch left the served window; deepest composed reach \
+                 into variant content was {max}ms behind the wall clock",
+                self.playlist.label(),
+            );
+        }
+    }
+}
+
+/// The deepest reach behind `now` among the served window's variant entries,
+/// in ms. Measured on the variant's OWN segment stamps, never the composed
+/// entry's: a substituted entry re-stamps the twin with the shared session's
+/// program date time, while the variant's retention trim deletes files by the
+/// stamps in its own playlist, so only the sidecar's stamp can say how close
+/// a referenced file is to deletion. A twin the sidecar no longer lists
+/// cannot be measured and is skipped; the existence check reports it if its
+/// file is truly gone.
+fn deepest_variant_reach_ms<'a>(
+    window: impl Iterator<Item = &'a ComposedEntry>,
+    variant: &PlaylistSidecar,
+    variant_prefix: &str,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    window
+        .filter(|entry| entry.variant)
+        .filter_map(|entry| {
+            let twin_path = entry.path.strip_prefix(variant_prefix)?;
+            let stamp = variant
+                .segments
+                .iter()
+                .find(|segment| segment.path == twin_path)?;
+            let stamp = parse_pdt(&stamp.program_date_time)?;
+            Some((now - stamp).whole_milliseconds().max(0) as u64)
+        })
+        .max()
 }
 
 /// Reads every published cohort request, dropping the ones no viewer has
@@ -1745,6 +1860,108 @@ mod tests {
                 cohort_query: String::from("zip=15216"),
                 without_path: true
             }
+        );
+    }
+
+    /// A composed entry as the audit sees it. The program date time is the
+    /// SHARED stamp, deliberately different from any variant stamp a test
+    /// gives the sidecar, so measuring on the wrong clock cannot pass.
+    fn served(path: &str, variant: bool, shared_stamp: OffsetDateTime) -> ComposedEntry {
+        ComposedEntry {
+            path: path.to_owned(),
+            duration: 4.0,
+            program_date_time: shared_stamp,
+            discontinuity: false,
+            sequence: 0,
+            variant,
+        }
+    }
+
+    fn twin(path: &str, stamp: OffsetDateTime) -> SidecarSegment {
+        SidecarSegment {
+            path: path.to_owned(),
+            duration: 4.0,
+            program_date_time: crate::composer::format_pdt(stamp),
+            item_id: String::from("game"),
+            discontinuity: false,
+        }
+    }
+
+    fn variant_sidecar(segments: Vec<SidecarSegment>) -> PlaylistSidecar {
+        PlaylistSidecar {
+            segments,
+            pipelines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reach_is_measured_on_the_variants_own_stamps() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        // the shared stamp says this position is current; the variant's own
+        // stamp says the file is 100s old, and the trim runs on that clock
+        let window = [served("variants/abc/live000003.ts", true, now)];
+        let variant = variant_sidecar(vec![twin(
+            "live000003.ts",
+            now - time::Duration::seconds(100),
+        )]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn reach_takes_the_deepest_entry_of_the_window() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        let window = [
+            served("variants/abc/live000003.ts", true, now),
+            served("variants/abc/live000004.ts", true, now),
+        ];
+        let variant = variant_sidecar(vec![
+            twin("live000003.ts", now - time::Duration::seconds(90)),
+            twin("live000004.ts", now - time::Duration::seconds(40)),
+        ]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            Some(90_000)
+        );
+    }
+
+    /// Shared entries are on the shared session's retention and are not this
+    /// measurement; a twin the sidecar no longer lists cannot be measured on
+    /// any clock and must not poison the maximum with a guess.
+    #[test]
+    fn shared_entries_and_unlisted_twins_are_not_measured() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        let ancient = now - time::Duration::seconds(900);
+        let window = [
+            served("live000900.ts", false, ancient),
+            served("variants/abc/live000007.ts", true, ancient),
+        ];
+        let variant = variant_sidecar(vec![twin("live000900.ts", ancient)]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            None
+        );
+    }
+
+    /// A twin stamped ahead of the wall clock is worked-ahead content, not a
+    /// retention concern; it reads as zero reach rather than wrapping.
+    #[test]
+    fn a_twin_ahead_of_the_wall_clock_reaches_zero() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        let window = [served("variants/abc/live000009.ts", true, now)];
+        let variant = variant_sidecar(vec![twin(
+            "live000009.ts",
+            now + time::Duration::seconds(30),
+        )]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            Some(0)
         );
     }
 }

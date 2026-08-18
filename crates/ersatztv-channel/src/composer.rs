@@ -213,14 +213,14 @@ pub struct SessionPlaylist {
     consecutive_resets: u32,
 }
 
-fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
     let format = format_description!(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
     );
     OffsetDateTime::parse(input, format).ok()
 }
 
-fn format_pdt(pdt: OffsetDateTime) -> String {
+pub(crate) fn format_pdt(pdt: OffsetDateTime) -> String {
     let format = format_description!(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
     );
@@ -408,6 +408,18 @@ impl SessionPlaylist {
         self.reconcile(timeline);
         self.trim(now);
         self.render(shared_head, now, target_duration, map_path)
+    }
+
+    /// The entries the last render published: the served window starting at
+    /// the serve head. Empty before the first render. This is exactly the
+    /// set of segment references a viewer of this cohort can currently
+    /// request, which makes it what the variant manager's served-window
+    /// audit checks against disk.
+    pub fn served_window(&self) -> impl Iterator<Item = &ComposedEntry> + '_ {
+        let skip = self.serve_head.map_or(self.entries.len(), |head| {
+            head.saturating_sub(self.head_sequence) as usize
+        });
+        self.entries.iter().skip(skip).take(SERVED_SEGMENTS)
     }
 
     /// Decides each templated item's fate. A variant whose recorded anchor
@@ -2300,6 +2312,37 @@ mod tests {
         // shared segment 1 is behind the head; the leading newline keeps
         // this from matching the variant's own live000001.ts
         assert!(!rendered.contains("\nlive000001.ts"));
+    }
+
+    /// `served_window` exists so the audit can check the exact references a
+    /// viewer can request; if it and the rendered playlist ever disagree,
+    /// the audit is checking files nobody serves.
+    #[test]
+    fn served_window_lists_exactly_what_render_published() {
+        let mut session = SessionPlaylist::default();
+        let shared = long_shared_with_templated_item(16);
+        let variant = long_variant_for_game(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+
+        assert!(
+            session.served_window().next().is_none(),
+            "nothing is served before the first render"
+        );
+
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            Some(2),
+            now,
+            4,
+            |s| s.to_owned(),
+        );
+
+        let published: Vec<&str> = rendered.lines().filter(|l| l.ends_with(".ts")).collect();
+        let window: Vec<&str> = session.served_window().map(|e| e.path.as_str()).collect();
+        assert!(!published.is_empty());
+        assert_eq!(window, published);
     }
 
     /// The head never chases past this timeline's own last full window. The
