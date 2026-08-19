@@ -20,7 +20,8 @@ pub struct OutputSettings {
     pub pts_offset: Option<PtsOffset>,
     /// Pad an under-running source to the output -t clamp (cloned last video
     /// frame; audio is always padded), so the item's PTS envelope always ends
-    /// exactly at pts_offset + duration.
+    /// exactly at pts_offset + duration. Used for items whose transcode must
+    /// end on an exact, reproducible timestamp.
     pub pad_to_duration: bool,
     pub realtime: bool,
     pub is_live: bool,
