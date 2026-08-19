@@ -3,9 +3,9 @@
 //! Variables use single braces and are distinct from `{{ENV_VAR}}` templates,
 //! which are expanded separately (and first):
 //!
-//! - `{channel_number}` or `{channel_number|default}` — the channel this
+//! - `{channel_number}` or `{channel_number|default}`, the channel this
 //!   playout is transcoding for
-//! - `{query:name}` or `{query:name|default}` — a caller-supplied request
+//! - `{query:name}` or `{query:name|default}`, a caller-supplied request
 //!   parameter, where `name` matches `[A-Za-z0-9_.-]+`
 //!
 //! A variable resolves to its default (or an empty string) when no value is
@@ -22,7 +22,8 @@ use url::Url;
 // absent so the template's own default is used instead
 const MAXIMUM_VALUE_LENGTH: usize = 256;
 
-// the characters Uri.EscapeDataString leaves alone: ALPHA / DIGIT / - . _ ~
+// rfc 3986 2.3 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~", the
+// characters that need no percent-encoding anywhere in a uri
 const ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
@@ -527,6 +528,35 @@ mod tests {
                 &HashMap::new(),
             );
             assert_eq!(result, "http://localhost:8000/stream?id=30.1");
+        }
+
+        // The two tests above supply no parameters, which returns the
+        // defaults-only expansion before the encoder is ever reached. These
+        // two keep a caller value present so the encoder is live, which is
+        // the only state where "trusted content is substituted verbatim" is
+        // observable at all.
+
+        #[test]
+        fn does_not_encode_defaults_while_encoding_caller_values() {
+            let result = expand_url(
+                "http://localhost:8000/{query:path|region/west/hd}/{query:name}.m3u8",
+                Some("30"),
+                &params(&[("name", "a/b")]),
+            );
+            assert_eq!(result, "http://localhost:8000/region/west/hd/a%2Fb.m3u8");
+        }
+
+        #[test]
+        fn does_not_encode_channel_number_while_encoding_caller_values() {
+            // nothing constrains a channel number to the characters the
+            // escape set leaves alone, and it comes from the lineup rather
+            // than from the caller
+            let result = expand_url(
+                "http://localhost:8000/{channel_number}/{query:name}.m3u8",
+                Some("west/30"),
+                &params(&[("name", "a/b")]),
+            );
+            assert_eq!(result, "http://localhost:8000/west/30/a%2Fb.m3u8");
         }
 
         #[test]
