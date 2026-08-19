@@ -952,16 +952,11 @@ impl ChannelSession {
         let item_start = current_item.start;
         let item_finish = current_item.finish;
         let item_duration = current_item.finish - current_item.start;
+        let item_slot_ms = item_duration.whole_milliseconds().max(0) as u64;
         let item_in_point_base_ms = match source {
             PlayoutItemSource::Local { in_point_ms, .. }
             | PlayoutItemSource::Http { in_point_ms, .. } => in_point_ms.unwrap_or(0),
             _ => 0,
-        };
-        let item_out_point_ms = match source {
-            PlayoutItemSource::Local { out_point_ms, .. }
-            | PlayoutItemSource::Http { out_point_ms, .. } => out_point_ms
-                .unwrap_or(item_in_point_base_ms + item_duration.whole_milliseconds() as u64),
-            _ => item_in_point_base_ms + item_duration.whole_milliseconds() as u64,
         };
 
         let effective_now = if start_at_zero {
@@ -981,6 +976,22 @@ impl ChannelSession {
                 finish: item_finish,
                 is_complete: true,
             };
+        }
+
+        let explicit_out_point_ms = match source {
+            PlayoutItemSource::Local { out_point_ms, .. }
+            | PlayoutItemSource::Http { out_point_ms, .. } => *out_point_ms,
+            _ => None,
+        };
+        let (item_out_point_ms, overrun_ms) =
+            effective_out_point_ms(explicit_out_point_ms, item_in_point_base_ms, item_slot_ms);
+        if overrun_ms > 0 {
+            log::warn!(
+                "item {} out_point overruns its {}ms slot by {}ms; clamping to the slot",
+                current_item.id,
+                item_slot_ms,
+                overrun_ms
+            );
         }
 
         let progress_ms = if start_at_zero {
@@ -1374,6 +1385,31 @@ fn playout_timing_to_pipeline(
     })
 }
 
+/// An explicit out_point may narrow what an item plays from its source, but
+/// must never widen it past the item's scheduled slot. Emitted media is
+/// appended to one continuous timeline with no later reconciliation against
+/// the schedule, so every surplus millisecond permanently delays everything
+/// after it for viewers. Legacy playouts really do carry such out_points on
+/// fallback filler items (the value belongs to a longer item the scheduler
+/// considered and rejected), which surfaced as schedule drift of roughly 80
+/// seconds per hour of session uptime.
+///
+/// Returns the effective out_point and how much was clamped away.
+fn effective_out_point_ms(
+    explicit_out_point_ms: Option<u64>,
+    in_point_base_ms: u64,
+    slot_ms: u64,
+) -> (u64, u64) {
+    let slot_out_point_ms = in_point_base_ms + slot_ms;
+    match explicit_out_point_ms {
+        Some(out_point_ms) if out_point_ms > slot_out_point_ms => {
+            (slot_out_point_ms, out_point_ms - slot_out_point_ms)
+        }
+        Some(out_point_ms) => (out_point_ms, 0),
+        None => (slot_out_point_ms, 0),
+    }
+}
+
 fn source_is_live(source: &PlayoutItemSource) -> bool {
     matches!(
         source,
@@ -1446,5 +1482,45 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
         streams: video.chain(audio).chain(subtitle).collect(),
         duration: hint.duration_ms.map(Duration::from_millis),
         format_name: hint.format_name.clone().or(Some(String::from("mpegts"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_item_without_an_explicit_out_point_plays_exactly_its_slot() {
+        assert_eq!(effective_out_point_ms(None, 0, 50_209), (50_209, 0));
+    }
+
+    #[test]
+    fn an_out_point_inside_the_slot_narrows_what_plays() {
+        assert_eq!(effective_out_point_ms(Some(23_000), 0, 50_209), (23_000, 0));
+    }
+
+    #[test]
+    fn an_out_point_past_the_slot_is_clamped_to_the_slot() {
+        // channel 13, item 12124970: a 50.209s fallback filler slot carrying
+        // out_point 60.007s from the item the legacy scheduler rejected; the
+        // 9.798s surplus accrued as permanent schedule drift every block
+        assert_eq!(
+            effective_out_point_ms(Some(60_007), 0, 50_209),
+            (50_209, 9_798)
+        );
+    }
+
+    #[test]
+    fn an_out_point_clamp_respects_an_explicit_in_point() {
+        // the slot is measured from the in_point, so a mid-file window may
+        // legitimately end past slot_ms alone
+        assert_eq!(
+            effective_out_point_ms(Some(80_000), 30_000, 50_000),
+            (80_000, 0)
+        );
+        assert_eq!(
+            effective_out_point_ms(Some(90_000), 30_000, 50_000),
+            (80_000, 10_000)
+        );
     }
 }
