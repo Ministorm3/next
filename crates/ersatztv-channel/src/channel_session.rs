@@ -769,7 +769,9 @@ impl ChannelSession {
         let current_item = match current_item_result {
             Ok(playout_item) => playout_item,
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
-                log::error!("{}", no_item_message(self.transcoded_until, next_start));
+                // a schedule gap is the one expected way to air black; the
+                // census line still counts it, but not at fault level
+                log::debug!("{}", no_item_message(self.transcoded_until, next_start));
                 self.fake_playout_item(next_start)
             }
             Err(err) => {
