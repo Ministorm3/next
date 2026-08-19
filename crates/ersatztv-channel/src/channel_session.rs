@@ -71,10 +71,11 @@ struct TimingResult {
     is_complete: bool,
 }
 
-/// Plain-data inputs for [`ChannelSession::build_output_settings`].
-/// `transcode_item` launches a real ffmpeg, so every decision that lives
-/// inline in it is invisible to the test suite; this seam lets tests reach
-/// the output settings a pipeline is actually built with.
+/// Plain-data inputs for [`ChannelSession::build_output_settings`]. Every
+/// field is something a test can construct, which is the point: while this
+/// construction lived inline in `transcode_item`, reverting a decision in it
+/// failed nothing, and the 2026-08-14 padding regression shipped through
+/// exactly that blindness.
 struct OutputSettingsPlan<'a> {
     channel_config: &'a ChannelConfig,
     accel: Option<ffpipeline::hw_accel::HardwareAccel>,
@@ -97,8 +98,6 @@ struct TimingPlan<'a> {
     realtime: bool,
     is_live: bool,
     transcoded_until: OffsetDateTime,
-    /// `last_segment_end - transcoded_until`: how far the stamp clock has
-    /// run past the schedule clock.
     stamp_error_ms: i64,
 }
 
@@ -1022,8 +1021,12 @@ impl ChannelSession {
         }
     }
 
-    /// The output settings for one pipeline, as a pure function of plain
-    /// inputs, so a test can observe what a pipeline is actually built with.
+    /// The output side of the pipeline as a pure function of plain inputs,
+    /// split out of `transcode_item` so the decisions in it can be pinned by
+    /// tests. `transcode_item` launches a real ffmpeg, so while a decision
+    /// lived inline there, reverting it failed nothing: that is how the
+    /// 2026-08-14 padding regression shipped, and the drift meter in
+    /// production was the first thing able to see it.
     fn build_output_settings(plan: OutputSettingsPlan) -> OutputSettings {
         let audio_norm = &plan.channel_config.normalization.audio;
         let video_norm = &plan.channel_config.normalization.video;
@@ -1112,8 +1115,9 @@ impl ChannelSession {
 
     /// The input timings for one pipeline, as a pure function of plain
     /// inputs. Same seam and same reason as
-    /// [`Self::build_output_settings`]: what the pipeline's -ss and -t are
-    /// derived from should be observable by a test.
+    /// [`Self::build_output_settings`]: the emission trim wiring lived
+    /// inline in `transcode_item`, where no test could observe whether it
+    /// was actually applied to what the -t consumes.
     fn plan_timings(plan: TimingPlan) -> PlannedTimings {
         let audio = Self::input_timing_at(
             plan.current_item,
@@ -1185,10 +1189,11 @@ impl ChannelSession {
     ///
     /// `stamp_error_ms` is the same timeline position read on the stamp clock
     /// and on the schedule clock, with the virtual start offset taken back out.
-    /// With every pipeline padded to its clamp, the -t cut is frame-quantized
-    /// upward (the frame straddling the cut is emitted whole), so each item
-    /// emits up to one frame more than its slot and the stamp clock
-    /// integrates that forever. Handing the measured error back to the next
+    /// The -t cut is frame-quantized upward (the frame straddling the cut is
+    /// emitted whole), so with every pipeline padded to its clamp each item
+    /// emits up to one frame more than its slot, and the stamp clock
+    /// integrates that forever: +531ms/hour on ch11, +262ms/hour on ch13,
+    /// live on 2026-08-14/15. Handing the measured error back to the next
     /// pipeline's output duration bounds it at about one frame instead.
     ///
     /// The correction is clamped so a wild clock (a failed pipeline, a
@@ -1204,9 +1209,8 @@ impl ChannelSession {
 
     /// Applies an emission trim to one input's timing. Only the emitted
     /// duration moves: `in_point` (where reading starts) and `finish` (how
-    /// far the schedule advances) are schedule-derived and stay untouched.
-    /// Output timing is measured, and measurement must never inform where a
-    /// source is read from.
+    /// far the schedule advances) are schedule-derived and stay untouched,
+    /// which is what keeps this on the right side of the PR #187 line.
     fn apply_emission_trim(timing: TimingResult, trim_ms: i64) -> TimingResult {
         let out_point = if trim_ms >= 0 {
             timing
@@ -1746,8 +1750,8 @@ mod tests {
         })
     }
 
-    /// A still image decodes as a single frame, so the encoder must be told
-    /// a rate to emit it at.
+    /// A still image decodes as a single frame since #211, so the encoder
+    /// must be told a rate to emit it at.
     #[test]
     fn a_still_image_forces_an_output_frame_rate() {
         assert!(output_settings(true, false, true).frame_rate.is_some());
@@ -1772,9 +1776,8 @@ mod tests {
         assert!(!output_settings(false, false, false).realtime);
     }
 
-    /// Every pipeline is padded, whatever kind of item it is. The emission
-    /// trim depends on this: only a padded pipeline can extend to cover a
-    /// negative stamp clock error.
+    /// The one-line caller change behind the 2026-08-14 regression, now
+    /// pinned: every pipeline is padded, whatever kind of item it is.
     #[test]
     fn every_pipeline_is_padded_to_its_clamp() {
         for realtime in [false, true] {
@@ -1789,13 +1792,14 @@ mod tests {
         }
     }
 
-    /// A plain file item occupying an 11.021 second slot.
+    /// A plain file item occupying an 11.021s slot, the shape of the logo
+    /// bump whose shortfall started the drift investigation.
     fn file_item() -> PlayoutItem {
         serde_json::from_value(serde_json::json!({
             "id": "file-item",
             "start": "2026-08-15T12:00:00.000-04:00",
             "finish": "2026-08-15T12:00:11.021-04:00",
-            "source": { "source_type": "local", "path": "/media/item.mp4" }
+            "source": { "source_type": "local", "path": "/bumps/logo.mp4" }
         }))
         .expect("a local file item deserializes")
     }
@@ -1876,7 +1880,7 @@ mod tests {
         assert_eq!(ChannelSession::emission_trim_ms(-6_500, 60_000), -500);
     }
 
-    /// A short pipeline gives back at most half of itself, so a short item can
+    /// A short pipeline gives back at most half of itself, so a bump can
     /// never be trimmed into nothing.
     #[test]
     fn a_trim_never_eats_more_than_half_the_pipeline() {
@@ -1885,7 +1889,7 @@ mod tests {
 
     /// Only the emitted duration moves. `in_point` is where reading starts
     /// and `finish` is how far the schedule advances; a trim that touched
-    /// either would be a measurement driving a seek.
+    /// either would be a measurement driving a seek, the PR #187 pattern.
     #[test]
     fn a_trim_moves_only_the_out_point() {
         let finish = OffsetDateTime::parse(
@@ -1921,8 +1925,8 @@ mod tests {
 
     /// The trim must land on what the -t actually consumes: both streams'
     /// out points. A trim that was computed but not applied here is exactly
-    /// the wiring gap that would let the drift keep integrating while every
-    /// unit test stays green.
+    /// the wiring gap that made the padding regression invisible to the
+    /// test suite.
     #[test]
     fn the_trim_reaches_every_stream_the_t_reads() {
         let item = file_item();
