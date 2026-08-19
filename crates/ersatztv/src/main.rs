@@ -227,13 +227,50 @@ async fn fix_content_types(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let is_m3u8 = request.uri().path().ends_with(".m3u8");
+    let path = request.uri().path();
+    let is_playlist = path.ends_with(".m3u8") || path.ends_with(".m3u");
+
+    // mime_guess maps .ts to a dlna vendor type that describes 192-byte
+    // timestamped packets; these segments are plain mpeg-2 transport streams,
+    // which iana registers as video/MP2T
+    let content_type = if path.ends_with(".m3u8") {
+        Some("application/vnd.apple.mpegurl")
+    } else if path.ends_with(".ts") {
+        Some("video/MP2T")
+    } else {
+        None
+    };
+
     let mut response = next.run(request).await;
-    if is_m3u8 && let Ok(value) = "application/vnd.apple.mpegurl".parse() {
+    if let Some(content_type) = content_type
+        && let Ok(value) = content_type.parse()
+    {
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, value);
     }
+
+    // Every playlist this server sends is generated per request, and none of
+    // them carry freshness information. RFC 9111 4.2.2 lets a cache apply a
+    // heuristic lifetime to exactly that case, so a shared cache may store a
+    // playlist and reuse it. Two things then go wrong: a media playlist is
+    // rewritten every few seconds, and a client handed an unchanged copy
+    // waits at least one target duration before asking again (RFC 8216
+    // 6.3.4), so its live edge stops advancing; and the multivariant playlist
+    // and channel lineup embed the scheme and host taken from this request's
+    // forwarded headers, so a stored copy can hand another client urls built
+    // for a different origin.
+    //
+    // no-cache still allows storing. It requires revalidation before reuse
+    // (RFC 9111 5.2.2.4), which is what a document that changes this often
+    // and varies by request needs. Segments are immutable and keep their
+    // current handling.
+    if is_playlist && let Ok(value) = "no-cache".parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CACHE_CONTROL, value);
+    }
+
     response
 }
 
@@ -368,4 +405,101 @@ async fn session_middleware(
     }
 
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::Service;
+
+    use super::*;
+
+    /// Drives the real middleware over a request, so the assertions cover
+    /// what a client actually receives rather than the classification alone.
+    async fn serve(path: &str) -> axum::response::Response {
+        let mut app = Router::new()
+            .route("/session/{channel}/live.m3u8", get(|| async { "#EXTM3U" }))
+            .route("/channel/{filename}", get(|| async { "#EXTM3U" }))
+            .route("/channels.m3u", get(|| async { "#EXTM3U" }))
+            .route("/xmltv.xml", get(|| async { "<tv/>" }))
+            .route(
+                "/session/{channel}/live000001.ts",
+                get(|| async { "segment" }),
+            )
+            .layer(axum::middleware::from_fn(fix_content_types));
+
+        let request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("the test request builds");
+
+        let response = app.call(request).await.expect("the router responds");
+        assert_eq!(response.status(), StatusCode::OK, "{path} must be routed");
+        response
+    }
+
+    fn cache_control(response: &axum::response::Response) -> Option<&str> {
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    fn content_type(response: &axum::response::Response) -> Option<&str> {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// A media playlist is rewritten every few seconds, so a cache must
+    /// revalidate before serving it to anyone else.
+    #[tokio::test]
+    async fn a_media_playlist_is_never_reused_without_revalidation() {
+        for path in ["/session/11/live.m3u8", "/channel/11.m3u8"] {
+            let response = serve(path).await;
+            assert_eq!(
+                cache_control(&response),
+                Some("no-cache"),
+                "{path} must not be reused without revalidation"
+            );
+        }
+    }
+
+    /// The channel lineup embeds the scheme and host from this request's
+    /// forwarded headers, so a stored copy would hand another client urls
+    /// built for a different origin.
+    #[tokio::test]
+    async fn the_channel_lineup_is_never_reused_without_revalidation() {
+        let response = serve("/channels.m3u").await;
+        assert_eq!(cache_control(&response), Some("no-cache"));
+    }
+
+    /// Segments are immutable, so the cache fix changes nothing for them.
+    #[tokio::test]
+    async fn a_segment_keeps_its_current_cache_handling() {
+        let response = serve("/session/11/live000001.ts").await;
+        assert_eq!(cache_control(&response), None);
+    }
+
+    /// The content type fix retypes media playlists to the HLS type and
+    /// transport stream segments to the iana-registered video/MP2T; nothing
+    /// else is retyped.
+    #[tokio::test]
+    async fn only_playlists_and_segments_are_retyped() {
+        let playlist = serve("/session/11/live.m3u8").await;
+        assert_eq!(
+            content_type(&playlist),
+            Some("application/vnd.apple.mpegurl")
+        );
+
+        let segment = serve("/session/11/live000001.ts").await;
+        assert_eq!(content_type(&segment), Some("video/MP2T"));
+
+        let guide = serve("/xmltv.xml").await;
+        assert_ne!(content_type(&guide), Some("application/vnd.apple.mpegurl"));
+        assert_ne!(content_type(&guide), Some("video/MP2T"));
+        assert_eq!(cache_control(&guide), None, "the guide is not a playlist");
+    }
 }
