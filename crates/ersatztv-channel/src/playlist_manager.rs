@@ -12,7 +12,11 @@ use time::macros::format_description;
 
 const MIN_SEGMENTS: usize = 4;
 
-// 12s
+/// How much media is kept behind the live edge before segments are trimmed
+/// and their files deleted. Two minutes.
+const HISTORY_DURATION: Duration = Duration::from_secs(120);
+
+/// How far past the wall clock the published window reaches. Twelve seconds.
 const PUBLISH_LEAD: Duration =
     Duration::from_secs(ffpipeline::pipeline::SEGMENT_SECONDS as u64 * 3);
 
@@ -37,6 +41,17 @@ pub struct PlaylistManager {
     discontinuity_before: HashSet<String>,
     media_sequence: u64,
     last_served_media_sequence: u64,
+    /// The sequence at the front of the served window, or `None` before the
+    /// first window is rendered. Retention measures history behind this, so
+    /// it has to be the position viewers are actually reading from.
+    ///
+    /// The window itself is placed from the wall clock every render: it ends
+    /// at the first segment whose program date time reaches `PUBLISH_LEAD`
+    /// past now, and starts a full window behind that. Nothing about the
+    /// placement is carried between renders, so a session that stalls
+    /// resumes at wherever the clock has reached rather than accumulating
+    /// permanent deficit against the schedule.
+    served_head: Option<u64>,
     discontinuity_sequence: u64,
     target_duration: u32,
     target_duration_f64: f64,
@@ -88,6 +103,7 @@ impl PlaylistManager {
             discontinuity_before: HashSet::new(),
             media_sequence: 0,
             last_served_media_sequence: 0,
+            served_head: None,
             discontinuity_sequence: 0,
             target_duration,
             target_duration_f64: target_duration as f64,
@@ -131,7 +147,8 @@ impl PlaylistManager {
 
         // overwrite ffmpeg's playlist with a generated playlist (containing *all* segments)
         if Path::new(&self.generated_playlist_file).exists() {
-            let (generated_playlist, _) = self.generate_playlist(|s| s.to_owned(), None)?;
+            let (generated_playlist, _) =
+                self.generate_playlist(|s| s.to_owned(), None, OffsetDateTime::now_utc())?;
             let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
             tokio::fs::write(temp.path(), generated_playlist).await?;
             tokio::fs::rename(temp.path(), &self.ffmpeg_playlist_file).await?;
@@ -226,7 +243,7 @@ impl PlaylistManager {
         }
 
         // trim old segments
-        let cutoff = OffsetDateTime::now_utc() - Duration::from_mins(2);
+        let cutoff = self.trim_cutoff();
         while !self.segments.is_empty() && self.segments[0].program_date_time < cutoff {
             if let Some(removed) = self.segments.remove(0) {
                 self.media_sequence += 1;
@@ -250,7 +267,7 @@ impl PlaylistManager {
 
         // generate and atomically save playlist
         let (generated_playlist, playlist_segment_count) =
-            self.generate_playlist(|s| s.to_owned(), Some(10))?;
+            self.generate_playlist(|s| s.to_owned(), Some(10), OffsetDateTime::now_utc())?;
         let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
         tokio::fs::write(temp.path(), generated_playlist).await?;
         tokio::fs::rename(temp.path(), &self.generated_playlist_file).await?;
@@ -259,6 +276,7 @@ impl PlaylistManager {
         let (generated_subtitle_playlist, _) = self.generate_playlist(
             |s| format!("{}.vtt", s.strip_suffix(".ts").unwrap_or(s)),
             Some(10),
+            OffsetDateTime::now_utc(),
         )?;
         let temp = tempfile::NamedTempFile::new_in(&self.output_folder)?;
         tokio::fs::write(temp.path(), generated_subtitle_playlist).await?;
@@ -278,10 +296,48 @@ impl PlaylistManager {
         Ok(())
     }
 
+    /// The program date time before which segments have aged out of the
+    /// history window, measured from the segment the window is serving from.
+    ///
+    /// Program date times advance with produced media, not with the wall
+    /// clock: `last_segment_end` is seeded from the channel start time and
+    /// only ever moves by a segment duration. A channel that cannot sustain
+    /// realtime, because a source underdelivers or the transcode is too slow
+    /// for the hardware, therefore falls behind the wall clock and stays
+    /// behind until it catches up. Measuring the cutoff against the wall
+    /// clock in that state keeps only `HISTORY_DURATION` minus the lag, and
+    /// keeps nothing at all once the lag reaches `HISTORY_DURATION`, which
+    /// deletes segment files that playlists being served still reference.
+    ///
+    /// Measuring it against the live edge has the mirror failure. A file
+    /// item transcodes faster than realtime, so produced media runs ahead of
+    /// the head the window serves from, and the budget is spent on segments
+    /// nobody has reached yet: what survives behind that head is
+    /// `HISTORY_DURATION` minus the work-ahead depth, reaching zero on a
+    /// channel that works far enough ahead, and deleting the same
+    /// still-referenced files.
+    ///
+    /// The served head is the anchor that bounds history where viewers
+    /// actually are, under both. Before the first render there is no head
+    /// yet and nothing is being served, so the live edge stands in.
+    fn trim_cutoff(&self) -> OffsetDateTime {
+        let served = self
+            .served_head
+            .and_then(|head| {
+                self.segments
+                    .get(head.saturating_sub(self.media_sequence) as usize)
+            })
+            .map(|segment| segment.program_date_time)
+            .unwrap_or(self.last_segment_end);
+
+        served - HISTORY_DURATION
+    }
+
     fn generate_playlist(
         &mut self,
         path_map: fn(&str) -> String,
         max_segments: Option<usize>,
+        now: OffsetDateTime,
     ) -> Result<(String, usize), ChannelError> {
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
@@ -290,7 +346,7 @@ impl PlaylistManager {
 
         let (skip, limit) = match max_segments {
             Some(max) => {
-                let horizon = OffsetDateTime::now_utc() + PUBLISH_LEAD;
+                let horizon = now + PUBLISH_LEAD;
 
                 // index one past the newest segment we want to publish
                 let head = self
@@ -303,6 +359,7 @@ impl PlaylistManager {
                 let candidate_ms = self.media_sequence + head.saturating_sub(max) as u64;
                 let clamped_ms = candidate_ms.max(self.last_served_media_sequence);
                 self.last_served_media_sequence = clamped_ms;
+                self.served_head = Some(clamped_ms);
 
                 let skip = ((clamped_ms - self.media_sequence) as usize).min(head);
                 (skip, head - skip)
@@ -419,4 +476,183 @@ fn render_subtitle_segment(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> PlaylistManager {
+        let folder = std::env::temp_dir();
+        PlaylistManager::new(
+            OffsetDateTime::UNIX_EPOCH,
+            4,
+            folder.clone(),
+            folder.join(".ready-test"),
+            PlaylistManagerOutputFiles {
+                generated_playlist_file: String::from("live.m3u8"),
+                ffmpeg_playlist_file: String::from("ffmpeg.m3u8"),
+                generated_subtitle_playlist_file: String::from("live_sub.m3u8"),
+            },
+        )
+    }
+
+    fn manager_with_segments(segment_count: usize) -> PlaylistManager {
+        let mut m = manager();
+        for i in 0..segment_count {
+            m.segments
+                .push_back(segment(&format!("live{i:06}.ts"), i as i64 * 4));
+        }
+        m
+    }
+
+    fn segment(path: &str, start_offset_secs: i64) -> Segment {
+        Segment {
+            path: path.to_owned(),
+            duration: 4.0,
+            program_date_time: OffsetDateTime::UNIX_EPOCH
+                + Duration::from_secs(start_offset_secs as u64),
+        }
+    }
+
+    /// The window ends at the first segment whose program date time reaches
+    /// `PUBLISH_LEAD` past the wall clock, and starts a full window behind
+    /// that. Segments are four seconds and `PUBLISH_LEAD` is twelve, so at
+    /// t=40s the horizon is t=52s, which is segment 13, and a ten segment
+    /// window starts at 3.
+    #[test]
+    fn window_is_placed_from_the_wall_clock() {
+        let mut m = manager_with_segments(20);
+        let start = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(40);
+
+        let (first, count) = m
+            .generate_playlist(|s| s.to_owned(), Some(10), start)
+            .unwrap();
+        assert!(first.contains("#EXT-X-MEDIA-SEQUENCE:3\n"));
+        assert_eq!(count, 10);
+
+        // eight seconds later the horizon has moved two segments, and the
+        // window moves with it rather than with any produced media
+        let (later, _) = m
+            .generate_playlist(|s| s.to_owned(), Some(10), start + Duration::from_secs(8))
+            .unwrap();
+        assert!(later.contains("#EXT-X-MEDIA-SEQUENCE:5\n"));
+    }
+
+    /// The anti-ratchet property. The window carries no placement between
+    /// renders, so a session that stalls does not accumulate deficit against
+    /// the schedule: however long the clock runs past the newest segment, the
+    /// next render serves the newest full window rather than resuming from
+    /// wherever a paced head had crept to.
+    ///
+    /// This is the property that makes a serve head unable to fall
+    /// permanently behind the wall clock, and it is the reason the window is
+    /// not paced at 1x.
+    #[test]
+    fn window_recovers_the_live_edge_after_a_long_stall() {
+        let mut m = manager_with_segments(20);
+        let start = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(40);
+
+        m.generate_playlist(|s| s.to_owned(), Some(10), start)
+            .unwrap();
+
+        // no new segments arrive for several minutes
+        let (after, count) = m
+            .generate_playlist(|s| s.to_owned(), Some(10), start + Duration::from_secs(400))
+            .unwrap();
+
+        // the newest ten segments, right up to the live edge
+        assert!(after.contains("#EXT-X-MEDIA-SEQUENCE:10\n"));
+        assert!(after.contains("live000010.ts"));
+        assert!(after.contains("live000019.ts"));
+        assert!(!after.contains("live000009.ts"));
+        assert_eq!(count, 10);
+    }
+
+    /// A window of `segment_count` four-second segments starting at
+    /// `channel_start`, with the live edge advanced exactly as `update`
+    /// advances it when it appends a segment.
+    fn window_anchored_at(channel_start: OffsetDateTime, segment_count: u64) -> PlaylistManager {
+        let mut m = manager();
+        for i in 0..segment_count {
+            m.segments.push_back(Segment {
+                path: format!("live{i:06}.ts"),
+                duration: 4.0,
+                program_date_time: channel_start + Duration::from_secs(i * 4),
+            });
+        }
+        m.last_segment_end = channel_start + Duration::from_secs(segment_count * 4);
+        m
+    }
+
+    /// The leading segments `update` would trim and delete.
+    fn expired(m: &PlaylistManager) -> usize {
+        let cutoff = m.trim_cutoff();
+        m.segments
+            .iter()
+            .take_while(|s| s.program_date_time < cutoff)
+            .count()
+    }
+
+    #[test]
+    fn keeps_two_minutes_of_media_behind_the_live_edge() {
+        // 40 four-second segments is 160s of media, so 40s of it has aged out
+        let m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
+
+        assert_eq!(expired(&m), 10);
+        assert_eq!(
+            (m.segments.len() - expired(&m)) as u64 * 4,
+            HISTORY_DURATION.as_secs()
+        );
+    }
+
+    #[test]
+    fn history_survives_a_channel_running_behind_the_wall_clock() {
+        // a channel whose source underdelivers falls behind the wall clock,
+        // and its program date times fall behind with it. the retained window
+        // must not shrink by the lag, because these files are still
+        // referenced by the playlists being served
+        let on_time = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
+        let behind = window_anchored_at(
+            OffsetDateTime::now_utc() - Duration::from_secs(97 + 160),
+            40,
+        );
+
+        assert_eq!(expired(&behind), expired(&on_time));
+    }
+
+    #[test]
+    fn history_survives_production_running_ahead_of_the_served_head() {
+        // a file item transcodes faster than realtime, so produced media runs
+        // past the head the window serves from. measuring the cutoff from the
+        // live edge spends the whole budget on media nobody has reached and
+        // deletes everything behind that head, which served playlists still
+        // reference: 60 segments produced, serving from segment 30, so 120s
+        // of media sits ahead of the head
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 60);
+        m.served_head = Some(30);
+
+        assert_eq!(expired(&m), 0);
+
+        let behind_head = m.served_head.unwrap() - m.media_sequence - expired(&m) as u64;
+        assert_eq!(behind_head * 4, HISTORY_DURATION.as_secs());
+    }
+
+    #[test]
+    fn history_behind_the_served_head_stays_bounded() {
+        // the mirror of the above: 160s of media sits behind the head, 40s
+        // more than the budget, and the excess still ages out
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 40);
+        m.served_head = Some(39);
+
+        assert_eq!(expired(&m), 9);
+    }
+
+    #[test]
+    fn nothing_is_trimmed_before_the_window_fills() {
+        // 10 segments is 40s of media, well inside the history window
+        let m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 10);
+
+        assert_eq!(expired(&m), 0);
+    }
 }
