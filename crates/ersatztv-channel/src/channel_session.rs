@@ -732,6 +732,10 @@ impl ChannelSession {
             )
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            // a worker that dies takes its transcoder with it: an orphaned
+            // ffmpeg keeps writing segments into a folder a replacement
+            // worker now owns
+            .kill_on_drop(true)
             .spawn()
             .map_err(|_| ChannelError::StreamFailure(String::from("failed to spawn ffmpeg")))?;
 
