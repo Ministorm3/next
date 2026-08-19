@@ -217,9 +217,27 @@ impl ChannelSession {
         let tn = self.timeout_notify.clone();
 
         tokio::spawn(async move {
+            // this loop is the only thing that publishes segments to viewers,
+            // and it runs every two seconds: report each distinct failure once
+            // rather than thirty times a minute, and report recovery, so a
+            // persistent fault is visible without burying the log
+            let mut last_failure: Option<String> = None;
             loop {
                 let mut playlist_manager = pm.lock().await;
-                let _ = playlist_manager.update().await;
+                match playlist_manager.update().await {
+                    Ok(()) => {
+                        if last_failure.take().is_some() {
+                            log::info!("playlist update recovered");
+                        }
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if last_failure.as_deref() != Some(message.as_str()) {
+                            log::warn!("playlist update failed: {message}");
+                            last_failure = Some(message);
+                        }
+                    }
+                }
                 if *playlist_manager.timeout() {
                     tn.notify_one();
                     break;
