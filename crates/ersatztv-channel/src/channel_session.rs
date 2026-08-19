@@ -973,8 +973,11 @@ impl ChannelSession {
         let stamp_error_ms = {
             let mut playlist_manager = self.playlist_manager.lock().await;
             playlist_manager.update().await?;
-            (playlist_manager.last_segment_end() - self.transcoded_until).whole_milliseconds()
-                as i64
+            Self::stamp_error_ms(
+                playlist_manager.last_segment_end(),
+                self.transcoded_until,
+                self.start_time_offset,
+            )
         };
         let PlannedTimings {
             audio: audio_timing,
@@ -1481,12 +1484,32 @@ impl ChannelSession {
         }
     }
 
+    /// How far the stamp clock has run past the schedule clock, in
+    /// milliseconds.
+    ///
+    /// The two clocks are seeded from the same reading at channel start, but
+    /// `transcoded_until` also carries `start_time_offset`, the distance to a
+    /// configured `virtual_start`. That offset is deliberate and permanent, so
+    /// it has to be added back before the two can be compared.
+    ///
+    /// Subtracting them raw would report the whole virtual start offset as
+    /// error. Since the correction below drives that error toward zero, a
+    /// channel with `virtual_start` set would have its content trimmed or
+    /// padded by the clamp on every item until the offset closed.
+    fn stamp_error_ms(
+        last_segment_end: OffsetDateTime,
+        transcoded_until: OffsetDateTime,
+        start_time_offset: time::Duration,
+    ) -> i64 {
+        (last_segment_end + start_time_offset - transcoded_until).whole_milliseconds() as i64
+    }
+
     /// How much of this pipeline's output duration to give back to the
     /// schedule, in milliseconds. Positive shortens the pipeline's -t,
     /// negative lengthens it.
     ///
-    /// `stamp_error_ms` is `last_segment_end - transcoded_until`: the same
-    /// timeline position read on the stamp clock and on the schedule clock.
+    /// `stamp_error_ms` is the same timeline position read on the stamp clock
+    /// and on the schedule clock, with the virtual start offset taken back out.
     /// The -t cut is frame-quantized upward (the frame straddling the cut is
     /// emitted whole), so with every pipeline padded to its clamp each item
     /// emits up to one frame more than its slot, and the stamp clock
@@ -2558,6 +2581,57 @@ fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    #[test]
+    fn stamp_error_measures_emission_against_the_schedule() {
+        // 25s more media emitted than the slot called for
+        assert_eq!(
+            ChannelSession::stamp_error_ms(at(1025), at(1000), time::Duration::ZERO),
+            25_000
+        );
+        assert_eq!(
+            ChannelSession::stamp_error_ms(at(995), at(1000), time::Duration::ZERO),
+            -5_000
+        );
+    }
+
+    #[test]
+    fn a_virtual_start_offset_is_not_a_stamp_error() {
+        // ChannelSession::new seeds last_segment_end at `now` and
+        // transcoded_until at `now + start_time_offset`, so the offset is
+        // present from the first pipeline and never goes away. reporting it
+        // as error would make emission_trim_ms claw back the whole virtual
+        // start offset, 500ms of content per item, for as long as it took
+        for offset_secs in [-604_800i64, -3600, -1, 1, 3600, 604_800] {
+            let offset = time::Duration::seconds(offset_secs);
+            assert_eq!(
+                ChannelSession::stamp_error_ms(at(1000), at(1000) + offset, offset),
+                0,
+                "a {offset_secs}s virtual start offset was measured as stamp error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_error_is_still_measured_through_a_virtual_start_offset() {
+        let offset = time::Duration::hours(1);
+        assert_eq!(
+            ChannelSession::stamp_error_ms(at(1025), at(1000) + offset, offset),
+            25_000
+        );
+    }
+
+    #[test]
+    fn a_virtual_start_offset_produces_no_emission_trim() {
+        // the end to end shape of the bug: measurement into correction
+        let offset = time::Duration::hours(1);
+        let error = ChannelSession::stamp_error_ms(at(1000), at(1000) + offset, offset);
+        assert_eq!(ChannelSession::emission_trim_ms(error, 30_000, false), 0);
+    }
 
     /// The steady state the trim exists for: each padded item overshoots its
     /// slot by up to one frame, and the whole accumulated error comes back on
