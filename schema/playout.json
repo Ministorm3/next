@@ -67,6 +67,17 @@
             }
           ]
         },
+        "slate": {
+          "description": "What the shared session plays for this item in place of `source`, when `source` is templated and cannot be tuned without a viewer's query values.\n\nThis substitutes the source for one session, it does not replace the item: the item keeps its id, its slot and its own `source`, because cohort viewers still get the live presentation through variant sessions, and that is only possible while the templated URL is still here to resolve per cohort.\n\nIn practice this is a local file. Media shorter than the item's slot is repeated to fill it. `in_point_ms` and `out_point_ms` are ignored here and a warning names the item that declared them: a slate plays its whole window, whose length the item's slot alone defines. Omit for no slate, in which case the shared session tunes the live source like any other item.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/PlayoutItemSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "watermark": {
           "description": "Compatibility graphics layer composited below every entry in `graphics`. Omit for no legacy watermark.",
           "oneOf": [

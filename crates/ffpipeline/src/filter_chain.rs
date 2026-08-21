@@ -1174,12 +1174,13 @@ mod tests {
 
     /// `tpad` costs one round trip and nothing more: the scale stays on the GPU.
     ///
-    /// `TPadFilter`'s `required_surface` is `System` because ffmpeg has no
-    /// hardware tpad, which reads like it could drag the whole video chain
-    /// into software. It does not: the resolver re-uploads immediately after
-    /// the pad and the scale still resolves to `scale_vaapi`. The download is
-    /// unavoidable given the filter exists only in software; what matters is
-    /// that it does not spread.
+    /// Every templated, variant and slate item sets `pad_to_duration`, so it
+    /// gets `TPadFilter`, whose `required_surface` is `System` because ffmpeg
+    /// has no hardware tpad. A 2026-08-14 audit read that as dragging the whole
+    /// video chain into software for all cohort content. It does not: the
+    /// resolver re-uploads immediately after the pad and the scale still
+    /// resolves to `scale_vaapi`. The download is unavoidable given the filter
+    /// exists only in software; what matters is that it does not spread.
     ///
     /// This is the guard for that. If a change ever makes the pad pull the
     /// scale into software with it, this fails.
@@ -1249,12 +1250,14 @@ mod tests {
             chain.as_arg()[1].to_string()
         };
 
+        // the same item WITHOUT the pad requirement keeps its scale on the GPU
         let without_tpad = build(vec![scale()]);
         assert!(
             without_tpad.contains("scale_vaapi"),
             "a hardware channel scales on the GPU when nothing forces it off: {without_tpad}"
         );
 
+        // and WITH it, exactly as a templated/variant/slate item is built
         let with_tpad = build(vec![PipelineFilter::Video(TPadFilter.into()), scale()]);
         assert!(
             with_tpad.contains("tpad=stop=-1:stop_mode=clone"),

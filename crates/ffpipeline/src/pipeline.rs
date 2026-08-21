@@ -217,6 +217,7 @@ pub enum PipelineInput {
         seek: Duration,
         channels: u32,
         decoder: AudioDecoder,
+        loop_when_exhausted: bool,
     },
     Video {
         input_source: InputSource,
@@ -225,6 +226,7 @@ pub enum PipelineInput {
         seek: Duration,
         realtime: bool,
         decoder: VideoDecoder,
+        loop_when_exhausted: bool,
     },
     Subtitle {
         input_source: InputSource,
@@ -461,6 +463,7 @@ impl Pipeline {
                 seek: input_settings.audio_input.in_point,
                 channels: audio_stream.channels,
                 decoder: AudioDecoder::new(audio_stream, &final_output_settings),
+                loop_when_exhausted: input_settings.audio_input.loop_when_exhausted,
             },
             PipelineInput::Video {
                 input_source: input_settings.video_input.input_source.to_owned(),
@@ -473,6 +476,7 @@ impl Pipeline {
                 },
                 realtime: final_output_settings.realtime && !final_output_settings.is_live,
                 decoder: video_decoder,
+                loop_when_exhausted: input_settings.video_input.loop_when_exhausted,
             },
         ];
 
@@ -830,6 +834,7 @@ impl Pipeline {
                     seek,
                     realtime,
                     decoder,
+                    loop_when_exhausted,
                     ..
                 } => {
                     input_paths.push(path.as_str());
@@ -838,6 +843,8 @@ impl Pipeline {
 
                     let video_input_index = input_paths.iter().position(|p| p == path).unwrap_or(0);
                     video_label = format!("{}:{}", video_input_index, index);
+
+                    result.extend(loop_input_args(*loop_when_exhausted));
 
                     if !seek.is_zero() {
                         result.extend(args!["-ss", format!("{}ms", seek.as_millis())]);
@@ -857,6 +864,7 @@ impl Pipeline {
                     index,
                     path,
                     decoder,
+                    loop_when_exhausted,
                     ..
                 } => {
                     // if we haven't yet used this input, add it
@@ -866,6 +874,8 @@ impl Pipeline {
                         result.extend(decoder.as_arg());
 
                         // TODO: seek?
+
+                        result.extend(loop_input_args(*loop_when_exhausted));
 
                         result.extend(input_source.args_for_input());
                         result.extend(args!["-i", path.to_owned()]);
@@ -961,6 +971,23 @@ pub fn generate_pipeline(
     Pipeline::full(ffmpeg_info, input_settings, output_settings)
 }
 
+/// Input arguments that repeat an input for as long as it is read.
+///
+/// `-stream_loop -1` reopens the input at its start on every EOF, so an input
+/// shorter than the window it stands in for keeps producing frames rather than
+/// running dry and leaving the rest of the window to the padding filters (a
+/// frozen last frame over silence). It changes nothing about when the transcode
+/// ends: the output `-t` remains the only bound, so an input longer than the
+/// window is read exactly as far as it was before and never reaches its first
+/// loop. This is the same pairing the video watermark path already relies on.
+fn loop_input_args(loop_when_exhausted: bool) -> ArgVec {
+    if loop_when_exhausted {
+        args!["-stream_loop", "-1"]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Input arguments for a watermark, chosen by how the watermark decodes.
 ///
 /// Every branch follows upstream. The fork's `-f image2` pin for still
@@ -1006,15 +1033,208 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::input::{LocalInputSource, ProbedInput};
+    use crate::input::{GraphicsLocation, LocalInputSource, ProbedInput};
     use crate::output_format::OutputFormat;
-    use crate::output_settings::{
-        AudioOutputSettings, OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions,
-    };
+    use crate::output_settings::AudioOutputSettings;
     use crate::probe::{
         CodecType, ProbeResult, ProbeResultAudioStream, ProbeResultColorParams, ProbeResultStream,
-        ProbeResultVideoStream,
     };
+
+    const SLATE_PATH: &str = "/bumps/fallback/WeatherSlateStatic.mp4";
+
+    /// An ordinary library item: one h264 video stream and one aac audio
+    /// stream in an mp4, of whatever length the caller is describing.
+    fn slate_probe(media: Duration) -> ProbeResult {
+        ProbeResult {
+            path: String::from(SLATE_PATH),
+            streams: vec![
+                ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
+                    stream_index: 0,
+                    codec: String::from("h264"),
+                    codec_type: CodecType::Video,
+                    profile: String::from("high"),
+                    height: Some(1080),
+                    width: Some(1920),
+                    frame_rate: FrameRate::parse("30"),
+                    sample_aspect_ratio: None,
+                    display_aspect_ratio: None,
+                    pix_fmt: String::from("yuv420p"),
+                    color_params: ProbeResultColorParams::default(),
+                    field_order: None,
+                    dv_profile: None,
+                })),
+                ProbeResultStream::Audio(ProbeResultAudioStream {
+                    stream_index: 1,
+                    codec: String::from("aac"),
+                    channels: 2,
+                }),
+            ],
+            duration: Some(media),
+            format_name: Some(String::from("mov,mp4,m4a")),
+        }
+    }
+
+    /// The pipeline the shared session builds for one templated window: a
+    /// single local file standing in for the whole slot, padded to the -t
+    /// clamp because the window's PTS envelope has to match every variant's.
+    fn slate_pipeline_args(media: Duration, window: Duration, loops: bool) -> ArgVec {
+        slate_pipeline_args_with_graphics(media, window, loops, Vec::new())
+    }
+
+    fn slate_pipeline_args_with_graphics(
+        media: Duration,
+        window: Duration,
+        loops: bool,
+        graphics_inputs: Vec<GraphicsInput>,
+    ) -> ArgVec {
+        slate_pipeline_args_full(media, window, loops, graphics_inputs, true)
+    }
+
+    fn slate_pipeline_args_full(
+        media: Duration,
+        window: Duration,
+        loops: bool,
+        graphics_inputs: Vec<GraphicsInput>,
+        pad_to_duration: bool,
+    ) -> ArgVec {
+        let probe = slate_probe(media);
+        let input_source = InputSource::Local(LocalInputSource {
+            path: String::from(SLATE_PATH),
+        });
+
+        let probed = |source: InputSource, probe: ProbeResult| ProbedInput {
+            input_source: source,
+            probe_result: probe,
+            in_point: Duration::ZERO,
+            out_point: window,
+            stream_index: None,
+            loop_when_exhausted: loops,
+        };
+
+        let input_settings = InputSettings {
+            start: OffsetDateTime::UNIX_EPOCH,
+            audio_input: probed(input_source.clone(), probe.clone()),
+            video_input: probed(input_source, probe),
+            subtitle_input: None,
+            graphics_inputs,
+            playout_offset: Duration::ZERO,
+        };
+
+        let output_settings = OutputSettings {
+            audio: AudioOutputSettings {
+                format: Some(AudioFormat::Aac),
+                bitrate: Some(Kbps(192)),
+                buffer: Some(Kbps(384)),
+                channels: Some(2),
+                sample_rate: Some(Hz(48000)),
+                loudness: None,
+            },
+            video_format: Some(VideoFormat::H264),
+            bit_depth: Some(8),
+            video_bitrate: Some(Kbps(5000)),
+            video_buffer: Some(Kbps(10000)),
+            video_size: None,
+            scaling_mode: ScalingMode::ScaleAndPad,
+            filter_options: VideoFilterOptions::default(),
+            deinterlace: false,
+            accel: None,
+            format: OutputFormat::Hls {
+                playlist: String::from("/session/live.m3u8"),
+                segment_template: String::from("/session/live%05d.ts"),
+                troubleshoot: false,
+            },
+            pts_offset: None,
+            pad_to_duration,
+            realtime: false,
+            is_live: false,
+            frame_rate: None,
+            subtitle_mode: SubtitleMode::Burn,
+            fonts_folder: None,
+            subtitle_force_style: None,
+            reports_folder: None,
+            report_id: None,
+        };
+
+        let ffmpeg_info = FfmpegInfo {
+            hwaccels: HashSet::new(),
+            video_filters: HashSet::new(),
+            preferred_filters: HashMap::new(),
+        };
+
+        let mut pipeline =
+            generate_pipeline(&ffmpeg_info, input_settings, output_settings).unwrap();
+        pipeline.optimize();
+        pipeline.args()
+    }
+
+    fn position_of(args: &ArgVec, value: &str) -> Option<usize> {
+        args.iter().position(|a| a.as_ref() == value)
+    }
+
+    /// A slate is chosen for what it shows, not for how long it runs, so a
+    /// 15 second bumper has to hold a 103 second window. Looping the input
+    /// is what makes any library item usable as one: without it the source
+    /// runs dry and the padding filters hold its last frame over silence for
+    /// the remaining minute and a half.
+    #[test]
+    fn a_slate_shorter_than_its_window_loops_to_fill_it() {
+        let args = slate_pipeline_args(Duration::from_secs(15), Duration::from_secs(103), true);
+
+        assert!(
+            has_pair(&args, "-stream_loop", "-1"),
+            "a slate must repeat, got {args:?}"
+        );
+        assert!(
+            has_pair(&args, "-t", "103000ms"),
+            "the window is still what ends the transcode, got {args:?}"
+        );
+
+        // -stream_loop is an input option, so ffmpeg only reads it before
+        // the -i it belongs to
+        let (loop_at, input_at) = (
+            position_of(&args, "-stream_loop").unwrap(),
+            position_of(&args, "-i").unwrap(),
+        );
+        assert!(loop_at < input_at, "got {args:?}");
+
+        // audio and video are the same file here, which is the only shape a
+        // slate item has: it must be opened, and looped, exactly once
+        assert_eq!(
+            args.iter().filter(|a| a.as_ref() == "-stream_loop").count(),
+            1,
+            "got {args:?}"
+        );
+    }
+
+    /// The loop is bounded by the same -t as everything else, so a slate
+    /// longer than its window never reaches its first repeat and is read
+    /// exactly as far as it was before looping existed. The flag is
+    /// unconditional precisely so this case needs no handling of its own.
+    #[test]
+    fn a_slate_longer_than_its_window_is_cut_by_the_window_as_before() {
+        let short = slate_pipeline_args(Duration::from_secs(15), Duration::from_secs(103), true);
+        let long = slate_pipeline_args(Duration::from_secs(600), Duration::from_secs(103), true);
+
+        assert_eq!(
+            short, long,
+            "the media's length must not steer the pipeline"
+        );
+        assert!(has_pair(&long, "-t", "103000ms"), "got {long:?}");
+    }
+
+    /// Scheduled content is never repeated: playing an item twice is not
+    /// what the schedule said. Only a source standing in for a window opts
+    /// into looping, so an ordinary item's pipeline is untouched.
+    #[test]
+    fn an_item_that_is_not_slate_is_never_looped() {
+        let args = slate_pipeline_args(Duration::from_secs(15), Duration::from_secs(103), false);
+
+        assert!(
+            !args.iter().any(|a| a.as_ref() == "-stream_loop"),
+            "got {args:?}"
+        );
+        assert!(has_pair(&args, "-t", "103000ms"), "got {args:?}");
+    }
 
     fn watermark_stream(codec: &str) -> ProbeResultVideoStream {
         ProbeResultVideoStream {
@@ -1072,6 +1292,95 @@ mod tests {
         }
     }
 
+    /// The wiring twin of the helper test above: the BUILT PIPELINE for a
+    /// still image layer carries the frame rate and no pinned demuxer.
+    #[test]
+    fn a_still_image_layer_follows_the_probed_demuxer_in_the_built_pipeline() {
+        let args = slate_pipeline_args_with_graphics(
+            Duration::from_secs(15),
+            Duration::from_secs(103),
+            true,
+            vec![GraphicsInput {
+                layer_index: 0,
+                input_source: InputSource::Local(LocalInputSource {
+                    path: String::from("/bumps/logo.png"),
+                }),
+                probe_result: ProbeResult {
+                    path: String::from("/bumps/logo.png"),
+                    streams: vec![ProbeResultStream::Video(Box::new(watermark_stream("png")))],
+                    duration: None,
+                    format_name: Some(String::from("png_pipe")),
+                },
+                stream_index: None,
+                location: GraphicsLocation::TopLeft,
+                width_percent: None,
+                within_source_content: None,
+                horizontal_margin_percent: None,
+                vertical_margin_percent: None,
+                opacity_percent: None,
+                timing: None,
+            }],
+        );
+
+        assert!(
+            !args.iter().any(|a| a.as_ref() == "image2"),
+            "the built pipeline must not pin a demuxer while the pin lives \
+             on its own branch, got {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.as_ref() == "-framerate"),
+            "the still image layer must still carry the output frame rate, got {args:?}"
+        );
+    }
+
+    /// `pad_to_duration` fills a source whose video stream ends before its
+    /// container does, and since 2026-08-14 every item carries it rather than
+    /// only templated ones.
+    ///
+    /// ch13 looked immune to that shortfall for months, but only because its
+    /// watermark input was looped and clamped to the item's `-t`, which
+    /// incidentally held the pipeline open past the short video. Upstream #211
+    /// makes a still image a single frame, so the masking is gone and the
+    /// defect is visible on every channel. Measured on
+    /// /bumps/logo/Philips LaserVision (video 10.560s inside an 11.021s
+    /// container), in the production pipeline shape and readrate paced:
+    ///
+    ///   no tpad    261 frames  10.42s out  1.02x  elapsed 10.21s
+    ///   with tpad  273 frames  10.90s out  1.06x  elapsed 10.25s
+    ///
+    /// so the pad recovers the whole shortfall for 0.04s of wall clock. That
+    /// also refutes the 0.65x figure recorded beside the slate pacing flag, at
+    /// least for this shape.
+    ///
+    /// This guards the wiring rather than the arithmetic: the flag has to
+    /// reach the filter chain, and nothing else in these tests would notice if
+    /// it stopped.
+    #[test]
+    fn padding_to_duration_puts_tpad_in_the_chain() {
+        let build = |pad: bool| {
+            slate_pipeline_args_full(
+                Duration::from_secs(15),
+                Duration::from_secs(103),
+                true,
+                Vec::new(),
+                pad,
+            )
+        };
+        let has_tpad = |args: &ArgVec| args.iter().any(|a| a.as_ref().contains("tpad="));
+
+        let padded = build(true);
+        let unpadded = build(false);
+
+        assert!(
+            has_tpad(&padded),
+            "a padded pipeline must carry tpad, got {padded:?}"
+        );
+        assert!(
+            !has_tpad(&unpadded),
+            "an unpadded pipeline must not, got {unpadded:?}"
+        );
+    }
+
     #[test]
     fn animated_and_video_watermarks_do_not_pin_a_demuxer() {
         for codec in ["gif", "apng", "h264"] {
@@ -1106,127 +1415,5 @@ mod tests {
             Some("videotoolbox")
         );
         assert_eq!(FrameSurface::System.device_name(), None);
-    }
-
-    fn file_probe(media: Duration) -> ProbeResult {
-        ProbeResult {
-            path: String::from("/media/item.mp4"),
-            streams: vec![
-                ProbeResultStream::Video(Box::new(ProbeResultVideoStream {
-                    stream_index: 0,
-                    codec: String::from("h264"),
-                    codec_type: CodecType::Video,
-                    profile: String::from("high"),
-                    height: Some(1080),
-                    width: Some(1920),
-                    frame_rate: FrameRate::parse("30"),
-                    sample_aspect_ratio: None,
-                    display_aspect_ratio: None,
-                    pix_fmt: String::from("yuv420p"),
-                    color_params: ProbeResultColorParams::default(),
-                    field_order: None,
-                    dv_profile: None,
-                })),
-                ProbeResultStream::Audio(ProbeResultAudioStream {
-                    stream_index: 1,
-                    codec: String::from("aac"),
-                    channels: 2,
-                }),
-            ],
-            duration: Some(media),
-            format_name: Some(String::from("mov,mp4,m4a")),
-        }
-    }
-
-    /// A software pipeline for a plain file item, with or without
-    /// `pad_to_duration`.
-    fn file_pipeline_args(pad_to_duration: bool) -> ArgVec {
-        let probe = file_probe(Duration::from_secs(10));
-        let input_source = InputSource::Local(LocalInputSource {
-            path: String::from("/media/item.mp4"),
-        });
-
-        let probed = |source: InputSource, probe: ProbeResult| ProbedInput {
-            input_source: source,
-            probe_result: probe,
-            in_point: Duration::ZERO,
-            out_point: Duration::from_millis(11_021),
-            stream_index: None,
-        };
-
-        let input_settings = InputSettings {
-            start: OffsetDateTime::UNIX_EPOCH,
-            playout_offset: Duration::ZERO,
-            audio_input: probed(input_source.clone(), probe.clone()),
-            video_input: probed(input_source, probe),
-            subtitle_input: None,
-            graphics_inputs: Vec::new(),
-        };
-
-        let output_settings = OutputSettings {
-            audio: AudioOutputSettings {
-                format: Some(AudioFormat::Aac),
-                bitrate: Some(Kbps(192)),
-                buffer: Some(Kbps(384)),
-                channels: Some(2),
-                sample_rate: Some(Hz(48000)),
-                loudness: None,
-            },
-            video_format: Some(VideoFormat::H264),
-            bit_depth: Some(8),
-            video_bitrate: Some(Kbps(5000)),
-            video_buffer: Some(Kbps(10000)),
-            video_size: None,
-            scaling_mode: ScalingMode::ScaleAndPad,
-            filter_options: VideoFilterOptions::default(),
-            deinterlace: false,
-            accel: None,
-            format: OutputFormat::Hls {
-                playlist: String::from("/session/live.m3u8"),
-                segment_template: String::from("/session/live%05d.ts"),
-                troubleshoot: false,
-            },
-            pts_offset: None,
-            pad_to_duration,
-            realtime: false,
-            is_live: false,
-            frame_rate: None,
-            subtitle_mode: SubtitleMode::Burn,
-            fonts_folder: None,
-            subtitle_force_style: None,
-            reports_folder: None,
-            report_id: None,
-        };
-
-        let ffmpeg_info = FfmpegInfo {
-            hwaccels: HashSet::new(),
-            video_filters: HashSet::new(),
-            preferred_filters: HashMap::new(),
-        };
-
-        let mut pipeline =
-            generate_pipeline(&ffmpeg_info, input_settings, output_settings).unwrap();
-        pipeline.optimize();
-        pipeline.args()
-    }
-
-    /// This guards the wiring rather than the arithmetic: the flag has to
-    /// reach the filter chain, and nothing else in these tests would notice
-    /// if it stopped.
-    #[test]
-    fn padding_to_duration_puts_tpad_in_the_chain() {
-        let has_tpad = |args: &ArgVec| args.iter().any(|a| a.as_ref().contains("tpad="));
-
-        let padded = file_pipeline_args(true);
-        let unpadded = file_pipeline_args(false);
-
-        assert!(
-            has_tpad(&padded),
-            "a padded pipeline must carry tpad, got {padded:?}"
-        );
-        assert!(
-            !has_tpad(&unpadded),
-            "an unpadded pipeline must not, got {unpadded:?}"
-        );
     }
 }

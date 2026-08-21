@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::{ChannelError, IoContext};
+use ersatztv_channel::slate::{self, SlateFile};
 use ersatztv_channel::variant_manager;
 use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
 use ersatztv_core::{READY_FILE_NAME, empty_folder};
@@ -86,6 +87,7 @@ struct OutputSettingsPlan<'a> {
     troubleshoot: bool,
     pts_duration: Option<Duration>,
     realtime: bool,
+    slate: bool,
     is_live: bool,
     video_is_still_image: bool,
 }
@@ -98,6 +100,7 @@ struct TimingPlan<'a> {
     subtitle_source: Option<&'a PlayoutItemSource>,
     start_at_zero: bool,
     realtime: bool,
+    slate: bool,
     is_live: bool,
     is_templated: bool,
     transcoded_until: OffsetDateTime,
@@ -525,7 +528,9 @@ impl ChannelSession {
 
             // a variant failure is terminal: the consumer falls back to the
             // shared feed, which is strictly better than substituted filler
-            let (finish, _is_complete) = self.transcode_item(&item, true, false, Some(pts)).await?;
+            let (finish, _is_complete) = self
+                .transcode_item(&item, true, false, Some(pts), false)
+                .await?;
 
             if finish <= self.transcoded_until {
                 return Err(ChannelError::StreamFailure(String::from(
@@ -725,10 +730,47 @@ impl ChannelSession {
             }
         };
 
+        // slate-on-shared: a templated window plays configured slate content
+        // on the shared session instead of tuning the live source. The item
+        // keeps its identity, so the sidecar still declares a templated
+        // envelope and cohort viewers still get the live presentation through
+        // variant sessions; what changes is only what the shared stream shows
+        let mut slate = false;
+        let current_item = match Self::item_is_templated(&current_item) {
+            true => match self.resolve_slate(&current_item).await {
+                Some((slate_source, origin)) => {
+                    log::info!(
+                        "item {}: shared session plays slate {} from {} for this templated window",
+                        current_item.id,
+                        slate_label(&slate_source),
+                        origin
+                    );
+                    slate = true;
+                    slate_item(current_item, slate_source)
+                }
+                None => current_item,
+            },
+            false => {
+                // slate answers a templated window and nothing else: an
+                // ordinary item already names the media its slot plays, and
+                // there is no live source here to stand in for. The key did
+                // nothing, so it says so rather than leaving an operator to
+                // wonder why the slate never aired
+                if let Some(declared) = current_item.slate.as_ref() {
+                    log::warn!(
+                        "item {} declares slate {} but nothing about it is templated; the slate is ignored and the item plays its own source",
+                        current_item.id,
+                        slate_label(declared)
+                    );
+                }
+                current_item
+            }
+        };
+
         let pts_duration = pts_time.map(|p| p.duration);
 
         let result = self
-            .transcode_item(&current_item, realtime, troubleshoot, pts_duration)
+            .transcode_item(&current_item, realtime, troubleshoot, pts_duration, slate)
             .await;
 
         let (finish, is_complete) = match result {
@@ -739,7 +781,7 @@ impl ChannelSession {
             Err(e) => {
                 log::error!("{}", item_failed_message(&current_item, &e));
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
-                self.transcode_item(&fake_item, realtime, troubleshoot, pts_duration)
+                self.transcode_item(&fake_item, realtime, troubleshoot, pts_duration, false)
                     .await?
             }
         };
@@ -758,6 +800,7 @@ impl ChannelSession {
         realtime: bool,
         troubleshoot: bool,
         pts_duration: Option<Duration>,
+        slate: bool,
     ) -> Result<(OffsetDateTime, bool), ChannelError> {
         // prioritize source from audio tracks, then default source
         let audio_source = Self::resolve_source(current_item, |t| t.audio.as_ref())
@@ -849,7 +892,11 @@ impl ChannelSession {
         // live sources can never seek or work ahead
         let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
 
-        let is_templated = source_is_templated(&video_source) || source_is_templated(&audio_source);
+        // slate stands in for a templated source, so it must keep the
+        // templated envelope contract (sidecar declaration, pts padding)
+        // even though the slate source itself is a plain file
+        let is_templated =
+            slate || source_is_templated(&video_source) || source_is_templated(&audio_source);
 
         // generate pipeline
         let output_settings = Self::build_output_settings(OutputSettingsPlan {
@@ -860,6 +907,7 @@ impl ChannelSession {
             troubleshoot,
             pts_duration,
             realtime,
+            slate,
             is_live,
             video_is_still_image: video_probe_result.is_still_image(),
         });
@@ -896,6 +944,7 @@ impl ChannelSession {
             subtitle_source: subtitle_source.as_ref(),
             start_at_zero,
             realtime,
+            slate,
             is_live,
             is_templated,
             transcoded_until: self.transcoded_until,
@@ -937,10 +986,13 @@ impl ChannelSession {
                 out_point: s_time.out_point,
                 probe_result: s_probe,
                 stream_index: subtitle_index,
+                loop_when_exhausted: false,
             }),
             _ => None,
         };
 
+        // every input is read once through, which is what the schedule asked
+        // for; the slate window then says otherwise just below
         let mut input_settings = InputSettings {
             start: current_item.start,
             playout_offset: if start_at_zero {
@@ -958,6 +1010,7 @@ impl ChannelSession {
                 out_point: audio_timing.out_point,
                 probe_result: audio_probe_result.clone(),
                 stream_index: audio_index,
+                loop_when_exhausted: false,
             },
             video_input: ProbedInput {
                 input_source: video_input_source,
@@ -969,10 +1022,12 @@ impl ChannelSession {
                 out_point: video_timing.out_point,
                 probe_result: video_probe_result.clone(),
                 stream_index: video_index,
+                loop_when_exhausted: false,
             },
             subtitle_input,
             graphics_inputs,
         };
+        repeat_media_inputs_for_slate(&mut input_settings, slate);
 
         let mut subtitle_source: Option<SubtitleSource> = None;
         if output_settings.subtitle_mode == SubtitleMode::Convert
@@ -1028,7 +1083,7 @@ impl ChannelSession {
                 &current_item.id,
                 declared_duration_ms,
                 is_templated,
-                false,
+                slate,
             )
             .await?;
 
@@ -1423,6 +1478,14 @@ impl ChannelSession {
             // trim assumes every pipeline is padded, because only a padded
             // pipeline can extend to cover a negative error.
             pad_to_duration: true,
+            // Slate paces like every other pipeline. It ran unpaced for
+            // months on the strength of a 0.65x padded-under-pacing
+            // measurement that was withdrawn on 2026-08-14 (it was one
+            // oversized file failing hardware decode, not the padding), and
+            // since 2026-08-15 every production pipeline runs padded and
+            // paced at 1x, which is the same combination at far larger
+            // scale. If slate pacing ever regresses, the symptom is the
+            // transcoded buffer shrinking during templated windows.
             realtime: plan.realtime,
             is_live: plan.is_live,
             frame_rate: if plan.video_is_still_image {
@@ -1454,11 +1517,19 @@ impl ChannelSession {
     /// inline in `transcode_item`, where no test could observe whether it
     /// was actually applied to what the -t consumes.
     fn plan_timings(plan: TimingPlan) -> PlannedTimings {
+        // a slate item must fill its whole remaining window in one pipeline
+        // invocation: work-ahead chunking would declare one sidecar envelope
+        // per chunk, and a variant reading the first chunk's duration would
+        // mistake it for a mid-item join. input_timing_at's realtime flag
+        // only controls that chunking, so slate forces it; output pacing
+        // (build_output_settings) still follows the real `realtime`
+        let whole_window = plan.realtime || plan.slate;
+
         let audio = Self::input_timing_at(
             plan.current_item,
             plan.audio_source,
             plan.start_at_zero,
-            plan.realtime,
+            whole_window,
             plan.is_live,
             plan.transcoded_until,
         );
@@ -1466,7 +1537,7 @@ impl ChannelSession {
             plan.current_item,
             plan.video_source,
             plan.start_at_zero,
-            plan.realtime,
+            whole_window,
             plan.is_live,
             plan.transcoded_until,
         );
@@ -1475,7 +1546,7 @@ impl ChannelSession {
                 plan.current_item,
                 s,
                 plan.start_at_zero,
-                plan.realtime,
+                whole_window,
                 plan.is_live,
                 plan.transcoded_until,
             )
@@ -1579,6 +1650,65 @@ impl ChannelSession {
         }
     }
 
+    /// Whether any of the item's resolved sources is templated, judged on
+    /// the original playout item before any slate substitution.
+    fn item_is_templated(item: &PlayoutItem) -> bool {
+        Self::resolve_source(item, |t| t.video.as_ref())
+            .as_ref()
+            .is_some_and(source_is_templated)
+            || Self::resolve_source(item, |t| t.audio.as_ref())
+                .as_ref()
+                .is_some_and(source_is_templated)
+    }
+
+    /// The slate this templated window plays on the shared session, and the
+    /// configuration it came from.
+    ///
+    /// The side file is read only when the item declares no slate of its
+    /// own: a file that is never read cannot warn about a channel-wide
+    /// setting this window was never going to use.
+    async fn resolve_slate(&self, item: &PlayoutItem) -> Option<(PlayoutItemSource, SlateOrigin)> {
+        let item_slate = usable_item_slate(item).await;
+        let side_file_slate = match item_slate {
+            Some(_) => None,
+            None => self.load_slate_path().await,
+        };
+        choose_slate(item_slate, side_file_slate)
+    }
+
+    /// The configured slate for this channel's templated windows, if any,
+    /// with the file that configured it so a log line can name it.
+    ///
+    /// The side file ([`slate::SlateConfig`], next to the playout folder)
+    /// predates the schedule carrying slate, and outlives it: legacy pipes
+    /// the channel config over stdin and rebuilds it per session, so a file
+    /// the operator owns is the one place a channel-wide setting survives in
+    /// both deployment shapes, and it still answers for every templated
+    /// window a schedule says nothing about. Re-read at every templated
+    /// window, so slate can be added or removed without a restart. Only
+    /// `path` matters here; the variant manager owns the `default` key on
+    /// its own cadence.
+    async fn load_slate_path(&self) -> Option<(String, PathBuf)> {
+        let file = slate::slate_file(self.channel_config.expanded_playout_folder())?;
+        let path = match slate::read_slate_file(&file).await {
+            SlateFile::Missing => None,
+            SlateFile::Malformed(err) => {
+                log::warn!("ignoring {}: {err}", file.display());
+                None
+            }
+            SlateFile::Present(config) => config.path,
+        }?;
+        if tokio::fs::metadata(&path).await.is_err() {
+            log::warn!(
+                "slate {} configured in {} does not exist; tuning the live source instead",
+                path,
+                file.display()
+            );
+            return None;
+        }
+        Some((path, file))
+    }
+
     fn fake_playout_item(&self, next_start: Option<OffsetDateTime>) -> PlayoutItem {
         let width = self
             .channel_config
@@ -1639,6 +1769,7 @@ impl ChannelSession {
                 }),
                 subtitle: None,
             }),
+            slate: None,
             watermark: None,
             graphics: Vec::new(),
         }
@@ -2020,6 +2151,208 @@ fn effective_out_point_ms(
     }
 }
 
+/// Where a templated window's slate was configured. There are two places to
+/// look now, so a line reporting that slate is on air has to say which one
+/// put it there, or it sends an operator to edit the file that lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SlateOrigin {
+    /// Declared on the playout item itself.
+    Schedule,
+    /// The channel's slate side file, named by its path.
+    SideFile(PathBuf),
+}
+
+impl std::fmt::Display for SlateOrigin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlateOrigin::Schedule => write!(f, "the schedule"),
+            SlateOrigin::SideFile(file) => write!(f, "{}", file.display()),
+        }
+    }
+}
+
+/// Which of the two configurations this window's slate comes from.
+///
+/// The item wins. A schedule can say which window gets which slate, where
+/// the side file can only say what the channel falls back to, so an item
+/// that names a slate has said the more specific thing. An item that names
+/// none leaves the channel-wide answer standing, exactly as before the
+/// schedule could carry slate at all.
+fn choose_slate(
+    item_slate: Option<PlayoutItemSource>,
+    side_file_slate: Option<(String, PathBuf)>,
+) -> Option<(PlayoutItemSource, SlateOrigin)> {
+    match (item_slate, side_file_slate) {
+        (Some(source), _) => Some((source, SlateOrigin::Schedule)),
+        (None, Some((path, file))) => Some((local_slate(path), SlateOrigin::SideFile(file))),
+        (None, None) => None,
+    }
+}
+
+/// The item's own slate, when it names media this session can play.
+///
+/// A local path that does not exist is not a slate: substituting it fails
+/// the window into the black fake item, where falling through leaves the
+/// side file and then the live source, both of which are better air. Only
+/// local paths are checked, because they are the only kind that can be
+/// answered for free; every other kind is opened by ffmpeg, and reaching it
+/// from here would cost a round trip on every templated window.
+async fn usable_item_slate(item: &PlayoutItem) -> Option<PlayoutItemSource> {
+    let source = item.slate.as_ref()?;
+
+    if let PlayoutItemSource::Local { path, .. } = source
+        && tokio::fs::metadata(path).await.is_err()
+    {
+        log::warn!(
+            "slate {} declared on item {} does not exist; falling back to the slate side file, and tuning the live source if that names nothing usable either",
+            path,
+            item.id
+        );
+        return None;
+    }
+
+    Some(source.clone())
+}
+
+/// A slate configured as a bare path, which is all the side file can say.
+fn local_slate(path: String) -> PlayoutItemSource {
+    PlayoutItemSource::Local {
+        path,
+        in_point_ms: None,
+        out_point_ms: None,
+        probe_hint: None,
+    }
+}
+
+/// What to call a slate source in a line an operator reads: the part of it
+/// they typed. A slate is almost always a local file, so this is almost
+/// always its path.
+fn slate_label(source: &PlayoutItemSource) -> &str {
+    match source {
+        PlayoutItemSource::Local { path, .. } => path,
+        PlayoutItemSource::Lavfi { params, .. } => params,
+        PlayoutItemSource::Http { uri, .. }
+        | PlayoutItemSource::Rtsp { uri, .. }
+        | PlayoutItemSource::Dynamic { uri, .. } => uri,
+        PlayoutItemSource::Script { command, .. } => command,
+    }
+}
+
+/// The item the shared session transcodes in place of a templated window:
+/// the same identity and slot, so the sidecar, variant spawning, and
+/// composition all see the window unchanged, with the slate as its only
+/// source.
+///
+/// The substituted item carries no slate of its own. The substitution has
+/// already happened, and an item that still advertised one would offer a
+/// second round of it to anything that read the item back.
+fn slate_item(item: PlayoutItem, slate_source: PlayoutItemSource) -> PlayoutItem {
+    let slate_source = whole_window_slate(slate_source, &item.id);
+
+    PlayoutItem {
+        id: item.id,
+        start: item.start,
+        finish: item.finish,
+        source: Some(slate_source),
+        tracks: None,
+        slate: None,
+        // the slate stands in for the window, so it keeps the window's
+        // decoration: every graphics layer carries over exactly as the
+        // legacy watermark already did
+        watermark: item.watermark,
+        graphics: item.graphics,
+    }
+}
+
+/// The slate as its window will play it: from the top, for the whole slot.
+///
+/// A slate arrives as a full source, so the wire can carry in and out points
+/// on it, and they are discarded here. Trim points are media coordinates
+/// that describe the item a scheduler picked them for: the scheduler read a
+/// duration off that media and cut a slot to hold it, which is why
+/// [`effective_out_point_ms`] can trust one to narrow a slot and only has to
+/// defend against one that widens it. A slate is not that item. The schedule
+/// declared the window, and the slate is only what the shared session shows
+/// across it, looping for as long as the window lasts, so no slot was ever
+/// measured against these points and there is nothing for them to narrow.
+///
+/// Clamping them instead would answer a media question with the schedule's
+/// number, since the only clamp available is the window's own length, and a
+/// short out_point would still have to be overwritten to keep the window
+/// whole. Discarding leaves each domain saying what it owns: the schedule
+/// owns how long the window runs, the slate owns only what plays inside it.
+///
+/// An out_point honoured here ends the shared transcode and the sidecar
+/// envelope early while the run loop advances past the whole window, which
+/// is dead air for every viewer and a variant left waiting on segments that
+/// are never coming, so the discard is loud.
+fn whole_window_slate(mut source: PlayoutItemSource, item_id: &str) -> PlayoutItemSource {
+    let declared = match &source {
+        PlayoutItemSource::Local {
+            in_point_ms,
+            out_point_ms,
+            ..
+        }
+        | PlayoutItemSource::Http {
+            in_point_ms,
+            out_point_ms,
+            ..
+        } => (*in_point_ms, *out_point_ms),
+        _ => (None, None),
+    };
+
+    if declared == (None, None) {
+        return source;
+    }
+
+    log::warn!(
+        "slate {} on item {} declares in_point {} and out_point {}; a slate plays its whole window, so both are discarded",
+        slate_label(&source),
+        item_id,
+        trim_point_label(declared.0),
+        trim_point_label(declared.1)
+    );
+
+    if let PlayoutItemSource::Local {
+        in_point_ms,
+        out_point_ms,
+        ..
+    }
+    | PlayoutItemSource::Http {
+        in_point_ms,
+        out_point_ms,
+        ..
+    } = &mut source
+    {
+        *in_point_ms = None;
+        *out_point_ms = None;
+    }
+
+    source
+}
+
+/// A trim point as an operator reading the warning wants to see it.
+fn trim_point_label(point_ms: Option<u64>) -> String {
+    match point_ms {
+        Some(point_ms) => format!("{point_ms}ms"),
+        None => String::from("none"),
+    }
+}
+
+/// Repeat the media inputs for as long as the window runs, which only a
+/// slate does.
+///
+/// A slate stands in for a window rather than filling a slot of its own, so
+/// any library item works as one whatever its length: the input is reopened
+/// until the output `-t` ends the window. Scheduled content is never
+/// repeated, because playing an item twice is not what the schedule said.
+/// The subtitle input keeps whatever it was built with: its cues are timed
+/// once against the source, and a slate carries none of them anyway.
+fn repeat_media_inputs_for_slate(input_settings: &mut InputSettings, slate: bool) {
+    input_settings.audio_input.loop_when_exhausted = slate;
+    input_settings.video_input.loop_when_exhausted = slate;
+}
+
 /// How far into an item the shared session began reading, derived from the
 /// envelope it declared for that item.
 ///
@@ -2222,10 +2555,54 @@ mod tests {
     #[test]
     fn a_templated_plan_ignores_the_stamp_error() {
         let item = templated_item();
-        let planned = plan_for(&item, true, true, true, 400);
+        let planned = plan_for(&item, false, true, 400);
         assert_eq!(planned.trim_ms, 0);
         assert_eq!(planned.declared_duration_ms, 150_000);
         assert_eq!(planned.video.out_point, Duration::from_millis(150_000));
+    }
+    /// Slate must fill its whole remaining window in one pipeline even in a
+    /// work-ahead state: chunking would declare one sidecar envelope per
+    /// chunk, and a variant reading the first chunk's duration would mistake
+    /// it for a mid-item join.
+    #[test]
+    fn slate_fills_its_whole_window_in_one_pipeline() {
+        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
+            "id": "slate-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:05:00.000-04:00",
+            "source": { "source_type": "local", "path": "/bumps/fallback/slate.mp4" }
+        }))
+        .expect("a slate stand-in deserializes");
+
+        let audio_source =
+            ChannelSession::resolve_source(&item, |t| t.audio.as_ref()).expect("audio source");
+        let video_source =
+            ChannelSession::resolve_source(&item, |t| t.video.as_ref()).expect("video source");
+        for (slate, expect_whole) in [(true, true), (false, false)] {
+            let planned = ChannelSession::plan_timings(TimingPlan {
+                current_item: &item,
+                audio_source: &audio_source,
+                video_source: &video_source,
+                subtitle_source: None,
+                start_at_zero: true,
+                realtime: false,
+                slate,
+                is_live: false,
+                is_templated: slate,
+                transcoded_until: item.start,
+                stamp_error_ms: 0,
+            });
+            if expect_whole {
+                assert!(planned.video.is_complete, "slate must not be chunked");
+                assert_eq!(planned.declared_duration_ms, 300_000);
+            } else {
+                assert!(
+                    !planned.video.is_complete,
+                    "work-ahead chunks a long file item"
+                );
+                assert_eq!(planned.declared_duration_ms, 44_000);
+            }
+        }
     }
 
     /// The steady state the trim exists for: each padded item overshoots its
@@ -2322,7 +2699,7 @@ mod tests {
         .expect("the scaffolded channel config shape deserializes")
     }
 
-    fn output_settings(realtime: bool, is_live: bool, still: bool) -> OutputSettings {
+    fn output_settings(realtime: bool, slate: bool, is_live: bool, still: bool) -> OutputSettings {
         ChannelSession::build_output_settings(OutputSettingsPlan {
             channel_config: &test_channel_config(),
             accel: None,
@@ -2331,6 +2708,7 @@ mod tests {
             troubleshoot: false,
             pts_duration: Some(Duration::from_millis(1234)),
             realtime,
+            slate,
             is_live,
             video_is_still_image: still,
         })
@@ -2341,30 +2719,48 @@ mod tests {
     #[test]
     fn every_pipeline_is_padded_to_its_clamp() {
         for realtime in [false, true] {
-            for is_live in [false, true] {
-                for still in [false, true] {
+            for slate in [false, true] {
+                for is_live in [false, true] {
                     assert!(
-                        output_settings(realtime, is_live, still).pad_to_duration,
-                        "realtime={realtime} is_live={is_live} still={still} must be padded"
+                        output_settings(realtime, slate, is_live, false).pad_to_duration,
+                        "realtime={realtime} slate={slate} is_live={is_live} must be padded"
                     );
                 }
             }
         }
+    }
+    /// Slate paces like every other pipeline: the unpaced special case
+    /// rested on a withdrawn measurement, and a padded paced pipeline is
+    /// what all of production runs. Pacing follows the caller alone.
+    #[test]
+    fn slate_paces_like_every_other_pipeline() {
+        assert!(output_settings(true, true, false, false).realtime);
+        assert!(output_settings(true, false, false, false).realtime);
+        assert!(!output_settings(false, false, false, false).realtime);
+        assert!(!output_settings(false, true, false, false).realtime);
     }
 
     /// A still image decodes as a single frame since #211, so the encoder
     /// must be told a rate to emit it at.
     #[test]
     fn a_still_image_forces_an_output_frame_rate() {
-        assert!(output_settings(true, false, true).frame_rate.is_some());
-        assert!(output_settings(true, false, false).frame_rate.is_none());
+        assert!(
+            output_settings(true, false, false, true)
+                .frame_rate
+                .is_some()
+        );
+        assert!(
+            output_settings(true, false, false, false)
+                .frame_rate
+                .is_none()
+        );
     }
 
     /// The scanned pts offset must reach the encoder unchanged; it is the
     /// only thing keeping output timestamps monotonic across items.
     #[test]
     fn the_pts_offset_reaches_the_encoder() {
-        let settings = output_settings(true, false, false);
+        let settings = output_settings(true, false, false, false);
         assert_eq!(
             settings.pts_offset.expect("offset is declared").duration,
             Duration::from_millis(1234)
@@ -2385,8 +2781,7 @@ mod tests {
 
     fn plan_for(
         item: &PlayoutItem,
-        start_at_zero: bool,
-        realtime: bool,
+        slate: bool,
         is_templated: bool,
         stamp_error_ms: i64,
     ) -> PlannedTimings {
@@ -2400,8 +2795,9 @@ mod tests {
             audio_source: &audio_source,
             video_source: &video_source,
             subtitle_source: None,
-            start_at_zero,
-            realtime,
+            start_at_zero: true,
+            realtime: true,
+            slate,
             is_live,
             is_templated,
             transcoded_until: item.start,
@@ -2416,7 +2812,7 @@ mod tests {
     #[test]
     fn the_trim_reaches_every_stream_the_t_reads() {
         let item = file_item();
-        let planned = plan_for(&item, true, true, false, 27);
+        let planned = plan_for(&item, false, false, 27);
         assert_eq!(planned.trim_ms, 27);
         assert_eq!(planned.audio.out_point, Duration::from_millis(10_994));
         assert_eq!(planned.video.out_point, Duration::from_millis(10_994));
@@ -2473,8 +2869,10 @@ mod tests {
         (progress_ms, item_duration_ms - position)
     }
 
-    fn templated_item() -> PlayoutItem {
-        serde_json::from_value(serde_json::json!({
+    /// A star-window item as legacy exports it: a templated live URI, and
+    /// whatever slate the schedule declares on it.
+    fn templated_item_with_slate(slate: Option<serde_json::Value>) -> PlayoutItem {
+        let mut item = serde_json::json!({
             "id": "star",
             "start": "2026-08-10T12:35:10.000-04:00",
             "finish": "2026-08-10T12:37:40.000-04:00",
@@ -2483,8 +2881,312 @@ mod tests {
                 "uri": "http://host:8000/live.ts?sid=ch{channel_number}&zip={query:zip|10001}",
                 "is_live": true
             }
-        }))
-        .unwrap()
+        });
+
+        if let Some(slate) = slate {
+            item["slate"] = slate;
+        }
+
+        serde_json::from_value(item).unwrap()
+    }
+
+    fn templated_item() -> PlayoutItem {
+        templated_item_with_slate(None)
+    }
+
+    /// The side file as `load_slate_path` reports it: the media it names,
+    /// and the file that named it.
+    fn side_file_slate(path: &str) -> Option<(String, PathBuf)> {
+        Some((String::from(path), PathBuf::from("/channels/5/slate.json")))
+    }
+
+    #[test]
+    fn a_templated_window_is_recognized_before_slate_substitution() {
+        assert!(ChannelSession::item_is_templated(&templated_item()));
+
+        // after substitution the sources are plain files, which is why the
+        // decision is judged on the original item and carried as a flag
+        let slated = slate_item(templated_item(), local_slate(String::from("/slate.mp4")));
+        assert!(!ChannelSession::item_is_templated(&slated));
+    }
+
+    /// A slate declared on the item is the one that plays, and the log line
+    /// says it came from the schedule. The item is the more specific of the
+    /// two configurations: it names this window's slate, where the side file
+    /// can only name the channel's.
+    #[tokio::test]
+    async fn an_item_carrying_a_slate_plays_it_over_the_side_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let declared = folder.path().join("WeatherSlate.mp4");
+        tokio::fs::write(&declared, b"slate").await.unwrap();
+
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "local",
+            "path": declared.to_string_lossy()
+        })));
+
+        let chosen = choose_slate(
+            usable_item_slate(&item).await,
+            side_file_slate("/generic/OffAir.mp4"),
+        );
+
+        let (source, origin) = chosen.expect("a declared slate must be chosen");
+        assert_eq!(slate_label(&source), declared.to_string_lossy());
+        assert_eq!(origin, SlateOrigin::Schedule);
+        assert_eq!(origin.to_string(), "the schedule");
+
+        // and it is what the shared session actually transcodes, while the
+        // window keeps its identity
+        let slated = slate_item(item, source);
+        assert_eq!(slated.id, "star");
+        match slated.source {
+            Some(PlayoutItemSource::Local { path, .. }) => {
+                assert_eq!(path, declared.to_string_lossy())
+            }
+            other => panic!("expected the declared slate, got {other:?}"),
+        }
+    }
+
+    /// An item that declares nothing leaves the channel-wide answer
+    /// standing, which is the whole world before a schedule could carry
+    /// slate. The log line names the file so an operator knows which
+    /// configuration to edit.
+    #[tokio::test]
+    async fn an_item_without_a_slate_falls_back_to_the_side_file() {
+        let item = templated_item();
+
+        let chosen = choose_slate(
+            usable_item_slate(&item).await,
+            side_file_slate("/generic/OffAir.mp4"),
+        );
+
+        let (source, origin) = chosen.expect("the side file must still answer");
+        assert_eq!(slate_label(&source), "/generic/OffAir.mp4");
+        assert_eq!(
+            origin,
+            SlateOrigin::SideFile(PathBuf::from("/channels/5/slate.json"))
+        );
+        assert_eq!(origin.to_string(), "/channels/5/slate.json");
+    }
+
+    /// With slate configured in neither place there is no substitution at
+    /// all: the shared session tunes the live source, templated URL and all,
+    /// exactly as it did before slate existed.
+    #[tokio::test]
+    async fn with_no_slate_anywhere_the_live_source_is_tuned() {
+        let item = templated_item();
+
+        assert!(choose_slate(usable_item_slate(&item).await, None).is_none());
+
+        // nothing swapped the source out, so what the session transcodes is
+        // still the templated live source
+        match ChannelSession::resolve_source(&item, |t| t.video.as_ref()) {
+            Some(source @ PlayoutItemSource::Http { .. }) => {
+                assert!(source_is_templated(&source));
+                assert!(source_is_live(&source));
+            }
+            other => panic!("expected the templated live source, got {other:?}"),
+        }
+    }
+
+    /// A schedule can name a file that is not on this box (a slate folder
+    /// that did not sync, a typo). Substituting it would fail the window
+    /// into the black fake item, so it is not a usable slate and the ladder
+    /// continues to the side file and then to the live source.
+    #[tokio::test]
+    async fn a_slate_naming_media_that_is_not_there_falls_through() {
+        let folder = tempfile::tempdir().unwrap();
+
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "local",
+            "path": folder.path().join("Gone.mp4").to_string_lossy()
+        })));
+
+        assert!(usable_item_slate(&item).await.is_none());
+        assert_eq!(
+            choose_slate(
+                usable_item_slate(&item).await,
+                side_file_slate("/generic/OffAir.mp4")
+            )
+            .map(|(source, _)| slate_label(&source).to_owned()),
+            Some(String::from("/generic/OffAir.mp4"))
+        );
+    }
+
+    #[test]
+    fn a_slate_item_keeps_the_window_identity_and_swaps_only_the_source() {
+        let item = templated_item();
+        let (id, start, finish) = (item.id.clone(), item.start, item.finish);
+
+        let slated = slate_item(item, local_slate(String::from("/slate.mp4")));
+
+        assert_eq!(slated.id, id);
+        assert_eq!(slated.start, start);
+        assert_eq!(slated.finish, finish);
+        assert!(slated.tracks.is_none());
+        match slated.source {
+            Some(PlayoutItemSource::Local {
+                path,
+                in_point_ms,
+                out_point_ms,
+                ..
+            }) => {
+                assert_eq!(path, "/slate.mp4");
+                assert_eq!(in_point_ms, None);
+                assert_eq!(out_point_ms, None);
+            }
+            other => panic!("expected a local slate source, got {other:?}"),
+        }
+    }
+
+    /// The trim points `input_timing` reads off the source it is handed, in
+    /// the two shapes that can carry them. Mirrors the two matches there, so
+    /// a slate that reaches it clean here reaches it clean there.
+    fn trim_points(source: &PlayoutItemSource) -> (u64, Option<u64>) {
+        match source {
+            PlayoutItemSource::Local {
+                in_point_ms,
+                out_point_ms,
+                ..
+            }
+            | PlayoutItemSource::Http {
+                in_point_ms,
+                out_point_ms,
+                ..
+            } => (in_point_ms.unwrap_or(0), *out_point_ms),
+            _ => (0, None),
+        }
+    }
+
+    /// A slate is a full source, so a scheduler can hang trim points on it,
+    /// and they must not shorten the window it stands in for. An out_point
+    /// honoured here ends the shared transcode and the sidecar envelope
+    /// short of a slot the run loop still advances past: black to the end of
+    /// the window, and a declared envelope no variant can ever fill. The
+    /// clamp is no defence, because a short out_point is not an overrun.
+    #[tokio::test]
+    async fn a_declared_slate_plays_its_whole_window_whatever_trim_points_it_carries() {
+        let folder = tempfile::tempdir().unwrap();
+        let declared = folder.path().join("WeatherSlate.mp4");
+        tokio::fs::write(&declared, b"slate").await.unwrap();
+
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "local",
+            "path": declared.to_string_lossy(),
+            "in_point_ms": 30_000,
+            "out_point_ms": 45_000
+        })));
+        let slot_ms = (item.finish - item.start).whole_milliseconds() as u64;
+
+        let source = usable_item_slate(&item)
+            .await
+            .expect("the declared slate is on disk");
+        let slated = slate_item(item, source);
+
+        let substituted = slated.source.as_ref().expect("the slate is the source");
+        assert_eq!(slate_label(substituted), declared.to_string_lossy());
+
+        // what input_timing then reads off the substituted source: no seek,
+        // no explicit end, so the window plays whole and nothing is clamped
+        let (in_point_base_ms, explicit_out_point_ms) = trim_points(substituted);
+        assert_eq!(in_point_base_ms, 0);
+        assert_eq!(explicit_out_point_ms, None);
+        assert_eq!(
+            effective_out_point_ms(explicit_out_point_ms, in_point_base_ms, slot_ms),
+            (slot_ms, 0)
+        );
+    }
+
+    /// The same for a slate that is not a local file. Trim points ride on
+    /// http sources too, and reach `input_timing` by the same match.
+    #[tokio::test]
+    async fn a_remote_slate_loses_its_trim_points_the_same_way() {
+        let item = templated_item_with_slate(Some(serde_json::json!({
+            "source_type": "http",
+            "uri": "http://slates/OffAir.mkv",
+            "out_point_ms": 20_000
+        })));
+        let slot_ms = (item.finish - item.start).whole_milliseconds() as u64;
+
+        let source = usable_item_slate(&item)
+            .await
+            .expect("a remote slate is taken at its word");
+        let slated = slate_item(item, source);
+
+        let substituted = slated.source.as_ref().expect("the slate is the source");
+        assert_eq!(trim_points(substituted), (0, None));
+        assert_eq!(
+            effective_out_point_ms(None, 0, slot_ms),
+            (slot_ms, 0),
+            "the whole window, as the schedule declared it"
+        );
+    }
+
+    /// Every input the pipeline reads for one item, before the slate window
+    /// says otherwise.
+    fn one_pass_input_settings() -> InputSettings {
+        let probed = |path: &str| ProbedInput {
+            input_source: InputSource::Local(LocalInputSource {
+                path: String::from(path),
+            }),
+            probe_result: ProbeResult {
+                path: String::from(path),
+                streams: Vec::new(),
+                duration: None,
+                format_name: None,
+            },
+            in_point: Duration::ZERO,
+            out_point: Duration::from_secs(150),
+            stream_index: None,
+            loop_when_exhausted: false,
+        };
+
+        InputSettings {
+            start: templated_item().start,
+            audio_input: probed("/slate/WeatherSlate.mp4"),
+            video_input: probed("/slate/WeatherSlate.mp4"),
+            subtitle_input: Some(probed("/slate/WeatherSlate.mp4")),
+            graphics_inputs: Vec::new(),
+            playout_offset: Duration::ZERO,
+        }
+    }
+
+    /// The single line joining the two halves of the feature: the run loop
+    /// decides this window plays slate, and the pipeline's media inputs have
+    /// to repeat for that to mean anything. Without it a slate shorter than
+    /// its window ends the transcode early and takes the rest of the slot
+    /// with it, which is the whole reason any library item can be slate.
+    #[test]
+    fn a_slate_window_repeats_its_media_inputs_and_a_scheduled_one_never_does() {
+        let mut slated = one_pass_input_settings();
+        repeat_media_inputs_for_slate(&mut slated, true);
+
+        assert!(
+            slated.audio_input.loop_when_exhausted,
+            "slate audio must repeat until the window ends"
+        );
+        assert!(
+            slated.video_input.loop_when_exhausted,
+            "slate video must repeat until the window ends"
+        );
+        assert!(
+            !slated
+                .subtitle_input
+                .expect("the subtitle input is left alone")
+                .loop_when_exhausted
+        );
+
+        let mut scheduled = one_pass_input_settings();
+        repeat_media_inputs_for_slate(&mut scheduled, false);
+
+        assert!(
+            !scheduled.audio_input.loop_when_exhausted,
+            "scheduled content must never play twice"
+        );
+        assert!(
+            !scheduled.video_input.loop_when_exhausted,
+            "scheduled content must never play twice"
+        );
     }
 
     #[test]
@@ -2761,8 +3463,8 @@ mod tests {
     /// Output pacing follows the caller alone.
     #[test]
     fn pacing_follows_the_caller() {
-        assert!(output_settings(true, false, false).realtime);
-        assert!(!output_settings(false, false, false).realtime);
+        assert!(output_settings(true, false, false, false).realtime);
+        assert!(!output_settings(false, false, false, false).realtime);
     }
 
     /// A realtime pipeline covers its whole remaining slot in one
@@ -2770,7 +3472,7 @@ mod tests {
     #[test]
     fn a_realtime_item_fills_its_slot_in_one_pipeline() {
         let item = file_item();
-        let planned = plan_for(&item, true, true, false, 0);
+        let planned = plan_for(&item, false, false, 0);
         assert_eq!(planned.audio.in_point, Duration::ZERO);
         assert_eq!(planned.audio.out_point, Duration::from_millis(11_021));
         assert_eq!(planned.video.out_point, Duration::from_millis(11_021));
@@ -2792,7 +3494,23 @@ mod tests {
         .expect("a local file item deserializes");
 
         let limit = Duration::from_secs(SEGMENT_SECONDS as u64 * 11);
-        let planned = plan_for(&item, true, false, false, 0);
+        let audio_source =
+            ChannelSession::resolve_source(&item, |t| t.audio.as_ref()).expect("audio source");
+        let video_source =
+            ChannelSession::resolve_source(&item, |t| t.video.as_ref()).expect("video source");
+        let planned = ChannelSession::plan_timings(TimingPlan {
+            current_item: &item,
+            audio_source: &audio_source,
+            video_source: &video_source,
+            subtitle_source: None,
+            start_at_zero: true,
+            realtime: false,
+            slate: false,
+            is_live: false,
+            is_templated: false,
+            transcoded_until: item.start,
+            stamp_error_ms: 0,
+        });
         assert_eq!(planned.video.in_point, Duration::ZERO);
         assert_eq!(planned.video.out_point, limit);
         assert!(!planned.video.is_complete);
