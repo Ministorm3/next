@@ -45,6 +45,26 @@ impl PlayoutLoader {
             .ok_or(ChannelError::PlayoutJsonNoItem { next_start })
     }
 
+    /// The `{query:}` variable names referenced anywhere in the playout file
+    /// covering `now`, lowercased. Empty when no playout file covers `now`.
+    pub async fn query_variable_names(
+        &self,
+        now: &OffsetDateTime,
+    ) -> Result<std::collections::BTreeSet<String>, ChannelError> {
+        let Ok(path) = self.playout_file_for_time(now).await else {
+            return Ok(std::collections::BTreeSet::new());
+        };
+
+        let playout_result = ersatztv_playout::playout::from_file(&path).await?;
+
+        let mut names = std::collections::BTreeSet::new();
+        for item in &playout_result.playout.items {
+            names.append(&mut item.query_variable_names());
+        }
+
+        Ok(names)
+    }
+
     async fn playout_file_for_time(&self, now: &OffsetDateTime) -> Result<String, ChannelError> {
         let mut entries = tokio::fs::read_dir(self.channel_config.expanded_playout_folder())
             .await

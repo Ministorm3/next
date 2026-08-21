@@ -97,17 +97,20 @@ struct TimingPlan<'a> {
     start_at_zero: bool,
     realtime: bool,
     is_live: bool,
+    is_templated: bool,
     transcoded_until: OffsetDateTime,
     stamp_error_ms: i64,
 }
 
 /// What [`ChannelSession::plan_timings`] decided: the per-stream input
-/// timings for one pipeline invocation, with the emission trim already
-/// applied.
+/// timings with the emission trim already applied, and the envelope the
+/// sidecar will declare, computed the same way the pipeline computes its
+/// own -t.
 struct PlannedTimings {
     audio: TimingResult,
     video: TimingResult,
     subtitle: Option<TimingResult>,
+    declared_duration_ms: u64,
     trim_ms: i64,
 }
 
@@ -136,6 +139,8 @@ pub struct ChannelSession {
 
     cached_subtitles: Option<(String, Arc<Vec<Cue>>)>,
     dynamic_http_client: reqwest::Client,
+
+    published_recognized_params: Option<Vec<String>>,
 
     /// Exclusive ownership of the output folder, held for the life of this
     /// session so a second worker for the same folder refuses to start.
@@ -264,6 +269,7 @@ impl ChannelSession {
             timeout_notify: Arc::new(tokio::sync::Notify::new()),
             cached_subtitles: None,
             dynamic_http_client,
+            published_recognized_params: None,
             _output_folder_lock: output_folder_lock,
         })
     }
@@ -396,6 +402,40 @@ impl ChannelSession {
         Ok(())
     }
 
+    /// Publishes the `{query:}` variable names the current playout references
+    /// (the parameters that identify a viewer cohort) next to the ready file,
+    /// rewriting only when the set changes.
+    async fn publish_recognized_params(&mut self) {
+        let names = match self
+            .playout_loader
+            .query_variable_names(&self.transcoded_until)
+            .await
+        {
+            Ok(names) => names.into_iter().collect::<Vec<_>>(),
+            Err(e) => {
+                log::debug!("failed to collect recognized params: {e}");
+                return;
+            }
+        };
+
+        if self.published_recognized_params.as_ref() == Some(&names) {
+            return;
+        }
+
+        let path = self
+            .channel_config
+            .expanded_output_folder()
+            .join(ersatztv_core::RECOGNIZED_PARAMS_FILE_NAME);
+
+        match serde_json::to_string(&names) {
+            Ok(json) => match tokio::fs::write(&path, json).await {
+                Ok(()) => self.published_recognized_params = Some(names),
+                Err(e) => log::warn!("failed to publish recognized params: {e}"),
+            },
+            Err(e) => log::warn!("failed to serialize recognized params: {e}"),
+        }
+    }
+
     async fn transcode(&mut self, realtime: bool, troubleshoot: bool) -> Result<(), ChannelError> {
         if !realtime {
             log::debug!("channel session will work ahead");
@@ -442,6 +482,8 @@ impl ChannelSession {
             Ok(scanned_pts_time) => pts_time = Some(scanned_pts_time),
             Err(e) => log::debug!("{e}"),
         }
+
+        self.publish_recognized_params().await;
 
         let mut current_item_result = self
             .playout_loader
@@ -598,6 +640,8 @@ impl ChannelSession {
         // live sources can never seek or work ahead
         let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
 
+        let is_templated = source_is_templated(&video_source) || source_is_templated(&audio_source);
+
         // generate pipeline
         let output_settings = Self::build_output_settings(OutputSettingsPlan {
             channel_config: &self.channel_config,
@@ -634,6 +678,7 @@ impl ChannelSession {
             audio: audio_timing,
             video: video_timing,
             subtitle: subtitle_timing,
+            declared_duration_ms,
             trim_ms,
         } = Self::plan_timings(TimingPlan {
             current_item,
@@ -643,6 +688,7 @@ impl ChannelSession {
             start_at_zero,
             realtime,
             is_live,
+            is_templated,
             transcoded_until: self.transcoded_until,
             stamp_error_ms,
         });
@@ -767,7 +813,14 @@ impl ChannelSession {
         self.playlist_manager
             .lock()
             .await
-            .before_new_pipeline(pts_offset, subtitle_source)
+            .before_new_pipeline(
+                pts_offset,
+                subtitle_source,
+                &current_item.id,
+                declared_duration_ms,
+                is_templated,
+                false,
+            )
             .await?;
 
         // stream current item
@@ -1138,6 +1191,11 @@ impl ChannelSession {
                 troubleshoot: plan.troubleshoot,
             },
             pts_offset: plan.pts_duration.map(|duration| PtsOffset { duration }),
+            // Two jobs. A templated item may be transcoded in parallel by
+            // variant sessions with different query values; padding both
+            // transcodes to the -t clamp keeps their PTS envelopes identical,
+            // so one can be substituted for the other at the playlist layer.
+            //
             // A file whose video stream ends before its container does books
             // more slot than its video can fill, and the shortfall is lost
             // permanently because last_segment_end only advances by emitted
@@ -1219,14 +1277,25 @@ impl ChannelSession {
             video.out_point.saturating_sub(video.in_point),
         )
         .as_millis() as u64;
-        let trim_ms = Self::emission_trim_ms(plan.stamp_error_ms, pipeline_ms);
+        let trim_ms = Self::emission_trim_ms(plan.stamp_error_ms, pipeline_ms, plan.is_templated);
         let audio = Self::apply_emission_trim(audio, trim_ms);
         let video = Self::apply_emission_trim(video, trim_ms);
+
+        // the envelope this pipeline will fill, computed the same way the
+        // pipeline computes its own -t. A variant of this item has to fill
+        // the same range, and cannot work it out from the item alone once
+        // this session has joined the item partway through
+        let declared_duration_ms = std::cmp::min(
+            audio.out_point.saturating_sub(audio.in_point),
+            video.out_point.saturating_sub(video.in_point),
+        )
+        .as_millis() as u64;
 
         PlannedTimings {
             audio,
             video,
             subtitle,
+            declared_duration_ms,
             trim_ms,
         }
     }
@@ -1264,12 +1333,20 @@ impl ChannelSession {
     /// live on 2026-08-14/15. Handing the measured error back to the next
     /// pipeline's output duration bounds it at about one frame instead.
     ///
+    /// Templated items are exempt: a variant transcode must fill exactly the
+    /// envelope the shared session declares, so their -t stays a pure
+    /// function of the item. They cost nothing to exempt; their slate slots
+    /// are frame-aligned and contribute no quantization error.
+    ///
     /// The correction is clamped so a wild clock (a failed pipeline, a
     /// corrupted playlist) slews back over several items instead of opening
     /// one large hole, and it never eats more than half the pipeline it is
     /// applied to.
-    fn emission_trim_ms(stamp_error_ms: i64, pipeline_ms: u64) -> i64 {
+    fn emission_trim_ms(stamp_error_ms: i64, pipeline_ms: u64, is_templated: bool) -> i64 {
         const MAX_CORRECTION_MS: i64 = 500;
+        if is_templated {
+            return 0;
+        }
         stamp_error_ms
             .clamp(-MAX_CORRECTION_MS, MAX_CORRECTION_MS)
             .min((pipeline_ms / 2) as i64)
@@ -1734,6 +1811,18 @@ fn effective_out_point_ms(
     }
 }
 
+/// Whether a source's URI references `{query:}` variables, meaning the item
+/// may be transcoded more than once with different values and its PTS
+/// envelope must be exact.
+fn source_is_templated(source: &PlayoutItemSource) -> bool {
+    match source {
+        PlayoutItemSource::Http { uri, .. } | PlayoutItemSource::Rtsp { uri, .. } => {
+            ersatztv_playout::stream_variables::has_query_variables(uri)
+        }
+        _ => false,
+    }
+}
+
 fn source_is_live(source: &PlayoutItemSource) -> bool {
     matches!(
         source,
@@ -1861,7 +1950,19 @@ mod tests {
         // the end to end shape of the bug: measurement into correction
         let offset = time::Duration::hours(1);
         let error = ChannelSession::stamp_error_ms(at(1000), at(1000) + offset, offset);
-        assert_eq!(ChannelSession::emission_trim_ms(error, 30_000), 0);
+        assert_eq!(ChannelSession::emission_trim_ms(error, 30_000, false), 0);
+    }
+
+    /// A templated item's envelope is a pure function of the item, whatever
+    /// the stamp clock says: a variant must be able to compute the same
+    /// envelope from the item alone.
+    #[test]
+    fn a_templated_plan_ignores_the_stamp_error() {
+        let item = templated_item();
+        let planned = plan_for(&item, true, true, true, 400);
+        assert_eq!(planned.trim_ms, 0);
+        assert_eq!(planned.declared_duration_ms, 150_000);
+        assert_eq!(planned.video.out_point, Duration::from_millis(150_000));
     }
 
     /// The steady state the trim exists for: each padded item overshoots its
@@ -1869,24 +1970,34 @@ mod tests {
     /// the very next pipeline.
     #[test]
     fn a_small_stamp_clock_error_is_returned_in_full() {
-        assert_eq!(ChannelSession::emission_trim_ms(27, 11_021), 27);
-        assert_eq!(ChannelSession::emission_trim_ms(-31, 11_021), -31);
-        assert_eq!(ChannelSession::emission_trim_ms(0, 11_021), 0);
+        assert_eq!(ChannelSession::emission_trim_ms(27, 11_021, false), 27);
+        assert_eq!(ChannelSession::emission_trim_ms(-31, 11_021, false), -31);
+        assert_eq!(ChannelSession::emission_trim_ms(0, 11_021, false), 0);
     }
 
     /// A wild clock slews back over several items rather than opening one
     /// large hole in a single pipeline.
     #[test]
     fn a_large_stamp_clock_error_is_clamped_in_both_directions() {
-        assert_eq!(ChannelSession::emission_trim_ms(6_500, 60_000), 500);
-        assert_eq!(ChannelSession::emission_trim_ms(-6_500, 60_000), -500);
+        assert_eq!(ChannelSession::emission_trim_ms(6_500, 60_000, false), 500);
+        assert_eq!(
+            ChannelSession::emission_trim_ms(-6_500, 60_000, false),
+            -500
+        );
     }
 
     /// A short pipeline gives back at most half of itself, so a bump can
     /// never be trimmed into nothing.
     #[test]
     fn a_trim_never_eats_more_than_half_the_pipeline() {
-        assert_eq!(ChannelSession::emission_trim_ms(400, 600), 300);
+        assert_eq!(ChannelSession::emission_trim_ms(400, 600, false), 300);
+    }
+
+    /// A variant transcode must fill exactly the envelope the shared session
+    /// declares, so a templated item's -t stays a pure function of the item.
+    #[test]
+    fn a_templated_item_is_never_trimmed() {
+        assert_eq!(ChannelSession::emission_trim_ms(400, 103_000, true), 0);
     }
 
     /// Only the emitted duration moves. `in_point` is where reading starts
@@ -2013,6 +2124,7 @@ mod tests {
         item: &PlayoutItem,
         start_at_zero: bool,
         realtime: bool,
+        is_templated: bool,
         stamp_error_ms: i64,
     ) -> PlannedTimings {
         let audio_source =
@@ -2028,6 +2140,7 @@ mod tests {
             start_at_zero,
             realtime,
             is_live,
+            is_templated,
             transcoded_until: item.start,
             stamp_error_ms,
         })
@@ -2040,7 +2153,7 @@ mod tests {
     #[test]
     fn the_trim_reaches_every_stream_the_t_reads() {
         let item = file_item();
-        let planned = plan_for(&item, true, true, 27);
+        let planned = plan_for(&item, true, true, false, 27);
         assert_eq!(planned.trim_ms, 27);
         assert_eq!(planned.audio.out_point, Duration::from_millis(10_994));
         assert_eq!(planned.video.out_point, Duration::from_millis(10_994));
@@ -2048,8 +2161,6 @@ mod tests {
         assert_eq!(planned.video.in_point, Duration::ZERO);
         assert_eq!(planned.video.finish, item.finish);
     }
-
-    use super::*;
 
     #[test]
     fn an_item_without_an_explicit_out_point_plays_exactly_its_slot() {
@@ -2086,20 +2197,26 @@ mod tests {
         );
     }
 
-    use super::*;
+    fn templated_item() -> PlayoutItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "star",
+            "start": "2026-08-10T12:35:10.000-04:00",
+            "finish": "2026-08-10T12:37:40.000-04:00",
+            "source": {
+                "source_type": "http",
+                "uri": "http://host:8000/live.ts?sid=ch{channel_number}&zip={query:zip|10001}",
+                "is_live": true
+            }
+        }))
+        .unwrap()
+    }
 
     /// One grep has to find every black-air line, and each has to say which
     /// slot it lost: 144 anonymous lines cannot be told apart from one slot
     /// failing 144 times.
     #[test]
     fn every_black_air_line_names_its_slot_and_shares_one_phrase() {
-        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
-            "id": "file-item",
-            "start": "2026-08-15T12:00:00.000-04:00",
-            "finish": "2026-08-15T12:00:11.021-04:00",
-            "source": { "source_type": "local", "path": "/bumps/logo.mp4" }
-        }))
-        .expect("a local file item deserializes");
+        let item = templated_item();
         let at = item.start;
 
         let messages = [
@@ -2135,7 +2252,7 @@ mod tests {
     #[test]
     fn a_realtime_item_fills_its_slot_in_one_pipeline() {
         let item = file_item();
-        let planned = plan_for(&item, true, true, 0);
+        let planned = plan_for(&item, true, true, false, 0);
         assert_eq!(planned.audio.in_point, Duration::ZERO);
         assert_eq!(planned.audio.out_point, Duration::from_millis(11_021));
         assert_eq!(planned.video.out_point, Duration::from_millis(11_021));
@@ -2157,7 +2274,7 @@ mod tests {
         .expect("a local file item deserializes");
 
         let limit = Duration::from_secs(SEGMENT_SECONDS as u64 * 11);
-        let planned = plan_for(&item, true, false, 0);
+        let planned = plan_for(&item, true, false, false, 0);
         assert_eq!(planned.video.in_point, Duration::ZERO);
         assert_eq!(planned.video.out_point, limit);
         assert!(!planned.video.is_complete);
@@ -2193,6 +2310,7 @@ mod tests {
             start_at_zero: false,
             realtime: true,
             is_live: true,
+            is_templated: false,
             // ninety seconds into the item
             transcoded_until: item.start + Duration::from_secs(90),
             stamp_error_ms: 0,

@@ -2,9 +2,12 @@ use std::time::{Duration, Instant};
 
 use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
 
+pub mod cohort;
 mod folder_lock;
 mod merge;
 mod path_resolve;
+pub mod sidecar;
+pub mod variant_request;
 
 pub use folder_lock::{FolderLock, lock_folder_exclusive};
 pub use merge::deep_merge;
@@ -15,6 +18,12 @@ pub const READY_FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const HEARTBEAT_FILE_NAME: &str = ".heartbeat";
 pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// JSON array of `{query:}` variable names the channel's current playout
+/// references, published by the worker next to its ready file. The server
+/// only treats request parameters with these names as cohort identity;
+/// anything else (player cache busters, proxy additions) is ignored.
+pub const RECOGNIZED_PARAMS_FILE_NAME: &str = ".recognized-params.json";
 
 pub const VERSION: &str = env!("ETV_VERSION_STRING");
 

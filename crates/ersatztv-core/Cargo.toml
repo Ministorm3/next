@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+percent-encoding = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 simple-expand-tilde = { workspace = true }
 tokio = { workspace = true }
@@ -12,4 +14,5 @@ tokio = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+filetime = { workspace = true }
 tempfile = { workspace = true }
