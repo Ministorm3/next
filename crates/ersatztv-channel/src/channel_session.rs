@@ -39,7 +39,9 @@ use tokio::sync::Mutex;
 
 use crate::dossier::DossierBuilder;
 use crate::local_proxy::{LocalProxyServer, ScriptCommand};
-use crate::playlist_manager::{PlaylistManager, PlaylistManagerOutputFiles, SubtitleSource};
+use crate::playlist_manager::{
+    PlaylistManager, PlaylistManagerOutputFiles, SubtitleSource, VARIANT_HISTORY_DURATION,
+};
 use crate::playout_loader::PlayoutLoader;
 use crate::pts_scanner::{PtsScanner, PtsTime};
 
@@ -429,6 +431,17 @@ impl ChannelSession {
     ) -> Result<(), ChannelError> {
         self.prep_output_folder(false).await?;
 
+        // STOPGAP: a variant's twins are consumed on the cohort's serve
+        // timeline, which trails this session's production by the shared
+        // session's serve lag; the extended budget keeps twins alive across
+        // that lag instead of trimming them out from under composed
+        // playlists. TODO: remove when the composer owns twin lifetimes
+        // (see VARIANT_HISTORY_DURATION).
+        self.playlist_manager
+            .lock()
+            .await
+            .set_history_duration(VARIANT_HISTORY_DURATION);
+
         self.ffmpeg_info = FfmpegInfo::load(
             &self.ffmpeg_path,
             &self.channel_config.ffmpeg.disabled_filters,
@@ -482,13 +495,34 @@ impl ChannelSession {
         // has already passed: a cohort that tuned in mid-window, or a shared
         // session that reached the item late, would otherwise order a variant
         // at position 0 for an item the composer is already deep into
+        let spawned_progress_ms = progress_ms;
         let progress_ms = variant_start_progress_ms(
-            progress_ms,
+            spawned_progress_ms,
             anchor,
             OffsetDateTime::now_local()? + self.start_time_offset,
             item.finish,
             live_item,
         );
+
+        // the spawn line in variant_manager reports the progress this worker
+        // was ORDERED with, which is not what it ends up claiming once the
+        // clock has moved. Reading a join off that line alone is how a
+        // misdiagnosis starts, so say where the claim actually landed
+        if progress_ms != spawned_progress_ms {
+            let envelope_ms = (item.finish - anchor).whole_milliseconds().max(0) as u64;
+            if progress_ms >= envelope_ms {
+                log::info!(
+                    "variant for item {item_id} opened past its {envelope_ms}ms envelope; \
+                     there is nothing left to substitute, so no transcode is started"
+                );
+            } else {
+                log::info!(
+                    "variant for item {item_id} opened {progress_ms}ms into its {envelope_ms}ms \
+                     envelope and claims that position, not the {spawned_progress_ms}ms it was \
+                     spawned with"
+                );
+            }
+        }
 
         self.transcoded_until =
             (anchor + time::Duration::milliseconds(progress_ms as i64)).min(item.finish);
@@ -517,6 +551,21 @@ impl ChannelSession {
                     }
                 }
             }
+        }
+
+        // the claim was measured at open; everything between it and ffmpeg
+        // actually connecting is startup the claim does not cover, and the
+        // window's content-to-stamp offset is this gap plus ffmpeg's own
+        // connect and keyframe wait. Hand-traced 2026-08-15: 45ms on a late
+        // open, 3ms on an early one. This line exists so the instruments can
+        // watch the whole distribution instead of two traced events; a value
+        // that grows is a variant startup problem coming back
+        {
+            let now = OffsetDateTime::now_local()? + self.start_time_offset;
+            let claim_lag_ms = (now - self.transcoded_until).whole_milliseconds();
+            log::info!(
+                "variant for item {item_id} begins transcoding {claim_lag_ms}ms past its claimed position"
+            );
         }
 
         let base_offset = Duration::from_millis(pts_offset_ms);
@@ -1102,7 +1151,12 @@ impl ChannelSession {
             // worker now owns
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| ChannelError::StreamFailure(String::from("failed to spawn ffmpeg")))?;
+            .map_err(|e| {
+                ChannelError::StreamFailure(format!(
+                    "failed to spawn ffmpeg {}: {e}",
+                    self.ffmpeg_path.display()
+                ))
+            })?;
 
         let stderr = ffmpeg_child
             .stderr

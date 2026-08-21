@@ -213,14 +213,14 @@ pub struct SessionPlaylist {
     consecutive_resets: u32,
 }
 
-fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_pdt(input: &str) -> Option<OffsetDateTime> {
     let format = format_description!(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
     );
     OffsetDateTime::parse(input, format).ok()
 }
 
-fn format_pdt(pdt: OffsetDateTime) -> String {
+pub(crate) fn format_pdt(pdt: OffsetDateTime) -> String {
     let format = format_description!(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
     );
@@ -410,6 +410,18 @@ impl SessionPlaylist {
         self.render(shared_head, now, target_duration, map_path)
     }
 
+    /// The entries the last render published: the served window starting at
+    /// the serve head. Empty before the first render. This is exactly the
+    /// set of segment references a viewer of this cohort can currently
+    /// request, which makes it what the variant manager's served-window
+    /// audit checks against disk.
+    pub fn served_window(&self) -> impl Iterator<Item = &ComposedEntry> + '_ {
+        let skip = self.serve_head.map_or(self.entries.len(), |head| {
+            head.saturating_sub(self.head_sequence) as usize
+        });
+        self.entries.iter().skip(skip).take(SERVED_SEGMENTS)
+    }
+
     /// Decides each templated item's fate. A variant whose recorded anchor
     /// lands inside the item wins from that offset onward: at the start when
     /// it was spawned with lead time, or as a late join when it wasn't. A
@@ -458,6 +470,13 @@ impl SessionPlaylist {
                 // yet; substitution must not start before it
                 let base = self.item_bases.get(&pipeline.item_id).copied().unwrap_or(0);
                 let mut first_unserved_ms = 0u64;
+                // walked counts the positions of this item this session has
+                // actually emitted. `first_unserved_ms` is a SPAN off `base`
+                // rather than a count, so the two agree only while `base` is
+                // the item's true first position. Where they disagree is the
+                // whole question behind a large join, so both are reported
+                let mut walked = 0u64;
+                let mut last_emitted = None;
                 for segment in shared
                     .segments
                     .iter()
@@ -469,6 +488,8 @@ impl SessionPlaylist {
                     if !emitted.contains(&seq) {
                         break;
                     }
+                    walked += 1;
+                    last_emitted = Some(seq);
                     first_unserved_ms =
                         seq.saturating_sub(base).saturating_add(1) * 1000 * SEGMENT_SECONDS;
                 }
@@ -479,18 +500,62 @@ impl SessionPlaylist {
                         self.decisions.get(&pipeline.item_id),
                         Some(ItemDecision::Shared)
                     );
+                    // "late join" means the viewer LOST content, so it has to
+                    // depend on the join position and not merely on there
+                    // having been a soft pin. A pin that upgrades at join 0
+                    // cost nothing: the substitution still starts at the
+                    // item's first frame. Reporting those as late joins
+                    // inflated every count taken off this line, which is how
+                    // ten of the nineteen "late joins" on 2026-08-11 came to
+                    // be events where nothing was actually served from shared.
+                    let how = match (upgraded, join_ms > 0) {
+                        (true, true) => " as a late join after a shared pin",
+                        (true, false) => " after a shared pin",
+                        (false, _) => "",
+                    };
                     log::info!(
-                        "[{}] item {}: serving variant{} (anchor {}ms, join {}ms)",
+                        "[{}] item {}: serving variant{how} (anchor {}ms, join {}ms)",
                         self.label,
                         pipeline.item_id,
-                        if upgraded {
-                            " as a late join after a shared pin"
-                        } else {
-                            ""
-                        },
                         anchor_ms,
                         join_ms,
                     );
+
+                    // A non-zero join costs the viewer that much of the item,
+                    // and two different defects produce one. Reporting the
+                    // arithmetic separates them on the first occurrence
+                    // instead of after another day of guessing:
+                    //
+                    //   walked == join_ms / SEGMENT  the session really did
+                    //     emit that many positions of this item, so the span
+                    //     is honest and the cause is upstream, in whatever let
+                    //     composition run that far past the trailing edge
+                    //   walked <  join_ms / SEGMENT  the span is inflated
+                    //     because `base` is not this airing's first position,
+                    //     so the join is fictional and the cause is the base
+                    //
+                    // `held` bounds both: a join beyond the item's own length
+                    // cannot be a position within it at all.
+                    if join_ms > 0 {
+                        let held = shared
+                            .segments
+                            .iter()
+                            .filter(|s| s.item_id == pipeline.item_id)
+                            .count();
+                        log::info!(
+                            "[{}] item {}: join arithmetic: base {}, last emitted {}, \
+                             walked {} position(s), {} held in the sidecar, \
+                             span {}ms vs walked {}ms",
+                            self.label,
+                            pipeline.item_id,
+                            base,
+                            last_emitted.map_or_else(|| String::from("none"), |s| s.to_string()),
+                            walked,
+                            held,
+                            first_unserved_ms,
+                            walked * 1000 * SEGMENT_SECONDS,
+                        );
+                    }
                 }
                 self.decisions.insert(
                     pipeline.item_id.clone(),
@@ -2247,6 +2312,37 @@ mod tests {
         // shared segment 1 is behind the head; the leading newline keeps
         // this from matching the variant's own live000001.ts
         assert!(!rendered.contains("\nlive000001.ts"));
+    }
+
+    /// `served_window` exists so the audit can check the exact references a
+    /// viewer can request; if it and the rendered playlist ever disagree,
+    /// the audit is checking files nobody serves.
+    #[test]
+    fn served_window_lists_exactly_what_render_published() {
+        let mut session = SessionPlaylist::default();
+        let shared = long_shared_with_templated_item(16);
+        let variant = long_variant_for_game(5);
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+
+        assert!(
+            session.served_window().next().is_none(),
+            "nothing is served before the first render"
+        );
+
+        let rendered = session.advance_and_render(
+            &shared,
+            Some(&variant),
+            "variants/abc/",
+            Some(2),
+            now,
+            4,
+            |s| s.to_owned(),
+        );
+
+        let published: Vec<&str> = rendered.lines().filter(|l| l.ends_with(".ts")).collect();
+        let window: Vec<&str> = session.served_window().map(|e| e.path.as_str()).collect();
+        assert!(!published.is_empty());
+        assert_eq!(window, published);
     }
 
     /// The head never chases past this timeline's own last full window. The

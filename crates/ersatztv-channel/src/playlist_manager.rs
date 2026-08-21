@@ -21,6 +21,57 @@ const HISTORY_DURATION: Duration = Duration::from_secs(120);
 const PUBLISH_LEAD: Duration =
     Duration::from_secs(ffpipeline::pipeline::SEGMENT_SECONDS as u64 * 3);
 
+/// STOPGAP: how much media a VARIANT session keeps instead.
+///
+/// A variant's segments are consumed on the cohort's serve timeline, which
+/// trails this session's own production by the shared session's serve lag,
+/// so a twin deleted on this session's clock can still be referenced by
+/// composed playlists, and the reference then serves 404s at the start of
+/// the substituted window.
+///
+/// No constant can be correct here while that lag is unbounded; this one is
+/// sized to clear every lag observed so far by an order of magnitude while
+/// still bounding what a long-running variant can hold on disk. Trimming
+/// under it logs a warning, because it means the lag or the item has
+/// outgrown the stopgap.
+///
+/// TODO: replace with composer-owned twin lifetime: the composer holds the
+/// only references to variant segments, so it should delete their files as
+/// entries age out of composed history, and this constant should not exist.
+/// Tracked in the timeline rearchitecture.
+pub(crate) const VARIANT_HISTORY_DURATION: Duration = Duration::from_secs(1800);
+
+// Cross-module contract: a composed cohort playlist's serve head may trail
+// the shared playlist's head by up to `composer::HARD_LAG_SEGMENTS` before
+// the composer forces it forward, while this module deletes segment files
+// `HISTORY_DURATION` behind the head it serves from. The lag bound must
+// stay strictly inside the retention window, or a lagging cohort window
+// references segments whose files are already deleted and clients 404.
+//
+// The composer forces a lagging head only as far as its own last full
+// window, which is `SERVED_SEGMENTS - 1` behind its newest composed entry,
+// so that offset is part of the trail and belongs in this bound.
+//
+// One term is NOT compile-time bounded: how far the shared head runs past
+// the composed timeline's own edge. Both ends are now placed from the wall
+// clock (this module publishes out to `PUBLISH_LEAD` past now, composition
+// stops `composer::COMPOSE_TRAIL_SECONDS` behind it), so the distance is no
+// longer free to grow with the life of the session the way it was while the
+// head was paced forward from its initial placement. It is still not a
+// constant: both ends are compared against program date times, which fall
+// behind the wall clock by whatever the schedule has drifted, and the
+// composer cannot emit content that does not exist on its timeline yet. The
+// composer warns when it detects that state; this assertion covers only
+// what a constant can cover.
+const _: () = assert!(
+    ersatztv_channel::composer::HARD_LAG_SEGMENTS
+        + ersatztv_channel::composer::SERVED_SEGMENTS as u64
+        - 1
+        < HISTORY_DURATION.as_secs() / ersatztv_channel::composer::SEGMENT_SECONDS,
+    "composer::HARD_LAG_SEGMENTS plus the served window must stay strictly inside \
+     the segment retention window"
+);
+
 #[derive(Clone)]
 pub struct SubtitleSource {
     pub cues: Arc<Vec<Cue>>,
@@ -65,6 +116,13 @@ pub struct PlaylistManager {
 
     current_item_id: String,
     pipelines: Vec<SidecarPipeline>,
+
+    /// Retention budget behind the served head; [`HISTORY_DURATION`] for a
+    /// shared session, [`VARIANT_HISTORY_DURATION`] for a variant.
+    history: Duration,
+    /// An extended budget that actually trims has been outgrown by serve
+    /// lag or item length; warned once per session.
+    extended_trim_warned: bool,
 
     timeout: bool,
     /// When the heartbeat file was last observed to exist, so its absence
@@ -129,6 +187,9 @@ impl PlaylistManager {
             current_item_id: String::new(),
             pipelines: Vec::new(),
 
+            history: HISTORY_DURATION,
+            extended_trim_warned: false,
+
             timeout: false,
             heartbeat_last_seen: Instant::now(),
             // Starts true: the file legitimately does not exist until the
@@ -138,6 +199,13 @@ impl PlaylistManager {
 
             last_progress: OffsetDateTime::now_utc(),
         }
+    }
+
+    /// Replaces the retention budget behind the served head. Set once at
+    /// session start, before any segment lands; variants use the STOPGAP
+    /// [`VARIANT_HISTORY_DURATION`] (see the TODO there).
+    pub fn set_history_duration(&mut self, history: Duration) {
+        self.history = history;
     }
 
     pub fn timeout(&self) -> &bool {
@@ -310,6 +378,15 @@ impl PlaylistManager {
         // trim old segments
         let cutoff = self.trim_cutoff();
         while !self.segments.is_empty() && self.segments[0].program_date_time < cutoff {
+            if self.history != HISTORY_DURATION && !self.extended_trim_warned {
+                self.extended_trim_warned = true;
+                log::warn!(
+                    "STOPGAP retention of {}s exhausted; trimming segments that \
+                     composed playlists may still reference (serve lag or item \
+                     length has outgrown VARIANT_HISTORY_DURATION)",
+                    self.history.as_secs()
+                );
+            }
             if let Some(removed) = self.segments.remove(0) {
                 self.media_sequence += 1;
                 if self.discontinuity_before.contains(&removed.path) {
@@ -498,7 +575,7 @@ impl PlaylistManager {
             .map(|segment| segment.program_date_time)
             .unwrap_or(self.last_segment_end);
 
-        served - HISTORY_DURATION
+        served - self.history
     }
 
     fn generate_playlist(
@@ -712,63 +789,20 @@ mod tests {
         }
     }
 
-    /// An io failure inside `update` is one of the two ways an item airs
-    /// black, and every one of them used to render as the same sentence about
-    /// loading a channel config. These pin the two facts a log line has to
-    /// carry on its own: what was being done, and to what.
-
-    #[tokio::test]
-    async fn scanning_a_missing_segment_folder_names_the_folder() {
-        let folder = tempfile::tempdir().unwrap();
-        let missing = folder.path().join("gone");
-        let mut manager = manager_in(&missing);
-
-        let message = manager.update().await.unwrap_err().to_string();
-
-        assert!(
-            message.contains("scan the segment folder"),
-            "message does not name the operation: {message}"
-        );
-        assert!(
-            message.contains(&missing.display().to_string()),
-            "message does not name the folder: {message}"
-        );
-        assert!(
-            !message.contains("channel config"),
-            "message blames the channel config: {message}"
-        );
+    fn source(cues: Vec<Cue>) -> SubtitleSource {
+        SubtitleSource {
+            cues: Arc::new(cues),
+            cursor: 0,
+            next_segment_source_offset: Duration::ZERO,
+        }
     }
 
-    /// The incident's signature: a trimmed segment whose file is already gone
-    /// aborts `update`, fails the item, and airs black. The line has to name
-    /// the segment, or the only way to reach it is to read this module.
-    #[tokio::test]
-    async fn trimming_a_segment_whose_file_is_gone_names_the_segment() {
-        let folder = tempfile::tempdir().unwrap();
-        let mut manager = manager_in(folder.path());
-
-        // one held segment, aged past the retention window, with no file on
-        // disk behind it
-        manager
-            .segments
-            .push_back(segment("live000042.ts", "item-a", 0));
-        manager.last_segment_end =
-            OffsetDateTime::UNIX_EPOCH + HISTORY_DURATION + Duration::from_secs(60);
-
-        let message = manager.update().await.unwrap_err().to_string();
-
-        assert!(
-            message.contains("delete the trimmed segment"),
-            "message does not name the operation: {message}"
-        );
-        assert!(
-            message.contains("live000042.ts"),
-            "message does not name the segment: {message}"
-        );
-        assert!(
-            !message.contains("channel config"),
-            "message blames the channel config: {message}"
-        );
+    fn cue(start: f64, end: f64, text: &str) -> Cue {
+        Cue {
+            start: Duration::from_secs_f64(start),
+            end: Duration::from_secs_f64(end),
+            text: String::from(text),
+        }
     }
 
     /// The window ends at the first segment whose program date time reaches
@@ -906,6 +940,48 @@ mod tests {
         assert_eq!(m.pipelines[0].item_id, "item-b");
     }
 
+    #[test]
+    fn spanning_cue_keeps_its_full_range_in_every_segment() {
+        // a cue from 2s to 10s covers all of the second segment and part of
+        // the first and third
+        let mut src = source(vec![cue(2.0, 10.0, "spanning")]);
+
+        let first = render_subtitle_segment(&mut src, Duration::ZERO, 4.0, 0);
+        let second = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+        let third = render_subtitle_segment(&mut src, Duration::from_secs(8), 4.0, 720_000);
+
+        for segment in [&first, &second, &third] {
+            assert!(
+                segment.contains("00:00:02.000 --> 00:00:10.000"),
+                "expected the full cue range, got:\n{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_map_anchors_the_source_timeline_to_the_segment() {
+        let mut src = source(vec![cue(6.0, 7.0, "later")]);
+
+        let segment = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+
+        assert!(
+            segment.starts_with("WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:04.000,MPEGTS:360000\n\n")
+        );
+        assert!(segment.contains("00:00:06.000 --> 00:00:07.000"));
+    }
+
+    #[test]
+    fn cue_that_ended_before_the_segment_is_not_emitted() {
+        let mut src = source(vec![cue(0.5, 1.5, "early"), cue(5.0, 6.0, "later")]);
+
+        let first = render_subtitle_segment(&mut src, Duration::ZERO, 4.0, 0);
+        let second = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+
+        assert!(first.contains("early"));
+        assert!(!second.contains("early"));
+        assert!(second.contains("later"));
+    }
+
     /// A window of `segment_count` four-second segments starting at
     /// `channel_start`, with the live edge advanced exactly as `update`
     /// advances it when it appends a segment.
@@ -986,6 +1062,42 @@ mod tests {
         assert_eq!(expired(&m), 9);
     }
 
+    /// The star-opening 404s of 2026-08-09: a 150s variant produced 38 twins
+    /// and its default 120s budget deleted the first four before the lagging
+    /// cohort viewer arrived. Under the variant budget the whole envelope
+    /// survives, and keeps surviving across serve lags far beyond any
+    /// observed.
+    #[test]
+    fn variant_history_keeps_the_whole_envelope_alive() {
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 38);
+        assert_eq!(expired(&m), 8);
+
+        m.set_history_duration(VARIANT_HISTORY_DURATION);
+        assert_eq!(expired(&m), 0);
+
+        // still zero with the serve lag an order of magnitude past the
+        // worst measured (272s)
+        let long = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 38 + 60);
+        let mut long_variant = long;
+        long_variant.set_history_duration(VARIANT_HISTORY_DURATION);
+        assert_eq!(expired(&long_variant), 0);
+    }
+
+    /// The extended budget is a cap, not unlimited: an item that outgrows it
+    /// still trims, bounding what a long-running variant can hold on disk.
+    #[test]
+    fn variant_history_still_bounds_a_long_running_item() {
+        // 500 four-second segments is 2000s of media, 200s past the budget
+        let mut m = window_anchored_at(OffsetDateTime::UNIX_EPOCH, 500);
+        m.set_history_duration(VARIANT_HISTORY_DURATION);
+
+        assert_eq!(expired(&m), 50);
+        assert_eq!(
+            (m.segments.len() - expired(&m)) as u64 * 4,
+            VARIANT_HISTORY_DURATION.as_secs()
+        );
+    }
+
     #[test]
     fn nothing_is_trimmed_before_the_window_fills() {
         // 10 segments is 40s of media, well inside the history window
@@ -994,62 +1106,31 @@ mod tests {
         assert_eq!(expired(&m), 0);
     }
 
-    fn source(cues: Vec<Cue>) -> SubtitleSource {
-        SubtitleSource {
-            cues: Arc::new(cues),
-            cursor: 0,
-            next_segment_source_offset: Duration::ZERO,
-        }
-    }
+    /// An io failure inside `update` is one of the two ways an item airs
+    /// black, and every one of them used to render as the same sentence about
+    /// loading a channel config. These pin the two facts a log line has to
+    /// carry on its own: what was being done, and to what.
 
-    fn cue(start: f64, end: f64, text: &str) -> Cue {
-        Cue {
-            start: Duration::from_secs_f64(start),
-            end: Duration::from_secs_f64(end),
-            text: String::from(text),
-        }
-    }
+    #[tokio::test]
+    async fn scanning_a_missing_segment_folder_names_the_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let missing = folder.path().join("gone");
+        let mut manager = manager_in(&missing);
 
-    #[test]
-    fn spanning_cue_keeps_its_full_range_in_every_segment() {
-        // a cue from 2s to 10s covers all of the second segment and part of
-        // the first and third
-        let mut src = source(vec![cue(2.0, 10.0, "spanning")]);
-
-        let first = render_subtitle_segment(&mut src, Duration::ZERO, 4.0, 0);
-        let second = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
-        let third = render_subtitle_segment(&mut src, Duration::from_secs(8), 4.0, 720_000);
-
-        for segment in [&first, &second, &third] {
-            assert!(
-                segment.contains("00:00:02.000 --> 00:00:10.000"),
-                "expected the full cue range, got:\n{segment}"
-            );
-        }
-    }
-
-    #[test]
-    fn timestamp_map_anchors_the_source_timeline_to_the_segment() {
-        let mut src = source(vec![cue(6.0, 7.0, "later")]);
-
-        let segment = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
+        let message = manager.update().await.unwrap_err().to_string();
 
         assert!(
-            segment.starts_with("WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:04.000,MPEGTS:360000\n\n")
+            message.contains("scan the segment folder"),
+            "message does not name the operation: {message}"
         );
-        assert!(segment.contains("00:00:06.000 --> 00:00:07.000"));
-    }
-
-    #[test]
-    fn cue_that_ended_before_the_segment_is_not_emitted() {
-        let mut src = source(vec![cue(0.5, 1.5, "early"), cue(5.0, 6.0, "later")]);
-
-        let first = render_subtitle_segment(&mut src, Duration::ZERO, 4.0, 0);
-        let second = render_subtitle_segment(&mut src, Duration::from_secs(4), 4.0, 360_000);
-
-        assert!(first.contains("early"));
-        assert!(!second.contains("early"));
-        assert!(second.contains("later"));
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "message does not name the folder: {message}"
+        );
+        assert!(
+            !message.contains("channel config"),
+            "message blames the channel config: {message}"
+        );
     }
 
     /// A worker whose heartbeat file was deleted (a rival worker's startup
@@ -1101,6 +1182,38 @@ mod tests {
         assert!(
             !*manager.timeout(),
             "a just-deleted heartbeat must get the full grace before expiring"
+        );
+    }
+
+    /// The incident's signature: a trimmed segment whose file is already gone
+    /// aborts `update`, fails the item, and airs black. The line has to name
+    /// the segment, or the only way to reach it is to read this module.
+    #[tokio::test]
+    async fn trimming_a_segment_whose_file_is_gone_names_the_segment() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(folder.path());
+
+        // one held segment, aged past the retention window, with no file on
+        // disk behind it
+        manager
+            .segments
+            .push_back(segment("live000042.ts", "item-a", 0));
+        manager.last_segment_end =
+            OffsetDateTime::UNIX_EPOCH + HISTORY_DURATION + Duration::from_secs(60);
+
+        let message = manager.update().await.unwrap_err().to_string();
+
+        assert!(
+            message.contains("delete the trimmed segment"),
+            "message does not name the operation: {message}"
+        );
+        assert!(
+            message.contains("live000042.ts"),
+            "message does not name the segment: {message}"
+        );
+        assert!(
+            !message.contains("channel config"),
+            "message blames the channel config: {message}"
         );
     }
 }

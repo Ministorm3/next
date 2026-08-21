@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::composer::{SEGMENT_SECONDS, SessionPlaylist};
+use crate::composer::{ComposedEntry, SEGMENT_SECONDS, SessionPlaylist, parse_pdt};
 use crate::slate::{SlateFile, read_slate_file};
 
 /// How many cohorts one channel transcodes variants for at once. Cohorts
@@ -114,6 +114,16 @@ struct VariantSession {
     playlist: SessionPlaylist,
     subtitle_playlist: SessionPlaylist,
     spawned_items: HashSet<String>,
+    /// References the served-window audit has already reported missing, so a
+    /// gone file is one warning instead of one per tick. Pruned to the
+    /// current window, so it cannot grow with the life of the session.
+    audit_warned_missing: HashSet<String>,
+    /// The deepest reach behind the wall clock among the substituted entries
+    /// served so far in the current variant-content stretch, in ms. Logged
+    /// and cleared when the window returns to all-shared content. This is
+    /// the measured answer to how much retention a variant actually needs
+    /// (see `VARIANT_HISTORY_DURATION` in the playlist manager).
+    audit_reach_max_ms: Option<u64>,
 }
 
 /// A cohort request found in the output folder: the token naming it, and the
@@ -149,8 +159,18 @@ impl VariantManager {
             _ => None,
         };
 
-        let requests = read_requests(channel, &recognized, default_cohort).await;
+        let (requests, torn) = read_requests(channel, &recognized, default_cohort).await;
         let shared = read_sidecar(&channel.output_folder.join("live.m3u8"), "shared").await;
+
+        // a live cohort request is a viewer of this channel. during a
+        // substituted window that viewer fetches only composed playlists and
+        // variant segments, none of which touch the shared session's files,
+        // so without this the session idles out mid-window with an active
+        // audience. requests here are already pruned of stale ones, so an
+        // audience that leaves still lets the channel wind down
+        if !requests.is_empty() {
+            touch_heartbeat(&channel.output_folder).await;
+        }
 
         let mut sessions = self.sessions.lock().await;
 
@@ -162,14 +182,29 @@ impl VariantManager {
             .filter(|r| !r.cohort_query.is_empty())
             .map(|r| r.cohort_query.clone())
             .collect();
-        reap(
-            &mut sessions,
-            &admitted,
-            &requested,
-            shared.is_some(),
-            channel,
-        )
-        .await;
+
+        // Reaping decides from the ABSENCE of a request, so it may only run on
+        // a complete view. A request caught mid-write is unreadable this tick
+        // but says nothing about whether its viewer is still there, and
+        // dropping a session on that evidence is the reap that kept firing
+        // while a viewer polled every two seconds. Sessions that really have
+        // gone away are still reaped on the next tick with an intact view.
+        if torn {
+            log::debug!(
+                "channel {}: deferring the reap, a cohort request was read mid-write \
+                 so this tick cannot tell an absent viewer from an unreadable one",
+                channel.number
+            );
+        } else {
+            reap(
+                &mut sessions,
+                &admitted,
+                &requested,
+                shared.is_some(),
+                channel,
+            )
+            .await;
+        }
 
         let Some(shared) = shared else {
             return;
@@ -303,6 +338,8 @@ impl VariantSession {
             )),
             subtitle_playlist: SessionPlaylist::default(),
             spawned_items: HashSet::new(),
+            audit_warned_missing: HashSet::new(),
+            audit_reach_max_ms: None,
         }
     }
 
@@ -350,7 +387,110 @@ impl VariantSession {
             &subtitles,
         )
         .await;
+
+        self.audit_served_window(channel, variant.as_ref(), now)
+            .await;
     }
+
+    /// Audits what the media playlist just published against what actually
+    /// backs it. Nothing else can see this failure: the server's static file
+    /// handler serves a bare 404 without logging, and any monitor that reads
+    /// the playlist sees a perfectly healthy window even while a file behind
+    /// it is gone.
+    ///
+    /// Two measurements. Every referenced file must still exist on disk; a
+    /// missing one is the trim-under-reference failure actually happening
+    /// (or a twin that was never produced), warned once per file. And the
+    /// deepest reach behind the wall clock into variant content, measured on
+    /// the variant's own stamps because those are the clock its retention
+    /// trim runs on; the maximum over a substituted stretch, logged when the
+    /// stretch leaves the window, is the observed answer to how much
+    /// retention a variant actually needs (see `VARIANT_HISTORY_DURATION`).
+    /// Only the media window is audited: the subtitle playlist mirrors its
+    /// decisions, and trims delete both files together.
+    async fn audit_served_window(
+        &mut self,
+        channel: &VariantChannel,
+        variant: Option<&PlaylistSidecar>,
+        now: OffsetDateTime,
+    ) {
+        let entries: Vec<(String, u64, bool)> = self
+            .playlist
+            .served_window()
+            .map(|e| (e.path.clone(), e.sequence, e.variant))
+            .collect();
+
+        let mut has_variant_entries = false;
+        for (path, sequence, is_variant) in &entries {
+            has_variant_entries |= is_variant;
+            let file = channel.output_folder.join(path);
+            let exists = tokio::fs::try_exists(&file).await.unwrap_or(false);
+            if !exists && self.audit_warned_missing.insert(path.clone()) {
+                log::warn!(
+                    "[{}] composed window references {path} (position {sequence}, {}) but \
+                     no file backs it on disk; every viewer of this cohort gets a 404 at \
+                     this position",
+                    self.playlist.label(),
+                    if *is_variant {
+                        "a variant twin"
+                    } else {
+                        "a shared segment"
+                    },
+                );
+            }
+        }
+        self.audit_warned_missing
+            .retain(|warned| entries.iter().any(|(path, ..)| path == warned));
+
+        if has_variant_entries {
+            let reach = variant.and_then(|v| {
+                deepest_variant_reach_ms(
+                    self.playlist.served_window(),
+                    v,
+                    &self.variant_prefix,
+                    now,
+                )
+            });
+            if let Some(reach) = reach {
+                self.audit_reach_max_ms =
+                    Some(self.audit_reach_max_ms.map_or(reach, |max| max.max(reach)));
+            }
+        } else if let Some(max) = self.audit_reach_max_ms.take() {
+            log::info!(
+                "[{}] substituted stretch left the served window; deepest composed reach \
+                 into variant content was {max}ms behind the wall clock",
+                self.playlist.label(),
+            );
+        }
+    }
+}
+
+/// The deepest reach behind `now` among the served window's variant entries,
+/// in ms. Measured on the variant's OWN segment stamps, never the composed
+/// entry's: a substituted entry re-stamps the twin with the shared session's
+/// program date time, while the variant's retention trim deletes files by the
+/// stamps in its own playlist, so only the sidecar's stamp can say how close
+/// a referenced file is to deletion. A twin the sidecar no longer lists
+/// cannot be measured and is skipped; the existence check reports it if its
+/// file is truly gone.
+fn deepest_variant_reach_ms<'a>(
+    window: impl Iterator<Item = &'a ComposedEntry>,
+    variant: &PlaylistSidecar,
+    variant_prefix: &str,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    window
+        .filter(|entry| entry.variant)
+        .filter_map(|entry| {
+            let twin_path = entry.path.strip_prefix(variant_prefix)?;
+            let stamp = variant
+                .segments
+                .iter()
+                .find(|segment| segment.path == twin_path)?;
+            let stamp = parse_pdt(&stamp.program_date_time)?;
+            Some((now - stamp).whole_milliseconds().max(0) as u64)
+        })
+        .max()
 }
 
 /// Reads every published cohort request, dropping the ones no viewer has
@@ -360,17 +500,23 @@ impl VariantSession {
 ///
 /// `default_cohort` is the already-canonicalized cohort that canonical-empty
 /// requests are admitted to, when the operator configured one.
+///
+/// Returns the resolved requests and whether the scan was TORN. A true second
+/// element means the view is incomplete (a request was caught mid-write, or
+/// the folder could not be scanned), so this tick cannot distinguish a viewer
+/// who left from one whose request was momentarily unreadable, and the caller
+/// must not reap on it.
 async fn read_requests(
     channel: &VariantChannel,
     recognized: &BTreeSet<String>,
     default_cohort: Option<&str>,
-) -> Vec<ResolvedRequest> {
+) -> (Vec<ResolvedRequest>, bool) {
     let folder = requests_folder(&channel.output_folder);
     let mut entries = match tokio::fs::read_dir(&folder).await {
         Ok(entries) => entries,
         // absence is the normal no-viewers case; anything else reads as
         // "no viewers" too, which reaps every session, so it has to say so
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false),
         Err(e) => {
             log::warn!(
                 "cannot scan the cohort requests folder {}: {e}; treating channel {} \
@@ -378,16 +524,29 @@ async fn read_requests(
                 folder.display(),
                 channel.number
             );
-            return Vec::new();
+            return (Vec::new(), true);
         }
     };
 
     let mut requests = Vec::new();
+    let mut torn = false;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
 
-        if is_stale(&path).await {
+        if let Some(age) = staleness(&path).await {
+            // this drop is what a "no fresh viewer request" reap is made of,
+            // so say it happened: a viewer that really left and a viewer
+            // whose requests stopped being republished look identical
+            // downstream, and only the age separates them
+            log::info!(
+                "dropping cohort request {} on channel {}: last republished {}s ago \
+                 (idle limit {}s)",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                channel.number,
+                age.as_secs(),
+                SESSION_IDLE_SECONDS
+            );
             let _ = tokio::fs::remove_file(&path).await;
             if let Some(name) = path.file_name() {
                 let _ =
@@ -400,6 +559,35 @@ async fn read_requests(
             tokio::fs::read_to_string(&path).await,
             path.file_name().map(|n| n.to_string_lossy().into_owned()),
         ) else {
+            continue;
+        };
+
+        // A request file's NAME is `stable_name` of its own contents, so a
+        // read whose contents do not hash to its name caught the file
+        // mid-write and must be ignored rather than canonicalized.
+        //
+        // A truncating writer (both this crate's `publish_request` and the
+        // legacy app's `File.WriteAllTextAsync`) leaves the file present,
+        // with a fresh modified time, and momentarily EMPTY. Reading that
+        // yields an empty query, which canonicalizes to the default cohort,
+        // so the cohort the viewer actually asked for is missing from this
+        // tick's requests and its session is reaped as unwanted. The fresh
+        // modified time means it is not reported as a stale drop either,
+        // which is exactly how the reap presented: "no cohort was requested
+        // this tick" while a viewer was polling every ~2s. Observed three
+        // times over 2026-08-13/14, each time recovering on the next tick.
+        //
+        // This check cannot swallow a genuine bare query: that request is
+        // named `stable_name("")` and its contents really are empty, so the
+        // two agree and it is admitted exactly as before.
+        if ersatztv_core::variant_request::stable_name(&raw_query) != token {
+            log::debug!(
+                "ignoring a torn cohort request {} on channel {}: contents do not \
+                 match the name, so the file was read mid-write",
+                token,
+                channel.number
+            );
+            torn = true;
             continue;
         };
 
@@ -430,7 +618,7 @@ async fn read_requests(
         });
     }
 
-    requests
+    (requests, torn)
 }
 
 /// Chooses which cohorts get a variant transcode. Cohorts already running keep
@@ -550,11 +738,26 @@ async fn reap(
         };
 
         let reason = if !have_shared {
-            "the shared sidecar is unavailable"
+            String::from("the shared sidecar is unavailable")
         } else if !requested.contains(&cohort_query) {
-            "no fresh viewer request"
+            // name what WAS requested this tick. A reap while viewers are
+            // demonstrably still polling has been observed, and the three
+            // ways it can happen are indistinguishable without this: no
+            // requests at all (the folder went empty), requests that
+            // resolved to some other cohort (recognition changed under us),
+            // or this cohort's request having just been dropped as stale
+            let others: Vec<&str> = requested.iter().map(String::as_str).collect();
+            if others.is_empty() {
+                String::from("no fresh viewer request; no cohort was requested this tick")
+            } else {
+                format!(
+                    "no fresh viewer request; {} other cohort(s) were requested this tick: {}",
+                    others.len(),
+                    others.join(", ")
+                )
+            }
         } else {
-            "not admitted at the session cap"
+            String::from("not admitted at the session cap")
         };
         log::info!(
             "reaping variant session for cohort '{}' on channel {} ({reason})",
@@ -726,16 +929,18 @@ async fn spawn_missing_variants(
     }
 }
 
-async fn is_stale(path: &Path) -> bool {
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return false;
-    };
-
-    metadata
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .is_some_and(|age| age.as_secs() >= SESSION_IDLE_SECONDS)
+/// How long ago a request file was last republished, when that is long
+/// enough to drop it. `None` means it is still fresh (or unreadable, which
+/// is deliberately treated as fresh rather than reaping on a stat failure).
+///
+/// Returns the age rather than a bool so the caller can say how stale a
+/// dropped request was. A silent drop here is indistinguishable in the log
+/// from a viewer genuinely leaving, and it is the step that precedes a
+/// "no fresh viewer request" reap.
+async fn staleness(path: &Path) -> Option<Duration> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let age = metadata.modified().ok()?.elapsed().ok()?;
+    (age.as_secs() >= SESSION_IDLE_SECONDS).then_some(age)
 }
 
 /// Publishes a playlist by rename, so a reader never observes a half-written
@@ -1152,6 +1357,124 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// A request caught mid-write is ignored for that tick, not read as a
+    /// different cohort.
+    ///
+    /// A truncating writer leaves the file present, freshly modified, and
+    /// empty. Reading that yields an empty query, which canonicalizes to the
+    /// default cohort, so the cohort the viewer asked for goes missing from
+    /// the tick and its session is reaped while the viewer is still polling.
+    /// Observed three times over 2026-08-13/14, each recovering a tick later.
+    #[tokio::test]
+    async fn a_request_caught_mid_write_does_not_reap_its_cohort() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "zip=15216")
+            .await
+            .unwrap();
+
+        let manager = VariantManager::new();
+        let channel = channel(output);
+        let playlist_path = output.join(composed_playlist_name(&stable_name("zip=15216"), false));
+
+        manager.tick(&channel).await;
+        assert!(
+            playlist_path.exists(),
+            "the cohort must be serving before the torn write"
+        );
+
+        // truncate the live request exactly as a non-atomic writer does: the
+        // file stays, its modified time is fresh, its contents are gone
+        let request = requests_folder(output).join(stable_name("zip=15216"));
+        tokio::fs::write(&request, b"").await.unwrap();
+
+        manager.tick(&channel).await;
+
+        assert!(
+            playlist_path.exists(),
+            "a torn request read as an empty query reaped the cohort mid-write"
+        );
+    }
+
+    /// The torn-write check must not swallow a genuine bare query, whose
+    /// contents really are empty and whose name is `stable_name("")`. Those
+    /// agree, so it is a valid request and keeps its session.
+    #[tokio::test]
+    async fn a_genuine_bare_request_is_still_admitted() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        let request = requests_folder(output).join(stable_name(""));
+        assert_eq!(
+            tokio::fs::read_to_string(&request).await.unwrap(),
+            "",
+            "a bare request's contents are genuinely empty"
+        );
+
+        let manager = VariantManager::new();
+        manager.tick(&channel(output)).await;
+
+        assert!(
+            answers_folder(output).join(stable_name("")).exists(),
+            "a genuine bare request must still be answered"
+        );
+    }
+
+    /// A cohort viewer's polls never touch the shared session's own files
+    /// during a substituted window, so their request file is the only proof
+    /// the channel has an audience. The tick must convert that proof into
+    /// the shared heartbeat, or the session idles out mid-window.
+    #[tokio::test]
+    async fn a_live_cohort_request_keeps_the_shared_heartbeat_fresh() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        let heartbeat = output.join(HEARTBEAT_FILE_NAME);
+        tokio::fs::write(&heartbeat, b"").await.unwrap();
+        let stale = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(&heartbeat, stale).unwrap();
+
+        ersatztv_core::variant_request::publish_request(output, "zip=15216")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        let after = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&heartbeat).unwrap(),
+        );
+        assert!(after > stale, "tick must refresh the shared heartbeat");
+    }
+
+    /// With no live requests the tick leaves the heartbeat alone, so an
+    /// audience that leaves still lets the channel wind down.
+    #[tokio::test]
+    async fn no_requests_leave_the_shared_heartbeat_stale() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        let heartbeat = output.join(HEARTBEAT_FILE_NAME);
+        tokio::fs::write(&heartbeat, b"").await.unwrap();
+        let stale = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(&heartbeat, stale).unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        let after = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&heartbeat).unwrap(),
+        );
+        assert_eq!(after, stale, "an idle channel must still time out");
+    }
+
     /// Both playlists a client can ask for are published, since the master
     /// playlist points a cohort at its own subtitle rendition too.
     #[tokio::test]
@@ -1537,6 +1860,108 @@ mod tests {
                 cohort_query: String::from("zip=15216"),
                 without_path: true
             }
+        );
+    }
+
+    /// A composed entry as the audit sees it. The program date time is the
+    /// SHARED stamp, deliberately different from any variant stamp a test
+    /// gives the sidecar, so measuring on the wrong clock cannot pass.
+    fn served(path: &str, variant: bool, shared_stamp: OffsetDateTime) -> ComposedEntry {
+        ComposedEntry {
+            path: path.to_owned(),
+            duration: 4.0,
+            program_date_time: shared_stamp,
+            discontinuity: false,
+            sequence: 0,
+            variant,
+        }
+    }
+
+    fn twin(path: &str, stamp: OffsetDateTime) -> SidecarSegment {
+        SidecarSegment {
+            path: path.to_owned(),
+            duration: 4.0,
+            program_date_time: crate::composer::format_pdt(stamp),
+            item_id: String::from("game"),
+            discontinuity: false,
+        }
+    }
+
+    fn variant_sidecar(segments: Vec<SidecarSegment>) -> PlaylistSidecar {
+        PlaylistSidecar {
+            segments,
+            pipelines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reach_is_measured_on_the_variants_own_stamps() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        // the shared stamp says this position is current; the variant's own
+        // stamp says the file is 100s old, and the trim runs on that clock
+        let window = [served("variants/abc/live000003.ts", true, now)];
+        let variant = variant_sidecar(vec![twin(
+            "live000003.ts",
+            now - time::Duration::seconds(100),
+        )]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn reach_takes_the_deepest_entry_of_the_window() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        let window = [
+            served("variants/abc/live000003.ts", true, now),
+            served("variants/abc/live000004.ts", true, now),
+        ];
+        let variant = variant_sidecar(vec![
+            twin("live000003.ts", now - time::Duration::seconds(90)),
+            twin("live000004.ts", now - time::Duration::seconds(40)),
+        ]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            Some(90_000)
+        );
+    }
+
+    /// Shared entries are on the shared session's retention and are not this
+    /// measurement; a twin the sidecar no longer lists cannot be measured on
+    /// any clock and must not poison the maximum with a guess.
+    #[test]
+    fn shared_entries_and_unlisted_twins_are_not_measured() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        let ancient = now - time::Duration::seconds(900);
+        let window = [
+            served("live000900.ts", false, ancient),
+            served("variants/abc/live000007.ts", true, ancient),
+        ];
+        let variant = variant_sidecar(vec![twin("live000900.ts", ancient)]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            None
+        );
+    }
+
+    /// A twin stamped ahead of the wall clock is worked-ahead content, not a
+    /// retention concern; it reads as zero reach rather than wrapping.
+    #[test]
+    fn a_twin_ahead_of_the_wall_clock_reaches_zero() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1000);
+        let window = [served("variants/abc/live000009.ts", true, now)];
+        let variant = variant_sidecar(vec![twin(
+            "live000009.ts",
+            now + time::Duration::seconds(30),
+        )]);
+
+        assert_eq!(
+            deepest_variant_reach_ms(window.iter(), &variant, "variants/abc/", now),
+            Some(0)
         );
     }
 }
