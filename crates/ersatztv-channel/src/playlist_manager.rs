@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ersatztv_channel::error::{ChannelError, IoContext};
 use ersatztv_core::{HEARTBEAT_FILE_NAME, HEARTBEAT_FILE_TIMEOUT};
@@ -63,6 +63,13 @@ pub struct PlaylistManager {
     subtitle_source: Option<SubtitleSource>,
 
     timeout: bool,
+    /// When the heartbeat file was last observed to exist, so its absence
+    /// can expire the session too. A worker whose heartbeat file was
+    /// deleted (a rival worker's startup empties the whole folder) was
+    /// previously immortal: the timeout was only ever computed from the
+    /// file's mtime, so no file meant no timeout, ever.
+    heartbeat_last_seen: Instant,
+    heartbeat_missing_warned: bool,
 
     last_progress: OffsetDateTime,
 }
@@ -115,6 +122,11 @@ impl PlaylistManager {
             subtitle_source: None,
 
             timeout: false,
+            heartbeat_last_seen: Instant::now(),
+            // Starts true: the file legitimately does not exist until the
+            // server first touches it, so absence is only worth a warning
+            // after the file has been seen.
+            heartbeat_missing_warned: true,
 
             last_progress: OffsetDateTime::now_utc(),
         }
@@ -356,7 +368,25 @@ impl PlaylistManager {
                 "read the modified time of the heartbeat file",
                 &self.heartbeat_file,
             )?;
+            self.heartbeat_last_seen = Instant::now();
+            self.heartbeat_missing_warned = false;
             self.timeout = modified.elapsed().unwrap_or(Duration::MAX) > HEARTBEAT_FILE_TIMEOUT;
+        } else {
+            // A missing heartbeat is a stale heartbeat. The file starts
+            // absent (the server touches it on the first viewer request),
+            // so construction time anchors the same grace a fresh file gets
+            // from its mtime; but a file that disappears after being seen
+            // means another process emptied this folder, and a worker that
+            // shrugs that off can never idle out again.
+            if !self.heartbeat_missing_warned {
+                log::warn!(
+                    "the heartbeat file {} disappeared; treating it as stale \
+                     (another process may have emptied this folder)",
+                    self.heartbeat_file.display()
+                );
+                self.heartbeat_missing_warned = true;
+            }
+            self.timeout = self.heartbeat_last_seen.elapsed() > HEARTBEAT_FILE_TIMEOUT;
         }
 
         Ok(())
@@ -863,5 +893,57 @@ mod tests {
         assert!(first.contains("early"));
         assert!(!second.contains("early"));
         assert!(second.contains("later"));
+    }
+
+    /// A worker whose heartbeat file was deleted (a rival worker's startup
+    /// empties the whole folder) used to be immortal: the timeout was only
+    /// computed from the file's mtime, so no file meant no timeout, ever.
+    /// Absence past the grace now expires the session like staleness does.
+    #[tokio::test]
+    async fn a_missing_heartbeat_arms_the_idle_timeout_after_the_grace() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(folder.path());
+        manager.heartbeat_last_seen =
+            Instant::now() - HEARTBEAT_FILE_TIMEOUT - Duration::from_secs(1);
+
+        manager.update().await.unwrap();
+
+        assert!(
+            *manager.timeout(),
+            "a heartbeat missing past the grace must expire the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_heartbeat_within_the_grace_does_not_time_out() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(folder.path());
+
+        manager.update().await.unwrap();
+
+        assert!(
+            !*manager.timeout(),
+            "a fresh session must get the same grace a fresh heartbeat file gets"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_that_reappears_rearms_the_grace() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(folder.path());
+        manager.heartbeat_last_seen =
+            Instant::now() - HEARTBEAT_FILE_TIMEOUT - Duration::from_secs(1);
+        std::fs::write(folder.path().join(HEARTBEAT_FILE_NAME), b"").unwrap();
+
+        manager.update().await.unwrap();
+        assert!(!*manager.timeout());
+
+        // and once seen, disappearance restarts the clock from the sighting
+        std::fs::remove_file(folder.path().join(HEARTBEAT_FILE_NAME)).unwrap();
+        manager.update().await.unwrap();
+        assert!(
+            !*manager.timeout(),
+            "a just-deleted heartbeat must get the full grace before expiring"
+        );
     }
 }
