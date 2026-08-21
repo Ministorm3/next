@@ -422,27 +422,13 @@ impl ChannelSession {
         let current_item = match current_item_result {
             Ok(playout_item) => playout_item,
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
-                // filling a schedule gap with black is normal; log it so black
-                // air is explainable
-                match next_start {
-                    Some(start) => {
-                        let gap = start - self.transcoded_until;
-                        log::debug!(
-                            "no playout item covers {}; filling with black/silence for {}m {}s until the next item",
-                            self.transcoded_until,
-                            gap.whole_minutes(),
-                            gap.whole_seconds() % 60
-                        );
-                    }
-                    None => log::debug!(
-                        "no playout item covers {} and none is scheduled after it; filling with black/silence",
-                        self.transcoded_until
-                    ),
-                }
+                // a schedule gap is the one expected way to air black; the
+                // census line still counts it, but not at fault level
+                log::debug!("{}", no_item_message(self.transcoded_until, next_start));
                 self.fake_playout_item(next_start)
             }
             Err(err) => {
-                log::error!("{}", err);
+                log::error!("{}", item_unselectable_message(self.transcoded_until, &err));
                 self.fake_playout_item(None)
             }
         };
@@ -459,7 +445,7 @@ impl ChannelSession {
             Err(e @ ChannelError::Stalled(_)) => return Err(e),
             Err(e) if troubleshoot => return Err(e),
             Err(e) => {
-                log::error!("item failed, replacing with black/silence: {e}");
+                log::error!("{}", item_failed_message(&current_item, &e));
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
                 self.transcode_item(&fake_item, realtime, troubleshoot, pts_duration)
                     .await?
@@ -1552,6 +1538,32 @@ impl ChannelSession {
     }
 }
 
+/// The three ways a slot airs black, worded so one grep for
+/// `replacing with black/silence` is a complete census and each line names
+/// the slot it lost. They are separate faults with separate remedies: a
+/// schedule gap is expected, an unreadable playout and a failed transcode
+/// are not, and the earlier wording distinguished none of them.
+fn no_item_message(at: OffsetDateTime, next_start: Option<OffsetDateTime>) -> String {
+    format!(
+        "no playout item covers {at}, replacing with black/silence until {}",
+        next_start.map_or_else(
+            || String::from("the next reload"),
+            |start| start.to_string()
+        )
+    )
+}
+
+fn item_unselectable_message(at: OffsetDateTime, error: &ChannelError) -> String {
+    format!("no item could be selected for {at}, replacing with black/silence: {error}")
+}
+
+fn item_failed_message(item: &PlayoutItem, error: &ChannelError) -> String {
+    format!(
+        "item {} ({} .. {}) failed, replacing with black/silence: {error}",
+        item.id, item.start, item.finish
+    )
+}
+
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
     match value {
         WatermarkLocation::TopLeft => ffpipeline::input::WatermarkLocation::TopLeft,
@@ -1727,155 +1739,6 @@ mod tests {
         assert_eq!(ChannelSession::emission_trim_ms(error, 30_000), 0);
     }
 
-    /// The channel configuration exactly as the scaffolder writes it, which
-    /// is the shape every deployment starts from.
-    fn test_channel_config() -> ChannelConfig {
-        serde_json::from_value(serde_json::json!({
-            "playout": { "folder": "/tmp/playout" },
-            "ffmpeg": {},
-            "normalization": {
-                "audio": {
-                    "format": "aac", "bitrate_kbps": 192, "buffer_kbps": 384,
-                    "channels": 2, "sample_rate_hz": 48000,
-                    "normalize_loudness": false
-                },
-                "video": {
-                    "format": "h264", "bit_depth": 8,
-                    "width": 1920, "height": 1080,
-                    "bitrate_kbps": 2000, "buffer_kbps": 4000
-                },
-                "subtitle": { "mode": "burn" }
-            }
-        }))
-        .expect("the scaffolded channel config shape deserializes")
-    }
-
-    fn output_settings(realtime: bool, is_live: bool, still: bool) -> OutputSettings {
-        ChannelSession::build_output_settings(OutputSettingsPlan {
-            channel_config: &test_channel_config(),
-            accel: None,
-            output_file: String::from("/tmp/out/live.m3u8"),
-            output_segment_template: String::from("/tmp/out/live%06d.ts"),
-            troubleshoot: false,
-            pts_duration: Some(Duration::from_millis(1234)),
-            realtime,
-            is_live,
-            video_is_still_image: still,
-        })
-    }
-
-    /// A still image decodes as a single frame since #211, so the encoder
-    /// must be told a rate to emit it at.
-    #[test]
-    fn a_still_image_forces_an_output_frame_rate() {
-        assert!(output_settings(true, false, true).frame_rate.is_some());
-        assert!(output_settings(true, false, false).frame_rate.is_none());
-    }
-
-    /// The scanned pts offset must reach the encoder unchanged; it is the
-    /// only thing keeping output timestamps monotonic across items.
-    #[test]
-    fn the_pts_offset_reaches_the_encoder() {
-        let settings = output_settings(true, false, false);
-        assert_eq!(
-            settings.pts_offset.expect("offset is declared").duration,
-            Duration::from_millis(1234)
-        );
-    }
-
-    /// Output pacing follows the caller alone.
-    #[test]
-    fn pacing_follows_the_caller() {
-        assert!(output_settings(true, false, false).realtime);
-        assert!(!output_settings(false, false, false).realtime);
-    }
-
-    /// The one-line caller change behind the 2026-08-14 regression, now
-    /// pinned: every pipeline is padded, whatever kind of item it is.
-    #[test]
-    fn every_pipeline_is_padded_to_its_clamp() {
-        for realtime in [false, true] {
-            for is_live in [false, true] {
-                for still in [false, true] {
-                    assert!(
-                        output_settings(realtime, is_live, still).pad_to_duration,
-                        "realtime={realtime} is_live={is_live} still={still} must be padded"
-                    );
-                }
-            }
-        }
-    }
-
-    /// A plain file item occupying an 11.021s slot, the shape of the logo
-    /// bump whose shortfall started the drift investigation.
-    fn file_item() -> PlayoutItem {
-        serde_json::from_value(serde_json::json!({
-            "id": "file-item",
-            "start": "2026-08-15T12:00:00.000-04:00",
-            "finish": "2026-08-15T12:00:11.021-04:00",
-            "source": { "source_type": "local", "path": "/bumps/logo.mp4" }
-        }))
-        .expect("a local file item deserializes")
-    }
-
-    fn plan_for(
-        item: &PlayoutItem,
-        start_at_zero: bool,
-        realtime: bool,
-        stamp_error_ms: i64,
-    ) -> PlannedTimings {
-        let audio_source =
-            ChannelSession::resolve_source(item, |t| t.audio.as_ref()).expect("audio source");
-        let video_source =
-            ChannelSession::resolve_source(item, |t| t.video.as_ref()).expect("video source");
-        let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
-        ChannelSession::plan_timings(TimingPlan {
-            current_item: item,
-            audio_source: &audio_source,
-            video_source: &video_source,
-            subtitle_source: None,
-            start_at_zero,
-            realtime,
-            is_live,
-            transcoded_until: item.start,
-            stamp_error_ms,
-        })
-    }
-
-    /// A realtime pipeline covers its whole remaining slot in one
-    /// invocation, and both streams agree on the range.
-    #[test]
-    fn a_realtime_item_fills_its_slot_in_one_pipeline() {
-        let item = file_item();
-        let planned = plan_for(&item, true, true, 0);
-        assert_eq!(planned.audio.in_point, Duration::ZERO);
-        assert_eq!(planned.audio.out_point, Duration::from_millis(11_021));
-        assert_eq!(planned.video.out_point, Duration::from_millis(11_021));
-        assert!(planned.video.is_complete);
-        assert_eq!(planned.video.finish, item.finish);
-    }
-
-    /// While working ahead, a long item is transcoded in chunks so the
-    /// buffer builds up quickly; the chunk boundary advances the schedule
-    /// by exactly the chunk.
-    #[test]
-    fn work_ahead_chunks_a_long_item() {
-        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
-            "id": "long-item",
-            "start": "2026-08-15T12:00:00.000-04:00",
-            "finish": "2026-08-15T12:05:00.000-04:00",
-            "source": { "source_type": "local", "path": "/media/episode.mp4" }
-        }))
-        .expect("a local file item deserializes");
-
-        let limit = Duration::from_secs(SEGMENT_SECONDS as u64 * 11);
-        let planned = plan_for(&item, true, false, 0);
-        assert_eq!(planned.video.in_point, Duration::ZERO);
-        assert_eq!(planned.video.out_point, limit);
-        assert!(!planned.video.is_complete);
-        assert_eq!(planned.video.finish, item.start + limit);
-    }
-
     /// The steady state the trim exists for: each padded item overshoots its
     /// slot by up to one frame, and the whole accumulated error comes back on
     /// the very next pipeline.
@@ -1937,6 +1800,114 @@ mod tests {
         assert_eq!(extended.out_point, Duration::from_millis(13_061));
     }
 
+    /// The channel configuration exactly as the scaffolder writes it, which
+    /// is the shape every deployment starts from.
+    fn test_channel_config() -> ChannelConfig {
+        serde_json::from_value(serde_json::json!({
+            "playout": { "folder": "/tmp/playout" },
+            "ffmpeg": {},
+            "normalization": {
+                "audio": {
+                    "format": "aac", "bitrate_kbps": 192, "buffer_kbps": 384,
+                    "channels": 2, "sample_rate_hz": 48000,
+                    "normalize_loudness": false
+                },
+                "video": {
+                    "format": "h264", "bit_depth": 8,
+                    "width": 1920, "height": 1080,
+                    "bitrate_kbps": 2000, "buffer_kbps": 4000
+                },
+                "subtitle": { "mode": "burn" }
+            }
+        }))
+        .expect("the scaffolded channel config shape deserializes")
+    }
+
+    fn output_settings(realtime: bool, is_live: bool, still: bool) -> OutputSettings {
+        ChannelSession::build_output_settings(OutputSettingsPlan {
+            channel_config: &test_channel_config(),
+            accel: None,
+            output_file: String::from("/tmp/out/live.m3u8"),
+            output_segment_template: String::from("/tmp/out/live%06d.ts"),
+            troubleshoot: false,
+            pts_duration: Some(Duration::from_millis(1234)),
+            realtime,
+            is_live,
+            video_is_still_image: still,
+        })
+    }
+
+    /// The one-line caller change behind the 2026-08-14 regression, now
+    /// pinned: every pipeline is padded, whatever kind of item it is.
+    #[test]
+    fn every_pipeline_is_padded_to_its_clamp() {
+        for realtime in [false, true] {
+            for is_live in [false, true] {
+                for still in [false, true] {
+                    assert!(
+                        output_settings(realtime, is_live, still).pad_to_duration,
+                        "realtime={realtime} is_live={is_live} still={still} must be padded"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A still image decodes as a single frame since #211, so the encoder
+    /// must be told a rate to emit it at.
+    #[test]
+    fn a_still_image_forces_an_output_frame_rate() {
+        assert!(output_settings(true, false, true).frame_rate.is_some());
+        assert!(output_settings(true, false, false).frame_rate.is_none());
+    }
+
+    /// The scanned pts offset must reach the encoder unchanged; it is the
+    /// only thing keeping output timestamps monotonic across items.
+    #[test]
+    fn the_pts_offset_reaches_the_encoder() {
+        let settings = output_settings(true, false, false);
+        assert_eq!(
+            settings.pts_offset.expect("offset is declared").duration,
+            Duration::from_millis(1234)
+        );
+    }
+
+    /// A plain file item occupying an 11.021s slot, the shape of the logo
+    /// bump whose shortfall started the drift investigation.
+    fn file_item() -> PlayoutItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "file-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:00:11.021-04:00",
+            "source": { "source_type": "local", "path": "/bumps/logo.mp4" }
+        }))
+        .expect("a local file item deserializes")
+    }
+
+    fn plan_for(
+        item: &PlayoutItem,
+        start_at_zero: bool,
+        realtime: bool,
+        stamp_error_ms: i64,
+    ) -> PlannedTimings {
+        let audio_source =
+            ChannelSession::resolve_source(item, |t| t.audio.as_ref()).expect("audio source");
+        let video_source =
+            ChannelSession::resolve_source(item, |t| t.video.as_ref()).expect("video source");
+        let is_live = source_is_live(&video_source) || source_is_live(&audio_source);
+        ChannelSession::plan_timings(TimingPlan {
+            current_item: item,
+            audio_source: &audio_source,
+            video_source: &video_source,
+            subtitle_source: None,
+            start_at_zero,
+            realtime,
+            is_live,
+            transcoded_until: item.start,
+            stamp_error_ms,
+        })
+    }
+
     /// The trim must land on what the -t actually consumes: both streams'
     /// out points. A trim that was computed but not applied here is exactly
     /// the wiring gap that made the padding regression invisible to the
@@ -1951,6 +1922,84 @@ mod tests {
         assert_eq!(planned.audio.in_point, Duration::ZERO);
         assert_eq!(planned.video.in_point, Duration::ZERO);
         assert_eq!(planned.video.finish, item.finish);
+    }
+
+    use super::*;
+
+    /// One grep has to find every black-air line, and each has to say which
+    /// slot it lost: 144 anonymous lines cannot be told apart from one slot
+    /// failing 144 times.
+    #[test]
+    fn every_black_air_line_names_its_slot_and_shares_one_phrase() {
+        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
+            "id": "file-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:00:11.021-04:00",
+            "source": { "source_type": "local", "path": "/bumps/logo.mp4" }
+        }))
+        .expect("a local file item deserializes");
+        let at = item.start;
+
+        let messages = [
+            no_item_message(at, Some(item.finish)),
+            item_unselectable_message(at, &ChannelError::CaptureFFmpegStderrFailure),
+            item_failed_message(&item, &ChannelError::CaptureFFmpegStderrFailure),
+        ];
+
+        for message in &messages {
+            assert!(
+                message.contains("replacing with black/silence"),
+                "black-air line is not greppable: {message}"
+            );
+        }
+
+        assert!(messages[0].contains(&at.to_string()));
+        assert!(messages[0].contains(&item.finish.to_string()));
+        assert!(messages[1].contains(&at.to_string()));
+        assert!(messages[2].contains(&item.id));
+        assert!(messages[2].contains(&item.start.to_string()));
+        assert!(messages[2].contains(&item.finish.to_string()));
+    }
+
+    /// Output pacing follows the caller alone.
+    #[test]
+    fn pacing_follows_the_caller() {
+        assert!(output_settings(true, false, false).realtime);
+        assert!(!output_settings(false, false, false).realtime);
+    }
+
+    /// A realtime pipeline covers its whole remaining slot in one
+    /// invocation, and both streams agree on the range.
+    #[test]
+    fn a_realtime_item_fills_its_slot_in_one_pipeline() {
+        let item = file_item();
+        let planned = plan_for(&item, true, true, 0);
+        assert_eq!(planned.audio.in_point, Duration::ZERO);
+        assert_eq!(planned.audio.out_point, Duration::from_millis(11_021));
+        assert_eq!(planned.video.out_point, Duration::from_millis(11_021));
+        assert!(planned.video.is_complete);
+        assert_eq!(planned.video.finish, item.finish);
+    }
+
+    /// While working ahead, a long item is transcoded in chunks so the
+    /// buffer builds up quickly; the chunk boundary advances the schedule
+    /// by exactly the chunk.
+    #[test]
+    fn work_ahead_chunks_a_long_item() {
+        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
+            "id": "long-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:05:00.000-04:00",
+            "source": { "source_type": "local", "path": "/media/episode.mp4" }
+        }))
+        .expect("a local file item deserializes");
+
+        let limit = Duration::from_secs(SEGMENT_SECONDS as u64 * 11);
+        let planned = plan_for(&item, true, false, 0);
+        assert_eq!(planned.video.in_point, Duration::ZERO);
+        assert_eq!(planned.video.out_point, limit);
+        assert!(!planned.video.is_complete);
+        assert_eq!(planned.video.finish, item.start + limit);
     }
 
     /// A live source never seeks, wherever the session is in the item: the
