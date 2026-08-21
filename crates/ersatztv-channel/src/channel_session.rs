@@ -167,7 +167,7 @@ impl ChannelSession {
                 )));
             }
             Err(e) => {
-                return Err(e.into());
+                return Err(e).io_context("lock the output folder", &output_folder);
             }
         };
 
