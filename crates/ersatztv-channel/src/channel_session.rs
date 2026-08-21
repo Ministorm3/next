@@ -917,6 +917,17 @@ impl ChannelSession {
         Ok(source.probe(&probe_deps).await?)
     }
 
+    /// Expands `{channel_number}` and `{query:name|default}` variables in a
+    /// source URL. The channel session supplies no caller query values, so
+    /// every `query:` variable resolves to its default.
+    fn expand_stream_variables_url(&self, uri: &str) -> String {
+        ersatztv_playout::stream_variables::expand_url(
+            uri,
+            Some(self.channel_config.number()),
+            &std::collections::HashMap::new(),
+        )
+    }
+
     fn playout_source_to_input_source(
         &self,
         source: PlayoutItemSource,
@@ -938,7 +949,7 @@ impl ChannelSession {
                 keep_alive,
                 ..
             } => {
-                let expanded_uri = expand_template(&uri)?;
+                let expanded_uri = self.expand_stream_variables_url(&expand_template(&uri)?);
                 let expanded_headers: Vec<String> = headers
                     .unwrap_or_default()
                     .iter()
@@ -961,7 +972,7 @@ impl ChannelSession {
             PlayoutItemSource::Rtsp {
                 uri, timeout_us, ..
             } => {
-                let expanded_uri = expand_template(&uri)?;
+                let expanded_uri = self.expand_stream_variables_url(&expand_template(&uri)?);
 
                 Ok(InputSource::Rtsp(RtspInputSource {
                     uri: expanded_uri,
