@@ -79,14 +79,27 @@ fn generate_blocking(
                 let folder_path = Path::new(folder);
                 let mut buf = Vec::with_capacity(8 * 1024);
                 for channel in channels {
-                    let path = folder_path.join(format!("{}.xml", channel.tvg_id));
-                    let file = match std::fs::File::open(&path) {
-                        Ok(f) => f,
-                        Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                        Err(e) => return Err(e),
+                    // prefer <tvg_id>.xml; fall back to <number>.xml, the
+                    // naming the legacy channel guide cache uses, so that
+                    // folder can serve as the xmltv source directly
+                    let candidates = [
+                        folder_path.join(format!("{}.xml", channel.tvg_id)),
+                        folder_path.join(format!("{}.xml", channel.number)),
+                    ];
+
+                    let Some(file) =
+                        candidates
+                            .iter()
+                            .find_map(|path| match std::fs::File::open(path) {
+                                Ok(f) => Some(Ok(f)),
+                                Err(e) if e.kind() == ErrorKind::NotFound => None,
+                                Err(e) => Some(Err(e)),
+                            })
+                    else {
+                        continue;
                     };
 
-                    copy_programmes(BufReader::new(file), w, &mut buf)?;
+                    copy_programmes(BufReader::new(file?), w, &mut buf)?;
                 }
             }
 
