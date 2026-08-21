@@ -2,9 +2,11 @@ use std::time::{Duration, Instant};
 
 use tokio::fs::{create_dir_all, read_dir, remove_dir, remove_file};
 
+mod folder_lock;
 mod merge;
 mod path_resolve;
 
+pub use folder_lock::{FolderLock, lock_folder_exclusive};
 pub use merge::deep_merge;
 pub use path_resolve::resolve_relative_paths;
 
