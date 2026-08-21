@@ -26,6 +26,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::composer::{SEGMENT_SECONDS, SessionPlaylist};
+use crate::slate::{SlateFile, read_slate_file};
 
 /// How many cohorts one channel transcodes variants for at once. Cohorts
 /// beyond this are answered with shared content rather than queued.
@@ -64,11 +65,46 @@ pub struct VariantChannel {
     /// configured identically whether this worker was given config files or
     /// handed its own configuration on stdin.
     pub config_json: String,
+    /// Where this channel's slate side file lives, `None` when the playout
+    /// folder has no parent to hold one. The manager reads only its
+    /// `default` key; the shared session owns `path`.
+    pub slate_file: Option<PathBuf>,
 }
 
 #[derive(Default)]
 pub struct VariantManager {
     sessions: Mutex<HashMap<String, VariantSession>>,
+    /// The slate default policy as it resolved last tick, kept so each named
+    /// policy condition is logged once per change instead of every two
+    /// seconds. The raw value participates in the comparison, so an edited
+    /// file re-logs even when it resolves the same way, and a recognized set
+    /// arriving after startup re-resolves without an operator edit.
+    default_policy: Mutex<DefaultPolicy>,
+}
+
+/// What the slate file's `default` key resolved to against the currently
+/// recognized parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum DefaultPolicy {
+    /// No slate file, or no `default` key: the pre-policy world, where a
+    /// canonical-empty request is answered with shared content.
+    #[default]
+    Absent,
+    /// The slate file did not parse. `path` is equally lost, so the shared
+    /// session logs its own warning for that half.
+    Malformed { error: String },
+    /// The `default` value canonicalized to no cohort (garbage value, or a
+    /// playout with no templated parameters): treated as no default.
+    Unroutable { raw: String },
+    /// The `default` value canonicalized to a cohort: canonical-empty
+    /// requests are admitted to it. `without_path` marks a slate file that
+    /// routes without slate media behind it, so the shared session keeps its
+    /// wall-gated live-tune mechanics for templated windows.
+    Routes {
+        raw: String,
+        cohort_query: String,
+        without_path: bool,
+    },
 }
 
 struct VariantSession {
@@ -100,7 +136,20 @@ impl VariantManager {
     /// the requester serving the shared session.
     pub async fn tick(&self, channel: &VariantChannel) {
         let recognized = cohort::read_recognized_params(&channel.output_folder).await;
-        let requests = read_requests(channel, &recognized).await;
+
+        // the default admission policy is read from the slate side file for
+        // now, but that home is provisional: it is expected to move into
+        // schedule logic or remote stream configuration. admission must stay
+        // decoupled from where the policy is read, so everything past this
+        // point sees only the resolved cohort query, never the file
+        let policy = resolve_default_policy(channel, &recognized).await;
+        self.log_policy_change(&policy, channel).await;
+        let default_cohort = match &policy {
+            DefaultPolicy::Routes { cohort_query, .. } => Some(cohort_query.as_str()),
+            _ => None,
+        };
+
+        let requests = read_requests(channel, &recognized, default_cohort).await;
         let shared = read_sidecar(&channel.output_folder.join("live.m3u8"), "shared").await;
 
         let mut sessions = self.sessions.lock().await;
@@ -134,6 +183,103 @@ impl VariantManager {
             touch_heartbeat(&session.folder).await;
             spawn_missing_variants(session, channel, &shared).await;
             session.render(channel, &shared).await;
+        }
+    }
+
+    /// Names what the default policy resolved to, once per change. The
+    /// resolution runs every tick, so logging unconditionally would repeat
+    /// each condition thirty times a minute; logging only the first
+    /// occurrence would hide a policy that resolves differently after a
+    /// recognized set arrives or an operator edit.
+    async fn log_policy_change(&self, policy: &DefaultPolicy, channel: &VariantChannel) {
+        let mut last = self.default_policy.lock().await;
+        if *last == *policy {
+            return;
+        }
+
+        let file = channel
+            .slate_file
+            .as_deref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_else(|| String::from("slate.json"));
+
+        match policy {
+            DefaultPolicy::Absent => log::info!(
+                "no slate default on channel {} any more; canonical-empty viewers serve shared",
+                channel.number
+            ),
+            DefaultPolicy::Malformed { error } => log::warn!(
+                "ignoring {file}: {error}; canonical-empty viewers on channel {} \
+                 serve shared",
+                channel.number
+            ),
+            DefaultPolicy::Unroutable { raw } => log::warn!(
+                "the slate default '{raw}' in {file} canonicalizes to no cohort; treating it \
+                 as no default, canonical-empty viewers on channel {} serve shared",
+                channel.number
+            ),
+            DefaultPolicy::Routes {
+                raw,
+                cohort_query,
+                without_path,
+            } => {
+                if *without_path {
+                    log::warn!(
+                        "the slate default '{raw}' in {file} routes canonical-empty viewers on \
+                         channel {} to cohort '{cohort_query}' with no slate path behind it; \
+                         the shared session keeps live-tune mechanics for templated windows",
+                        channel.number
+                    );
+                } else {
+                    log::info!(
+                        "the slate default '{raw}' in {file} routes canonical-empty viewers on \
+                         channel {} to cohort '{cohort_query}'",
+                        channel.number
+                    );
+                }
+            }
+        }
+
+        *last = policy.clone();
+    }
+}
+
+/// Resolves the slate file's `default` key to the cohort it names, through
+/// the same canonicalization a real request goes through, exactly once. The
+/// result is used as-is by the request loop, so a default can never be
+/// substituted into itself, and 'Zip=15216' names the same cohort folder a
+/// real 'zip=15216' viewer gets.
+async fn resolve_default_policy(
+    channel: &VariantChannel,
+    recognized: &BTreeSet<String>,
+) -> DefaultPolicy {
+    let Some(file) = channel.slate_file.as_deref() else {
+        return DefaultPolicy::Absent;
+    };
+
+    let config = match read_slate_file(file).await {
+        SlateFile::Missing => return DefaultPolicy::Absent,
+        SlateFile::Malformed(error) => return DefaultPolicy::Malformed { error },
+        SlateFile::Present(config) => config,
+    };
+
+    let Some(raw) = config.default else {
+        return DefaultPolicy::Absent;
+    };
+
+    let query_pairs: Vec<(String, String)> = url::form_urlencoded::parse(raw.as_bytes())
+        .into_owned()
+        .collect();
+    let cohort_query =
+        cohort::to_query_string(&cohort::cohort_parameters(&query_pairs, recognized));
+
+    if cohort_query.is_empty() {
+        DefaultPolicy::Unroutable { raw }
+    } else {
+        DefaultPolicy::Routes {
+            raw,
+            cohort_query,
+            without_path: config.path.is_none(),
         }
     }
 }
@@ -211,9 +357,13 @@ impl VariantSession {
 /// refreshed recently, and resolves each to a cohort. Only the worker can do
 /// this: recognizing a parameter depends on the playout it is currently
 /// running.
+///
+/// `default_cohort` is the already-canonicalized cohort that canonical-empty
+/// requests are admitted to, when the operator configured one.
 async fn read_requests(
     channel: &VariantChannel,
     recognized: &BTreeSet<String>,
+    default_cohort: Option<&str>,
 ) -> Vec<ResolvedRequest> {
     let folder = requests_folder(&channel.output_folder);
     let mut entries = match tokio::fs::read_dir(&folder).await {
@@ -258,10 +408,25 @@ async fn read_requests(
             .collect();
 
         let parameters = cohort::cohort_parameters(&query_pairs, recognized);
+        let mut cohort_query = cohort::to_query_string(&parameters);
+
+        // canonical-empty requests (a bare query, and a query whose
+        // parameters are all unrecognized, which canonicalize identically)
+        // are admitted to the default cohort here, at resolution, so
+        // admission, answers, reaping, and request-file keep-alive all see
+        // the substituted requester exactly as they see a real one. a
+        // request that resolves to any cohort of its own is never touched.
+        // the default arrives already canonicalized and is used as-is, so
+        // substitution can never recurse
+        if cohort_query.is_empty()
+            && let Some(default_cohort) = default_cohort
+        {
+            cohort_query = default_cohort.to_owned();
+        }
 
         requests.push(ResolvedRequest {
             token,
-            cohort_query: cohort::to_query_string(&parameters),
+            cohort_query,
         });
     }
 
@@ -682,6 +847,7 @@ mod tests {
     use ersatztv_core::sidecar::{SidecarPipeline, SidecarSegment};
 
     use super::*;
+    use crate::slate::SLATE_FILE_NAME;
 
     fn request(cohort_query: &str) -> ResolvedRequest {
         ResolvedRequest {
@@ -696,7 +862,25 @@ mod tests {
             output_folder: folder.to_path_buf(),
             channel_binary: PathBuf::from("ersatztv-channel"),
             config_json: String::from("{}"),
+            // pointed into the output folder so a test can drop a slate file
+            // beside everything else it stages; no test writes one unless
+            // slate policy is what it is testing
+            slate_file: Some(folder.join(SLATE_FILE_NAME)),
         }
+    }
+
+    async fn write_slate(output: &Path, contents: &str) {
+        tokio::fs::write(output.join(SLATE_FILE_NAME), contents)
+            .await
+            .unwrap();
+    }
+
+    /// The answer file's literal contents, empty meaning serve shared, read
+    /// the way a requester would after `read_answer`'s trim.
+    async fn answer_for(output: &Path, raw_query: &str) -> String {
+        tokio::fs::read_to_string(answers_folder(output).join(stable_name(raw_query)))
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1001,5 +1185,358 @@ mod tests {
         assert_eq!(session.playlist.label(), "ch 5 cohort 'zip=15216'");
         // the subtitle half stays silent so decisions are reported once
         assert_eq!(session.subtitle_playlist.label(), "");
+    }
+
+    /// Pins the pre-policy world: with no slate file at all, a bare query
+    /// identifies no cohort and is answered with shared.
+    #[tokio::test]
+    async fn without_a_slate_file_a_bare_query_is_answered_with_shared() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(answer_for(output, "").await, "");
+    }
+
+    /// A slate file that only names media must not change routing: `path`
+    /// alone is today's behavior, and a bare query stays on shared.
+    #[tokio::test]
+    async fn a_path_only_slate_answers_a_bare_query_with_shared() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, r#"{"path": "/slate.mp4"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(answer_for(output, "").await, "");
+    }
+
+    /// The operator's default admits a bare-query viewer to a real cohort:
+    /// the answer sits on the empty query's pinned wire token and names the
+    /// same folder a real zip=15216 viewer gets, with the cohort's composed
+    /// playlist on disk ready to serve. The slate media path is dead on
+    /// purpose, since routing must not depend on it existing.
+    #[tokio::test]
+    async fn a_slate_default_routes_a_bare_query_to_its_cohort() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(
+            output,
+            r#"{"path": "/no/such/slate.mp4", "default": "zip=15216"}"#,
+        )
+        .await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        let answer = tokio::fs::read_to_string(answers_folder(output).join("cbf29ce484222325"))
+            .await
+            .unwrap();
+        assert_eq!(answer, stable_name("zip=15216"));
+
+        let playlist = tokio::fs::read_to_string(
+            output.join(composed_playlist_name(&stable_name("zip=15216"), false)),
+        )
+        .await
+        .unwrap();
+        assert!(playlist.starts_with("#EXTM3U"));
+    }
+
+    /// A routed bare-query viewer and a real viewer of the default's cohort
+    /// share one session and one transcode: both answers name one folder, and
+    /// only one cohort folder is minted, so the default occupies one cap slot
+    /// rather than one per viewer class.
+    #[tokio::test]
+    async fn a_routed_bare_viewer_shares_the_real_viewers_session() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, r#"{"path": "/slate.mp4", "default": "zip=15216"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+        ersatztv_core::variant_request::publish_request(output, "zip=15216")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(
+            answer_for(output, "").await,
+            answer_for(output, "zip=15216").await
+        );
+
+        let mut cohort_folders = 0;
+        let mut entries = tokio::fs::read_dir(output.join(VARIANTS_FOLDER))
+            .await
+            .unwrap();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if !entry.file_name().to_string_lossy().starts_with('.') {
+                cohort_folders += 1;
+            }
+        }
+        assert_eq!(cohort_folders, 1);
+    }
+
+    /// An access_token-only query canonicalizes to empty exactly like a bare
+    /// one, so the default admits it too: the decision rides resolution, not
+    /// raw-token comparison, and the raw token keeps its own answer file.
+    #[tokio::test]
+    async fn a_query_of_only_unrecognized_params_is_routed_by_the_default() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, r#"{"path": "/slate.mp4", "default": "zip=15216"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "access_token=eyJabc")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(
+            answer_for(output, "access_token=eyJabc").await,
+            stable_name("zip=15216")
+        );
+    }
+
+    /// A request that resolves to a cohort of its own is never touched by the
+    /// default: the real query wins.
+    #[tokio::test]
+    async fn a_real_query_is_never_rerouted_by_the_default() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, r#"{"path": "/slate.mp4", "default": "zip=15216"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "zip=10001")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(
+            answer_for(output, "zip=10001").await,
+            stable_name("zip=10001")
+        );
+    }
+
+    /// Routing does not require slate media: a file holding only `default`
+    /// still admits bare-query viewers. The named warning it draws is log
+    /// state, not behavior.
+    #[tokio::test]
+    async fn a_default_without_a_path_still_routes() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, r#"{"default": "zip=15216"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(answer_for(output, "").await, stable_name("zip=15216"));
+    }
+
+    /// A slate file that does not parse must degrade to the pre-policy world
+    /// without panicking: bare queries serve shared.
+    #[tokio::test]
+    async fn a_malformed_slate_file_answers_a_bare_query_with_shared() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, "{not json").await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(answer_for(output, "").await, "");
+    }
+
+    /// A default the playout does not recognize canonicalizes to no cohort
+    /// and is treated as no default. Substitution happens at most once, so an
+    /// unroutable default can never loop back into itself.
+    #[tokio::test]
+    async fn a_default_that_canonicalizes_to_empty_answers_shared() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(
+            output,
+            r#"{"path": "/slate.mp4", "default": "cachebust=1"}"#,
+        )
+        .await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        VariantManager::new().tick(&channel(output)).await;
+
+        assert_eq!(answer_for(output, "").await, "");
+    }
+
+    /// The policy is re-read every tick: adding a default routes on the next
+    /// tick, and removing it hands the viewer back to shared, all without a
+    /// restart.
+    #[tokio::test]
+    async fn editing_the_slate_file_between_ticks_changes_the_answer() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        let manager = VariantManager::new();
+        let channel = channel(output);
+
+        manager.tick(&channel).await;
+        assert_eq!(answer_for(output, "").await, "");
+
+        write_slate(output, r#"{"default": "zip=15216"}"#).await;
+        manager.tick(&channel).await;
+        assert_eq!(answer_for(output, "").await, stable_name("zip=15216"));
+
+        write_slate(output, r#"{"path": "/slate.mp4"}"#).await;
+        manager.tick(&channel).await;
+        assert_eq!(answer_for(output, "").await, "");
+    }
+
+    /// Before the shared session publishes its recognized params, the
+    /// default cannot resolve; once they appear, the same file starts
+    /// routing without an operator edit. This is the startup flap the
+    /// once-per-change log state is keyed for.
+    #[tokio::test]
+    async fn the_default_starts_routing_once_recognized_params_appear() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, "[]").await;
+        write_slate(output, r#"{"path": "/slate.mp4", "default": "zip=15216"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        let manager = VariantManager::new();
+        let channel = channel(output);
+
+        manager.tick(&channel).await;
+        assert_eq!(answer_for(output, "").await, "");
+
+        tokio::fs::write(
+            output.join(ersatztv_core::RECOGNIZED_PARAMS_FILE_NAME),
+            r#"["zip"]"#,
+        )
+        .await
+        .unwrap();
+
+        manager.tick(&channel).await;
+        assert_eq!(answer_for(output, "").await, stable_name("zip=15216"));
+    }
+
+    /// A routed bare-query viewer's request file is what keeps the default
+    /// cohort's session alive, exactly like a real requester's: while the
+    /// file stays fresh the session survives ticks, and once it goes stale
+    /// the session reaps and its playlists leave the disk.
+    #[tokio::test]
+    async fn the_bare_requesters_file_keeps_the_default_cohort_session_alive() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        write_shared_session(output, r#"["zip"]"#).await;
+        write_slate(output, r#"{"path": "/slate.mp4", "default": "zip=15216"}"#).await;
+
+        ersatztv_core::variant_request::publish_request(output, "")
+            .await
+            .unwrap();
+
+        let manager = VariantManager::new();
+        let channel = channel(output);
+        let playlist = output.join(composed_playlist_name(&stable_name("zip=15216"), false));
+
+        manager.tick(&channel).await;
+        assert!(playlist.exists());
+
+        manager.tick(&channel).await;
+        assert!(playlist.exists(), "a fresh request must hold the session");
+
+        let request = requests_folder(output).join(stable_name(""));
+        let stale = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(&request, stale).unwrap();
+
+        manager.tick(&channel).await;
+        assert!(
+            !playlist.exists(),
+            "a stale request must reap the session it admitted"
+        );
+    }
+
+    /// Each policy outcome carries what its once-per-change log needs: the
+    /// raw value rides along so an operator edit re-logs even when it
+    /// resolves the same way, and 'Zip=15216' resolves through the normal
+    /// canonicalization rather than raw comparison.
+    #[tokio::test]
+    async fn the_default_policy_names_each_outcome() {
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path();
+        let channel = channel(output);
+        let recognized: BTreeSet<String> = [String::from("zip")].into();
+
+        assert_eq!(
+            resolve_default_policy(&channel, &recognized).await,
+            DefaultPolicy::Absent
+        );
+
+        write_slate(output, r#"{"path": "/slate.mp4"}"#).await;
+        assert_eq!(
+            resolve_default_policy(&channel, &recognized).await,
+            DefaultPolicy::Absent
+        );
+
+        write_slate(output, "{not json").await;
+        assert!(matches!(
+            resolve_default_policy(&channel, &recognized).await,
+            DefaultPolicy::Malformed { .. }
+        ));
+
+        write_slate(output, r#"{"default": "cachebust=1"}"#).await;
+        assert_eq!(
+            resolve_default_policy(&channel, &recognized).await,
+            DefaultPolicy::Unroutable {
+                raw: String::from("cachebust=1")
+            }
+        );
+
+        write_slate(output, r#"{"default": "Zip=15216"}"#).await;
+        assert_eq!(
+            resolve_default_policy(&channel, &recognized).await,
+            DefaultPolicy::Routes {
+                raw: String::from("Zip=15216"),
+                cohort_query: String::from("zip=15216"),
+                without_path: true
+            }
+        );
     }
 }

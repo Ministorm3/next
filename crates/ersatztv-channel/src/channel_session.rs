@@ -570,6 +570,7 @@ impl ChannelSession {
             output_folder: self.channel_config.expanded_output_folder().clone(),
             channel_binary,
             config_json: self.channel_config.merged_source_json(),
+            slate_file: slate::slate_file(self.channel_config.expanded_playout_folder()),
         };
 
         tokio::spawn(async move {
