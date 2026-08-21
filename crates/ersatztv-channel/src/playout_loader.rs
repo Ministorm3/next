@@ -45,6 +45,25 @@ impl PlayoutLoader {
             .ok_or(ChannelError::PlayoutJsonNoItem { next_start })
     }
 
+    /// Finds a playout item by id in the playout file covering `now`. Used by
+    /// variant sessions, which are told which item to transcode rather than
+    /// following the schedule.
+    pub async fn get_item_by_id(
+        &self,
+        item_id: &str,
+        now: &OffsetDateTime,
+    ) -> Result<PlayoutItem, ChannelError> {
+        let path = self.playout_file_for_time(now).await?;
+        let playout_result = ersatztv_playout::playout::from_file(&path).await?;
+
+        playout_result
+            .playout
+            .items
+            .into_iter()
+            .find(|i| i.id == item_id)
+            .ok_or(ChannelError::PlayoutJsonNoItem { next_start: None })
+    }
+
     /// The `{query:}` variable names referenced anywhere in the playout file
     /// covering `now`, lowercased. Empty when no playout file covers `now`.
     pub async fn query_variable_names(

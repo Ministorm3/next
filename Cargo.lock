@@ -443,6 +443,7 @@ dependencies = [
  "ersatztv-core",
  "ersatztv-playout",
  "ffpipeline",
+ "filetime",
  "futures-core",
  "futures-util",
  "log",
@@ -456,6 +457,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "url",
  "uuid",
 ]
 

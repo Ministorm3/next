@@ -13,6 +13,8 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
 use ersatztv::error::LineupError;
+use ersatztv_core::cohort;
+use ersatztv_core::variant_request;
 use ersatztv_core::{HEARTBEAT_FILE_NAME, READY_FILE_TIMEOUT, empty_folder};
 use tokio::signal;
 use tokio::sync::Mutex;
@@ -173,6 +175,7 @@ async fn run() -> Result<(), LineupError> {
 
 async fn stream(
     Path(filename): Path<String>,
+    axum::extract::Query(query_pairs): axum::extract::Query<Vec<(String, String)>>,
     State(state): State<Arc<LineupState>>,
     request: axum::extract::Request,
 ) -> Result<impl IntoResponse, LineupError> {
@@ -206,7 +209,14 @@ async fn stream(
         Err(_) => return Err(LineupError::ChannelNotReady),     // 30s deadline
     }
 
-    let content = get_multi_variant(channel, request.headers());
+    // only parameters the channel's playout actually references identify a
+    // cohort; the cohort's canonical query string travels on the media
+    // playlist urls so playlist reloads keep their identity
+    let recognized = cohort::read_recognized_params(channel.output_folder()).await;
+    let cohort_parameters = cohort::cohort_parameters(&query_pairs, &recognized);
+    let cohort_query = cohort::to_query_string(&cohort_parameters);
+
+    let content = get_multi_variant(channel, request.headers(), &cohort_query);
 
     Ok((
         [(
@@ -274,32 +284,52 @@ async fn fix_content_types(
     response
 }
 
-fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap) -> String {
+fn get_multi_variant(channel: &ChannelModel, headers: &HeaderMap, cohort_query: &str) -> String {
+    let query_suffix = if cohort_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{cohort_query}")
+    };
+
     let mut result = String::new();
     result.push_str("#EXTM3U\n");
     result.push_str("#EXT-X-VERSION:6\n");
     result.push_str(&format!(
-        "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"en\",URI=\"{}/session/{}/live_sub.m3u8\"\n",
+        "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"en\",URI=\"{}/session/{}/live_sub.m3u8{}\"\n",
         get_scheme_host(headers),
-        channel.number()
+        channel.number(),
+        query_suffix
     ));
     result.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={},SUBTITLES=\"subs\"\n",
         channel.bandwidth_bps()
     ));
     result.push_str(&format!(
-        "{}/session/{}/live.m3u8",
+        "{}/session/{}/live.m3u8{}",
         get_scheme_host(headers),
-        channel.number()
+        channel.number(),
+        query_suffix
     ));
 
     result
 }
 
 async fn channel_playlist(
+    axum::extract::Query(query_pairs): axum::extract::Query<Vec<(String, String)>>,
     State(state): State<Arc<LineupState>>,
     request: axum::extract::Request,
 ) -> Result<impl IntoResponse, LineupError> {
+    // custom parameters on the playlist request travel onto every channel
+    // url, so one m3u url per location carries its cohort identity (e.g.
+    // channels.m3u?zip=90210); each channel later keeps only the names its
+    // own playout recognizes
+    let forwarded = cohort::forward_query_string(&query_pairs);
+    let query_suffix = if forwarded.is_empty() {
+        String::new()
+    } else {
+        format!("?{forwarded}")
+    };
+
     let mut content = String::new();
     let scheme_host = get_scheme_host(request.headers());
     let xmltv_url = format!("{}/xmltv.xml", scheme_host);
@@ -327,9 +357,10 @@ async fn channel_playlist(
             channel.name()
         ));
         content.push_str(&format!(
-            "{}/channel/{}.m3u8\n",
+            "{}/channel/{}.m3u8{}\n",
             scheme_host,
-            channel.number()
+            channel.number(),
+            query_suffix
         ));
     }
 
@@ -404,7 +435,69 @@ async fn session_middleware(
         }
     }
 
+    // a playlist request carrying recognized cohort parameters is answered
+    // with a composed playlist; everything else falls through to the shared
+    // static files
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or_default().to_owned();
+    if let Some(response) = maybe_composed_playlist(&state, &path, &query).await {
+        return response;
+    }
+
     next.run(request).await
+}
+
+/// Serves a composed per-cohort playlist for `/{channel}/live.m3u8` and
+/// `/{channel}/live_sub.m3u8` requests carrying a query.
+///
+/// The query is handed to the channel's worker rather than interpreted here:
+/// recognizing a cohort parameter depends on the playout the worker is
+/// running. Returns None whenever the worker has not published a playlist for
+/// this query, which falls the request through to the shared playlist.
+async fn maybe_composed_playlist(
+    state: &Arc<LineupState>,
+    path: &str,
+    query: &str,
+) -> Option<axum::response::Response> {
+    let split: Vec<&str> = path.split('/').collect();
+    let (channel_number, file) = match split.as_slice() {
+        ["", channel, file] => (*channel, *file),
+        _ => return None,
+    };
+
+    let subtitles = match file {
+        "live.m3u8" => false,
+        "live_sub.m3u8" => true,
+        _ => return None,
+    };
+
+    if query.is_empty() {
+        return None;
+    }
+
+    let channel = state
+        .channels
+        .iter()
+        .find(|c| c.number() == channel_number)?;
+
+    // publishing the query both asks the worker to resolve it and keeps the
+    // resulting cohort's transcode alive; the worker owns the resolution
+    // because only it knows what the current playout recognizes
+    let _ = variant_request::publish_request(channel.output_folder(), query).await;
+
+    let playlist =
+        variant_request::await_composed_playlist(channel.output_folder(), query, subtitles).await?;
+
+    Some(
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.apple.mpegurl",
+            )],
+            playlist,
+        )
+            .into_response(),
+    )
 }
 
 #[cfg(test)]

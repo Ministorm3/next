@@ -32,6 +32,14 @@ pub struct ChannelConfig {
 
     #[serde(skip)]
     number: String,
+
+    /// The merged json every source contributed, kept verbatim so a child
+    /// process can be handed exactly the configuration this one was built
+    /// from. Legacy pipes the channel config in on stdin and leaves no file
+    /// behind, so replaying the merged value is the only way to configure a
+    /// variant worker identically.
+    #[serde(skip)]
+    merged_source: Value,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -547,12 +555,21 @@ impl ChannelConfig {
             ersatztv_core::deep_merge(&mut config_value, v);
         }
 
-        let mut channel_config: ChannelConfig = serde_json::from_value(config_value)
+        let mut channel_config: ChannelConfig = serde_json::from_value(config_value.clone())
             .map_err(|e| ChannelError::ChannelConfigFailure(e.to_string()))?;
 
+        channel_config.merged_source = config_value;
         channel_config.finalize(output_folder, number)?;
 
         Ok(channel_config)
+    }
+
+    /// The merged configuration as json, ready to hand a child process on
+    /// stdin. Path fields are already resolved to absolute paths, and
+    /// resolving an absolute path again is a no-op, so a child loading this
+    /// resolves every path to what this process resolved it to.
+    pub fn merged_source_json(&self) -> String {
+        self.merged_source.to_string()
     }
 
     fn finalize(&mut self, output_folder: &PathBuf, number: &str) -> Result<(), ChannelError> {
@@ -618,6 +635,57 @@ fn deserialize_optional_accel<'de, D: Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE: &str = r#"{
+        "playout": { "folder": "playouts/five" },
+        "ffmpeg": { "ffmpeg_path": "/usr/bin/ffmpeg" },
+        "normalization": {
+            "audio": { "format": "aac", "bitrate_kbps": 192 },
+            "video": { "format": "h264", "bit_depth": 8, "bitrate_kbps": 4000 }
+        }
+    }"#;
+
+    const OVERLAY: &str = r#"{ "normalization": { "video": { "bitrate_kbps": 6000 } } }"#;
+
+    /// A variant worker is configured by replaying the merged json its parent
+    /// was built from. That is only sound if a replay produces the same
+    /// configuration, including paths that were resolved relative to the
+    /// original source files rather than to wherever the replay is read from.
+    #[tokio::test]
+    async fn replaying_the_merged_source_reproduces_the_configuration() {
+        let folder = tempfile::tempdir().unwrap();
+        let base_path = folder.path().join("channel.json");
+        let overlay_path = folder.path().join("overlay.json");
+        tokio::fs::write(&base_path, BASE).await.unwrap();
+        tokio::fs::write(&overlay_path, OVERLAY).await.unwrap();
+
+        let output = folder.path().join("out");
+        let original = ChannelConfig::from_sources(&[base_path, overlay_path], &output, "5")
+            .await
+            .unwrap();
+
+        // the replay is read from an unrelated folder, exactly as a child
+        // process reading it from stdin resolves relative to its own cwd
+        let elsewhere = tempfile::tempdir().unwrap();
+        let replay_path = elsewhere.path().join("replay.json");
+        tokio::fs::write(&replay_path, original.merged_source_json())
+            .await
+            .unwrap();
+
+        let replayed = ChannelConfig::from_sources(&[replay_path], &output, "5")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replayed.expanded_playout_folder(),
+            original.expanded_playout_folder()
+        );
+        assert_eq!(replayed.ffmpeg.ffmpeg_path, original.ffmpeg.ffmpeg_path);
+        assert_eq!(replayed.playout.folder, original.playout.folder);
+        // the overlay's value survives the round trip, not the base's
+        assert_eq!(replayed.normalization.video.bitrate_kbps, Some(6000));
+        assert_eq!(replayed.normalization.audio.bitrate_kbps, Some(192));
+    }
 
     /// `from_sources` merges several files, so an unreadable one has to name
     /// itself or the operator cannot tell which source is at fault.

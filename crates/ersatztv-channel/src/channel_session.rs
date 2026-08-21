@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use ersatztv_channel::config::ChannelConfig;
 use ersatztv_channel::error::{ChannelError, IoContext};
+use ersatztv_channel::variant_manager;
+use ersatztv_channel::variant_manager::{VariantChannel, VariantManager};
 use ersatztv_core::{READY_FILE_NAME, empty_folder};
 use ersatztv_playout::playout::{
     AudioHint, PeriodicClock, PlayoutItem, PlayoutItemSource, PlayoutItemTracks, ProbeHint,
@@ -142,6 +144,10 @@ pub struct ChannelSession {
 
     published_recognized_params: Option<Vec<String>>,
 
+    /// Caller-supplied values for `{query:}` variables. Empty for the shared
+    /// channel session; a variant session carries its cohort's values.
+    query_parameters: std::collections::HashMap<String, String>,
+
     /// Exclusive ownership of the output folder, held for the life of this
     /// session so a second worker for the same folder refuses to start.
     _output_folder_lock: ersatztv_core::FolderLock,
@@ -270,7 +276,70 @@ impl ChannelSession {
             cached_subtitles: None,
             dynamic_http_client,
             published_recognized_params: None,
+            query_parameters: std::collections::HashMap::new(),
             _output_folder_lock: output_folder_lock,
+        })
+    }
+
+    /// Sets the cohort's `{query:}` values for a variant session.
+    pub fn with_query_parameters(
+        mut self,
+        query_parameters: std::collections::HashMap<String, String>,
+    ) -> ChannelSession {
+        self.query_parameters = query_parameters;
+        self
+    }
+
+    /// Spawns the loop that publishes segments to viewers, which is the only
+    /// thing that does.
+    ///
+    /// Shared by the channel session and the variant session on purpose. This
+    /// existed as two identical copies until upstream changed the cadence in
+    /// #202: the copy in `run` picked up the faster startup interval and the
+    /// copy in `run_variant` silently did not, because nothing links two
+    /// blocks of copied code. A variant's first sidecar is what the composer's
+    /// decision reads, so that copy was the worse one to leave behind. One
+    /// function means the next upstream change to this loop reaches both.
+    ///
+    /// Distinct failures are reported once rather than thirty times a minute,
+    /// and recovery is reported too, so a persistent fault stays visible
+    /// without burying the log.
+    fn spawn_playlist_publisher(
+        pm: Arc<Mutex<PlaylistManager>>,
+        tn: Arc<tokio::sync::Notify>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut last_failure: Option<String> = None;
+            loop {
+                let mut playlist_manager = pm.lock().await;
+                match playlist_manager.update().await {
+                    Ok(()) => {
+                        if last_failure.take().is_some() {
+                            log::info!("playlist update recovered");
+                        }
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if last_failure.as_deref() != Some(message.as_str()) {
+                            log::warn!("playlist update failed: {message}");
+                            last_failure = Some(message);
+                        }
+                    }
+                }
+                if *playlist_manager.timeout() {
+                    tn.notify_one();
+                    break;
+                }
+                // publish fast until the window is ready, so the first
+                // playlist (and a variant's first sidecar) lands promptly
+                let interval = if *playlist_manager.is_ready() {
+                    PLAYLIST_UPDATE_INTERVAL
+                } else {
+                    PLAYLIST_UPDATE_INTERVAL_STARTUP
+                };
+                drop(playlist_manager);
+                tokio::time::sleep(interval).await;
+            }
         })
     }
 
@@ -294,44 +363,9 @@ impl ChannelSession {
             .as_ref()
             .and_then(|a| a.to_pipeline(&self.channel_config));
 
-        let pm = self.playlist_manager.clone();
-        let tn = self.timeout_notify.clone();
+        Self::spawn_playlist_publisher(self.playlist_manager.clone(), self.timeout_notify.clone());
 
-        tokio::spawn(async move {
-            // this loop is the only thing that publishes segments to viewers,
-            // and it runs every two seconds: report each distinct failure once
-            // rather than thirty times a minute, and report recovery, so a
-            // persistent fault is visible without burying the log
-            let mut last_failure: Option<String> = None;
-            loop {
-                let mut playlist_manager = pm.lock().await;
-                match playlist_manager.update().await {
-                    Ok(()) => {
-                        if last_failure.take().is_some() {
-                            log::info!("playlist update recovered");
-                        }
-                    }
-                    Err(e) => {
-                        let message = e.to_string();
-                        if last_failure.as_deref() != Some(message.as_str()) {
-                            log::warn!("playlist update failed: {message}");
-                            last_failure = Some(message);
-                        }
-                    }
-                }
-                if *playlist_manager.timeout() {
-                    tn.notify_one();
-                    break;
-                }
-                let interval = if *playlist_manager.is_ready() {
-                    PLAYLIST_UPDATE_INTERVAL
-                } else {
-                    PLAYLIST_UPDATE_INTERVAL_STARTUP
-                };
-                drop(playlist_manager);
-                tokio::time::sleep(interval).await;
-            }
-        });
+        self.spawn_variant_loop();
 
         // always work ahead initially
         let realtime = false;
@@ -376,6 +410,181 @@ impl ChannelSession {
                 }
             }
         }
+    }
+
+    /// Transcodes a single playout item as a stream variant: the cohort's
+    /// `{query:}` values steer the item's templated URL, the PTS envelope is
+    /// anchored to the shared session's offset for the same item, and the
+    /// session exits when the item is fully transcoded (or reaps on heartbeat
+    /// staleness like any session).
+    pub async fn run_variant(
+        &mut self,
+        item_id: &str,
+        pts_offset_ms: u64,
+        progress_ms: u64,
+        shared_duration_ms: u64,
+    ) -> Result<(), ChannelError> {
+        self.prep_output_folder(false).await?;
+
+        self.ffmpeg_info = FfmpegInfo::load(
+            &self.ffmpeg_path,
+            &self.channel_config.ffmpeg.disabled_filters,
+            &self.channel_config.ffmpeg.preferred_filters,
+        )
+        .await?;
+
+        self.hw_accel = self
+            .channel_config
+            .normalization
+            .video
+            .accel
+            .as_ref()
+            .and_then(|a| a.to_pipeline(&self.channel_config));
+
+        Self::spawn_playlist_publisher(self.playlist_manager.clone(), self.timeout_notify.clone());
+
+        let item = self
+            .playout_loader
+            .get_item_by_id(item_id, &self.transcoded_until)
+            .await?;
+
+        // the variant's position in the item comes from the shared session's
+        // published coverage, not the wall clock: both transcodes must sit on
+        // the same envelope grid even when the channel runs behind schedule.
+        //
+        // that coverage is measured from wherever the shared session started
+        // reading, which is not the item's start when the session joined the
+        // item partway through. `shared_duration_ms` is the envelope the
+        // shared session declared, so the distance from the item's end back
+        // to it gives the point its pts offset corresponds to. anchoring at
+        // the item's start instead would push the variant's envelope past
+        // the shared one by exactly that join distance
+        let item_duration_ms = (item.finish - item.start).whole_milliseconds().max(0) as u64;
+        let join_offset_ms = shared_join_offset_ms(item_duration_ms, shared_duration_ms);
+        let anchor = item.start + time::Duration::milliseconds(join_offset_ms as i64);
+
+        // a live source starts producing on connect, so a variant spawned
+        // with lead time must not open it before the position its output
+        // claims: connecting early would shift the content off the envelope.
+        // file sources seek, so they may start whenever they are ready
+        let live_item = [
+            Self::resolve_source(&item, |t| t.video.as_ref()),
+            Self::resolve_source(&item, |t| t.audio.as_ref()),
+        ]
+        .iter()
+        .flatten()
+        .any(source_is_live);
+
+        // and by the same token it must not claim a position the wall clock
+        // has already passed: a cohort that tuned in mid-window, or a shared
+        // session that reached the item late, would otherwise order a variant
+        // at position 0 for an item the composer is already deep into
+        let progress_ms = variant_start_progress_ms(
+            progress_ms,
+            anchor,
+            OffsetDateTime::now_local()? + self.start_time_offset,
+            item.finish,
+            live_item,
+        );
+
+        self.transcoded_until =
+            (anchor + time::Duration::milliseconds(progress_ms as i64)).min(item.finish);
+        self.state = if progress_ms == 0 {
+            ChannelSessionState::ZeroAndRealtime
+        } else {
+            ChannelSessionState::SeekAndRealtime
+        };
+
+        if live_item {
+            let wait_tn = self.timeout_notify.clone();
+            loop {
+                let now = OffsetDateTime::now_local()? + self.start_time_offset;
+                if now >= self.transcoded_until {
+                    break;
+                }
+                let remaining: Duration = (self.transcoded_until - now)
+                    .try_into()
+                    .unwrap_or(Duration::from_secs(1));
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {}
+                    _ = wait_tn.notified() => {
+                        return Err(ChannelError::IdleTimeout(
+                            self.channel_config.number().to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let base_offset = Duration::from_millis(pts_offset_ms);
+
+        while self.transcoded_until < item.finish {
+            let progress = self.transcoded_until - anchor;
+            let pts =
+                base_offset + Duration::from_millis(progress.whole_milliseconds().max(0) as u64);
+
+            // a variant failure is terminal: the consumer falls back to the
+            // shared feed, which is strictly better than substituted filler
+            let (finish, _is_complete) = self.transcode_item(&item, true, false, Some(pts)).await?;
+
+            if finish <= self.transcoded_until {
+                return Err(ChannelError::StreamFailure(String::from(
+                    "variant transcode made no progress",
+                )));
+            }
+
+            self.transcoded_until = finish;
+            self.state = ChannelSessionState::SeekAndRealtime;
+        }
+
+        // let the playlist manager pick up the final segments before exiting
+        self.playlist_manager.lock().await.update().await?;
+
+        Ok(())
+    }
+
+    /// Serves cohort requests for the lifetime of this session: answering
+    /// which cohort a viewer's query resolves to, spawning variant transcodes,
+    /// and publishing each cohort's composed playlists.
+    ///
+    /// Only a shared session does this. A variant session is itself the
+    /// product of one, and must never spawn further variants.
+    fn spawn_variant_loop(&self) {
+        let channel_binary = match std::env::current_exe() {
+            Ok(binary) => binary,
+            Err(e) => {
+                // without our own path there is nothing to spawn variants
+                // with, so cohorts quietly keep receiving shared content
+                log::warn!("cannot locate the channel binary, disabling stream variants: {e}");
+                return;
+            }
+        };
+
+        let channel = VariantChannel {
+            number: self.channel_config.number().to_owned(),
+            output_folder: self.channel_config.expanded_output_folder().clone(),
+            channel_binary,
+            config_json: self.channel_config.merged_source_json(),
+        };
+
+        tokio::spawn(async move {
+            let variant_loop = tokio::spawn(async move {
+                let variants = VariantManager::new();
+                loop {
+                    variants.tick(&channel).await;
+                    tokio::time::sleep(variant_manager::TICK_INTERVAL).await;
+                }
+            });
+
+            // the loop never returns on its own, so reaching here means it
+            // panicked. cohorts stop being served the moment their playlists
+            // go stale, but the channel keeps streaming shared content, so
+            // nothing else would reveal that this happened
+            let Err(e) = variant_loop.await;
+            log::error!(
+                "stream variant loop stopped: {e}. cohorts on this channel now fall back to shared content"
+            );
+        });
     }
 
     async fn prep_output_folder(&self, troubleshoot: bool) -> Result<(), ChannelError> {
@@ -977,7 +1186,7 @@ impl ChannelSession {
         ersatztv_playout::stream_variables::expand_url(
             uri,
             Some(self.channel_config.number()),
-            &std::collections::HashMap::new(),
+            &self.query_parameters,
         )
     }
 
@@ -1811,6 +2020,60 @@ fn effective_out_point_ms(
     }
 }
 
+/// How far into an item the shared session began reading, derived from the
+/// envelope it declared for that item.
+///
+/// A session that starts an item from its beginning declares the item's whole
+/// duration, giving an offset of zero. One that joins the item partway through
+/// declares only the remainder, and the shortfall is how far in it started.
+///
+/// This is what makes a variant's `progress_ms` usable. That value counts the
+/// shared session's published output, measured from wherever it began reading
+/// rather than from the item's start, so it is an item offset only when the
+/// two coincide.
+fn shared_join_offset_ms(item_duration_ms: u64, shared_duration_ms: u64) -> u64 {
+    item_duration_ms.saturating_sub(shared_duration_ms)
+}
+
+/// The envelope position a variant's output may honestly claim when it opens.
+///
+/// A live source produces from the instant it connects, so a variant opening
+/// at wall time `now` is carrying content for position `now - anchor`,
+/// whatever it was spawned believing. Claiming an earlier position does not
+/// move the content back. It only makes the composer demand a twin index this
+/// worker will not reach for exactly that distance, and both sides then
+/// advance at 1x so the gap never closes; the cohort is served shared for the
+/// rest of the window. See the composer's
+/// `the_join_is_the_displacement_between_the_two_axes`, which pins that the
+/// join is precisely this distance.
+///
+/// SCHEDULE DERIVED, deliberately. `anchor` is the item's authored start plus
+/// the declared join offset, and `now` is the wall clock; no measured
+/// presentation timestamp takes part. That keeps `transcoded_until` out from
+/// under measurement, which is the rule that closed PR #187. Nor can it seek:
+/// `input_timing` forces a live item's `in_point` to zero before the state
+/// this progress selects is ever consulted.
+///
+/// A variant that opens at or before its anchor keeps exactly what it was
+/// given, so a cohort present from the item's start is unaffected.
+fn variant_start_progress_ms(
+    spawned_progress_ms: u64,
+    anchor: OffsetDateTime,
+    now: OffsetDateTime,
+    item_finish: OffsetDateTime,
+    live: bool,
+) -> u64 {
+    // a file source seeks, so where it opens says nothing about which
+    // position it will emit
+    if !live {
+        return spawned_progress_ms;
+    }
+
+    let elapsed_ms = (now - anchor).whole_milliseconds().max(0) as u64;
+    let envelope_ms = (item_finish - anchor).whole_milliseconds().max(0) as u64;
+    spawned_progress_ms.max(elapsed_ms).min(envelope_ms)
+}
+
 /// Whether a source's URI references `{query:}` variables, meaning the item
 /// may be transcoded more than once with different values and its PTS
 /// envelope must be exact.
@@ -2197,6 +2460,19 @@ mod tests {
         );
     }
 
+    /// What a variant ends up producing, given the item and what the shared
+    /// session declared and has published so far. Mirrors what `run_variant`
+    /// derives and what `input_timing` then computes for a live source.
+    fn variant_envelope(
+        item_duration_ms: u64,
+        shared_duration_ms: u64,
+        progress_ms: u64,
+    ) -> (u64, u64) {
+        let join = shared_join_offset_ms(item_duration_ms, shared_duration_ms);
+        let position = (join + progress_ms).min(item_duration_ms);
+        (progress_ms, item_duration_ms - position)
+    }
+
     fn templated_item() -> PlayoutItem {
         serde_json::from_value(serde_json::json!({
             "id": "star",
@@ -2209,6 +2485,248 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_shared_session_that_started_the_item_has_no_join_offset() {
+        assert_eq!(shared_join_offset_ms(113_000, 113_000), 0);
+    }
+
+    /// A 103000ms templated window, the shape every cohort variant runs in.
+    fn window() -> (OffsetDateTime, OffsetDateTime) {
+        let anchor = OffsetDateTime::UNIX_EPOCH;
+        (anchor, anchor + time::Duration::seconds(103))
+    }
+
+    /// THE REGRESSION GUARD for ordering a variant at the position the wall
+    /// clock has reached. A cohort that is present when the item starts must
+    /// be completely unaffected, and that is the case every healthy
+    /// substitution takes: 135 of 135 measured on 2026-08-14 joined at 0.
+    ///
+    /// Both directions matter. Spawned early, the variant waits out the
+    /// air-lock and still opens at its anchor, so nothing moves. Spawned
+    /// exactly at the anchor, likewise.
+    #[test]
+    fn a_variant_that_opens_on_time_keeps_the_progress_it_was_given() {
+        let (anchor, finish) = window();
+
+        for lead in [0i64, 1, 30, 45] {
+            let now = anchor - time::Duration::seconds(lead);
+            assert_eq!(
+                variant_start_progress_ms(0, anchor, now, finish, true),
+                0,
+                "a variant opening {lead}s before its anchor claims the item start"
+            );
+        }
+
+        // and a non-zero progress handed down for a genuine mid-item shared
+        // join is passed through untouched
+        assert_eq!(
+            variant_start_progress_ms(20_000, anchor, anchor, finish, true),
+            20_000
+        );
+    }
+
+    /// A cohort that tuned in partway through the window, or a shared session
+    /// that reached the item late, opens against a wall clock already inside
+    /// the envelope. ch11 item 12206607 on 2026-08-12: cohort 'zip=90210'
+    /// spawned at 21:31:02, about 59s into a window that began airing at
+    /// 21:30:03, and its variant claimed position 0 while the composer was
+    /// demanding 60000ms.
+    #[test]
+    fn a_live_variant_opening_late_claims_where_the_wall_clock_stands() {
+        let (anchor, finish) = window();
+
+        assert_eq!(
+            variant_start_progress_ms(
+                0,
+                anchor,
+                anchor + time::Duration::seconds(59),
+                finish,
+                true
+            ),
+            59_000
+        );
+
+        // it never moves backwards: a larger declared progress wins
+        assert_eq!(
+            variant_start_progress_ms(
+                80_000,
+                anchor,
+                anchor + time::Duration::seconds(59),
+                finish,
+                true
+            ),
+            80_000
+        );
+    }
+
+    /// THE PR #187 GUARD, and the reason it now needs to be a test rather than
+    /// an argument.
+    ///
+    /// A non-zero `progress_ms` selects `SeekAndRealtime`, which makes
+    /// `start_at_zero` false, which would otherwise derive `in_point` from
+    /// `transcoded_until`. That is an output offset driving an input seek, and
+    /// it is the pattern jasongdove rejected when he closed PR #187: output
+    /// timestamp offsets and source read positions are deliberately decoupled,
+    /// and the read position comes from the SCHEDULE, never from a
+    /// measurement.
+    ///
+    /// Before 02a05f7 nothing reached that branch, because a fallback pipeline
+    /// always spawned at progress 0. `variant_start_progress_ms` is what makes
+    /// progress non-zero, so the decoupling is now load bearing. What holds it
+    /// is the live branch in `input_timing_at`, which returns `in_point` ZERO
+    /// before the state is consulted at all.
+    ///
+    /// It is worth being precise about why this is safe today: every templated
+    /// source is live, 9716 of 9716 across the install on 2026-08-14. But that
+    /// is a property of what the scheduler emits, not of this worker, so the
+    /// guard has to be the branch and not the data.
+    #[test]
+    fn a_live_source_never_seeks_however_far_the_session_has_progressed() {
+        let item = templated_item();
+        let source = item.source.clone().expect("the fixture carries a source");
+
+        for elapsed in [0i64, 8, 59, 149] {
+            let timing = ChannelSession::input_timing_at(
+                &item,
+                &source,
+                // false is the seeking branch: this is what a non-zero
+                // progress selects
+                false,
+                true,
+                true,
+                item.start + time::Duration::seconds(elapsed),
+            );
+
+            assert_eq!(
+                timing.in_point,
+                Duration::ZERO,
+                "a live source must not seek, {elapsed}s into the item"
+            );
+        }
+
+        // and it covers only the remainder, so a session joining partway
+        // through keeps its output inside the item's envelope. The fixture
+        // window is 150s
+        let at_59 = ChannelSession::input_timing_at(
+            &item,
+            &source,
+            false,
+            true,
+            true,
+            item.start + time::Duration::seconds(59),
+        );
+        assert_eq!(at_59.out_point, Duration::from_millis(91_000));
+    }
+
+    /// A file source seeks, so where it opens says nothing about which
+    /// position it emits, and the wall clock must not touch it.
+    #[test]
+    fn a_file_variant_is_never_moved_by_the_wall_clock() {
+        let (anchor, finish) = window();
+        assert_eq!(
+            variant_start_progress_ms(
+                0,
+                anchor,
+                anchor + time::Duration::seconds(59),
+                finish,
+                false
+            ),
+            0
+        );
+    }
+
+    /// Past the end of the envelope there is nothing left to substitute, so
+    /// the claim saturates rather than running past the window.
+    ///
+    /// That saturation is what stops the wasted encode. `run_variant` sets
+    /// `transcoded_until` to `(anchor + progress).min(item.finish)` and then
+    /// loops `while transcoded_until < item.finish`, so a claim that reaches
+    /// the envelope leaves the loop with nothing to do and no ffmpeg is
+    /// started at all. On 2026-08-12 item 12206607 a full 105s GPU encode ran
+    /// to completion and was discarded because the variant was ordered at
+    /// position 0 for a window the cohort had almost entirely missed.
+    #[test]
+    fn a_late_open_cannot_claim_past_the_envelope() {
+        let (anchor, finish) = window();
+        let progress = variant_start_progress_ms(
+            0,
+            anchor,
+            anchor + time::Duration::seconds(500),
+            finish,
+            true,
+        );
+        assert_eq!(progress, 103_000);
+
+        // the consequence: transcoded_until lands exactly on the item's
+        // finish, so the transcode loop never runs
+        let transcoded_until = (anchor + time::Duration::milliseconds(progress as i64)).min(finish);
+        assert_eq!(
+            transcoded_until, finish,
+            "a variant with nothing left to cover must start no encode"
+        );
+    }
+
+    #[test]
+    fn a_shared_session_that_joined_late_reports_how_far_in_it_started() {
+        // channel 32, item 11866757: the item's slot is 113s and the shared
+        // session declared 58.58s, so it began 54.42s into the item
+        assert_eq!(shared_join_offset_ms(113_000, 58_580), 54_420);
+    }
+
+    #[test]
+    fn a_variant_of_an_item_started_from_zero_fills_the_whole_remainder() {
+        // channel 11, item 11866490: shared declared the full 113s at
+        // progress 0, and the variant matched it exactly
+        let (pts_from, duration) = variant_envelope(113_000, 113_000, 0);
+
+        assert_eq!(pts_from, 0);
+        assert_eq!(duration, 113_000);
+    }
+
+    #[test]
+    fn a_variant_of_a_late_joined_item_stops_where_the_shared_envelope_stops() {
+        // channel 32: the variant used to be given the item's whole remaining
+        // slot (97s) against a shared envelope of only 58.58s. It must fill
+        // the 42.58s the shared session has left instead
+        let (pts_from, duration) = variant_envelope(113_000, 58_580, 16_000);
+
+        assert_eq!(pts_from, 16_000);
+        assert_eq!(duration, 42_580);
+        assert_eq!(
+            pts_from + duration,
+            58_580,
+            "must end with the shared envelope"
+        );
+    }
+
+    #[test]
+    fn a_variant_produces_nothing_once_the_shared_envelope_is_covered() {
+        // channel 13, item 11865804: the shared session joined 4.755s before
+        // the item ended and had already published past that, yet the variant
+        // was handed 131s of work
+        let (_, duration) = variant_envelope(136_000, 4_755, 4_766);
+
+        assert_eq!(duration, 0);
+    }
+
+    #[test]
+    fn a_variant_envelope_always_ends_with_the_shared_one() {
+        // the invariant the whole substitution rests on, over a spread of
+        // join distances and coverage points
+        for shared_duration in [1_000u64, 4_755, 58_580, 112_999, 113_000] {
+            for progress in [0u64, 1, 4_000, 16_000, 58_000] {
+                let (pts_from, duration) = variant_envelope(113_000, shared_duration, progress);
+                if progress <= shared_duration {
+                    assert_eq!(
+                        pts_from + duration,
+                        shared_duration,
+                        "shared={shared_duration} progress={progress}"
+                    );
+                }
+            }
+        }
     }
 
     /// One grep has to find every black-air line, and each has to say which
@@ -2279,46 +2797,6 @@ mod tests {
         assert_eq!(planned.video.out_point, limit);
         assert!(!planned.video.is_complete);
         assert_eq!(planned.video.finish, item.start + limit);
-    }
-
-    /// A live source never seeks, wherever the session is in the item: the
-    /// read position is the live edge, and only the remaining schedule
-    /// interval bounds the output.
-    #[test]
-    fn a_live_source_never_seeks() {
-        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
-            "id": "live-item",
-            "start": "2026-08-15T12:00:00.000-04:00",
-            "finish": "2026-08-15T12:02:30.000-04:00",
-            "source": {
-                "source_type": "http",
-                "uri": "http://host:8000/live.ts",
-                "is_live": true
-            }
-        }))
-        .expect("a live http item deserializes");
-
-        let audio_source =
-            ChannelSession::resolve_source(&item, |t| t.audio.as_ref()).expect("audio source");
-        let video_source =
-            ChannelSession::resolve_source(&item, |t| t.video.as_ref()).expect("video source");
-        let planned = ChannelSession::plan_timings(TimingPlan {
-            current_item: &item,
-            audio_source: &audio_source,
-            video_source: &video_source,
-            subtitle_source: None,
-            start_at_zero: false,
-            realtime: true,
-            is_live: true,
-            is_templated: false,
-            // ninety seconds into the item
-            transcoded_until: item.start + Duration::from_secs(90),
-            stamp_error_ms: 0,
-        });
-        assert_eq!(planned.video.in_point, Duration::ZERO);
-        assert_eq!(planned.video.out_point, Duration::from_secs(60));
-        assert!(planned.video.is_complete);
-        assert_eq!(planned.video.finish, item.finish);
     }
 }
 
