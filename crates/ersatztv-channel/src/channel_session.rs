@@ -3546,6 +3546,56 @@ mod tests {
         assert!(messages[2].contains(&item.start.to_string()));
         assert!(messages[2].contains(&item.finish.to_string()));
     }
+
+    /// A realtime pipeline covers its whole remaining slot in one
+    /// invocation, and both streams agree on the range.
+    #[test]
+    fn a_realtime_item_fills_its_slot_in_one_pipeline() {
+        let item = file_item();
+        let planned = plan_for(&item, false, false, 0);
+        assert_eq!(planned.audio.in_point, Duration::ZERO);
+        assert_eq!(planned.audio.out_point, Duration::from_millis(11_021));
+        assert_eq!(planned.video.out_point, Duration::from_millis(11_021));
+        assert!(planned.video.is_complete);
+        assert_eq!(planned.video.finish, item.finish);
+    }
+
+    /// While working ahead, a long item is transcoded in chunks so the
+    /// buffer builds up quickly; the chunk boundary advances the schedule
+    /// by exactly the chunk.
+    #[test]
+    fn work_ahead_chunks_a_long_item() {
+        let item: PlayoutItem = serde_json::from_value(serde_json::json!({
+            "id": "long-item",
+            "start": "2026-08-15T12:00:00.000-04:00",
+            "finish": "2026-08-15T12:05:00.000-04:00",
+            "source": { "source_type": "local", "path": "/media/episode.mp4" }
+        }))
+        .expect("a local file item deserializes");
+
+        let limit = Duration::from_secs(SEGMENT_SECONDS as u64 * 11);
+        let audio_source =
+            ChannelSession::resolve_source(&item, |t| t.audio.as_ref()).expect("audio source");
+        let video_source =
+            ChannelSession::resolve_source(&item, |t| t.video.as_ref()).expect("video source");
+        let planned = ChannelSession::plan_timings(TimingPlan {
+            current_item: &item,
+            audio_source: &audio_source,
+            video_source: &video_source,
+            subtitle_source: None,
+            start_at_zero: true,
+            realtime: false,
+            slate: false,
+            is_live: false,
+            is_templated: false,
+            transcoded_until: item.start,
+            stamp_error_ms: 0,
+        });
+        assert_eq!(planned.video.in_point, Duration::ZERO);
+        assert_eq!(planned.video.out_point, limit);
+        assert!(!planned.video.is_complete);
+        assert_eq!(planned.video.finish, item.start + limit);
+    }
 }
 
 #[cfg(test)]
