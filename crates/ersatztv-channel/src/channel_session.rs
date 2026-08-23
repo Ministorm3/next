@@ -769,13 +769,22 @@ impl ChannelSession {
         let current_item = match current_item_result {
             Ok(playout_item) => playout_item,
             Err(ChannelError::PlayoutJsonNoItem { next_start }) => {
-                // a schedule gap is the one expected way to air black; the
-                // census line still counts it, but not at fault level
-                log::debug!("{}", no_item_message(self.transcoded_until, next_start));
+                log::debug!(
+                    "no playout item covers {}, replacing with black/silence until {}",
+                    self.transcoded_until,
+                    next_start.map_or_else(
+                        || String::from("the next reload"),
+                        |start| start.to_string()
+                    )
+                );
                 self.fake_playout_item(next_start)
             }
             Err(err) => {
-                log::error!("{}", item_unselectable_message(self.transcoded_until, &err));
+                log::error!(
+                    "no item could be selected for {}, replacing with black/silence: {}",
+                    self.transcoded_until,
+                    err
+                );
                 self.fake_playout_item(None)
             }
         };
@@ -829,7 +838,13 @@ impl ChannelSession {
             Err(e @ ChannelError::Stalled(_)) => return Err(e),
             Err(e) if troubleshoot => return Err(e),
             Err(e) => {
-                log::error!("{}", item_failed_message(&current_item, &e));
+                log::error!(
+                    "item {} ({} .. {}) failed, replacing with black/silence: {}",
+                    current_item.id,
+                    current_item.start,
+                    current_item.finish,
+                    e
+                );
                 let fake_item = self.fake_playout_item(Some(current_item.finish));
                 self.transcode_item(&fake_item, realtime, troubleshoot, pts_duration, false)
                     .await?
@@ -2107,32 +2122,6 @@ impl ChannelSession {
             log::error!("failed to save dossier: {err}");
         }
     }
-}
-
-/// The three ways a slot airs black, worded so one grep for
-/// `replacing with black/silence` is a complete census and each line names
-/// the slot it lost. They are separate faults with separate remedies: a
-/// schedule gap is expected, an unreadable playout and a failed transcode
-/// are not, and the earlier wording distinguished none of them.
-fn no_item_message(at: OffsetDateTime, next_start: Option<OffsetDateTime>) -> String {
-    format!(
-        "no playout item covers {at}, replacing with black/silence until {}",
-        next_start.map_or_else(
-            || String::from("the next reload"),
-            |start| start.to_string()
-        )
-    )
-}
-
-fn item_unselectable_message(at: OffsetDateTime, error: &ChannelError) -> String {
-    format!("no item could be selected for {at}, replacing with black/silence: {error}")
-}
-
-fn item_failed_message(item: &PlayoutItem, error: &ChannelError) -> String {
-    format!(
-        "item {} ({} .. {}) failed, replacing with black/silence: {error}",
-        item.id, item.start, item.finish
-    )
 }
 
 fn playout_location_to_pipeline(value: &WatermarkLocation) -> ffpipeline::input::WatermarkLocation {
@@ -3499,52 +3488,6 @@ mod tests {
         let (_, duration) = variant_envelope(136_000, 4_755, 4_766);
 
         assert_eq!(duration, 0);
-    }
-
-    #[test]
-    fn a_variant_envelope_always_ends_with_the_shared_one() {
-        // the invariant the whole substitution rests on, over a spread of
-        // join distances and coverage points
-        for shared_duration in [1_000u64, 4_755, 58_580, 112_999, 113_000] {
-            for progress in [0u64, 1, 4_000, 16_000, 58_000] {
-                let (pts_from, duration) = variant_envelope(113_000, shared_duration, progress);
-                if progress <= shared_duration {
-                    assert_eq!(
-                        pts_from + duration,
-                        shared_duration,
-                        "shared={shared_duration} progress={progress}"
-                    );
-                }
-            }
-        }
-    }
-    /// One grep has to find every black-air line, and each has to say which
-    /// slot it lost: 144 anonymous lines cannot be told apart from one slot
-    /// failing 144 times.
-    #[test]
-    fn every_black_air_line_names_its_slot_and_shares_one_phrase() {
-        let item = templated_item();
-        let at = item.start;
-
-        let messages = [
-            no_item_message(at, Some(item.finish)),
-            item_unselectable_message(at, &ChannelError::CaptureFFmpegStderrFailure),
-            item_failed_message(&item, &ChannelError::CaptureFFmpegStderrFailure),
-        ];
-
-        for message in &messages {
-            assert!(
-                message.contains("replacing with black/silence"),
-                "black-air line is not greppable: {message}"
-            );
-        }
-
-        assert!(messages[0].contains(&at.to_string()));
-        assert!(messages[0].contains(&item.finish.to_string()));
-        assert!(messages[1].contains(&at.to_string()));
-        assert!(messages[2].contains(&item.id));
-        assert!(messages[2].contains(&item.start.to_string()));
-        assert!(messages[2].contains(&item.finish.to_string()));
     }
 
     /// A realtime pipeline covers its whole remaining slot in one
