@@ -173,3 +173,17 @@ the #215 inlined form (fork helpers + census test deleted per the user:
 qsv clean. The zero gate remains banked against 1add35e; the separation
 branches stay based on 4eec042 and rebase at ship time as normal. Full
 gate green at b94f733 (356 tests).
+
+## PHASE 5 COMPLETE 2026-08-23
+
+- SEPARATION.md + separation-map/ committed on the lineage (cacea22).
+- 36 superseded/closed branches renamed to archive/* (local + fork; 22 old
+  fork names deleted only after their archive twin was verified pushed).
+  Untouched: open-PR branches (#212 #214 #216 #217's), prepped branches
+  (still-image-watermark-demuxer, report-schedule-drift, docs/clock-domains,
+  bench/, stream-variables), deploy/budget-and-tunein, clock-trace probes,
+  pre-existing backup/*.
+- NAMING DECISION: rebuilt/* stays as the permanent fork-side extraction
+  namespace (base names back open PRs or are archived; no swap).
+- Junk removed: worktree-wf_* branches, backup/pre-reconcile-rewrite (its
+  rewrite was verified equivalent long ago), stray workflow worktree.
