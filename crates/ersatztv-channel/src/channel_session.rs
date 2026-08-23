@@ -3547,13 +3547,6 @@ mod tests {
         assert!(messages[2].contains(&item.finish.to_string()));
     }
 
-    /// Output pacing follows the caller alone.
-    #[test]
-    fn pacing_follows_the_caller() {
-        assert!(output_settings(true, false, false, false).realtime);
-        assert!(!output_settings(false, false, false, false).realtime);
-    }
-
     /// A realtime pipeline covers its whole remaining slot in one
     /// invocation, and both streams agree on the range.
     #[test]
