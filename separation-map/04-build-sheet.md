@@ -164,3 +164,12 @@ C2/C4/C5/C6 panel running.
   the tip removal governs.
 - ZERO GATE: stack/recomposed (72ed15a) vs 1add35e = 0 diff lines. The
   split now reproduces the deployed lineage EXACTLY.
+
+## UPSTREAM INTEGRATED 2026-08-23 (post-gate, expected)
+
+Merge b94f733 brings the lineage to upstream f7882aa: census converged to
+the #215 inlined form (fork helpers + census test deleted per the user:
+"no tests. Just do what he did"; gap stays debug, both sides agree), #218
+qsv clean. The zero gate remains banked against 1add35e; the separation
+branches stay based on 4eec042 and rebase at ship time as normal. Full
+gate green at b94f733 (356 tests).
