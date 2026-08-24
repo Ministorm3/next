@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/per-cohort-stream-variants
+      - stack/recomposed
 permissions:
   contents: read
   packages: write
