@@ -6,18 +6,23 @@ pub mod cohort;
 mod folder_lock;
 mod merge;
 mod path_resolve;
+pub mod process;
+mod schema_version;
 pub mod sidecar;
 pub mod variant_request;
 
 pub use folder_lock::{FolderLock, lock_folder_exclusive};
 pub use merge::deep_merge;
 pub use path_resolve::resolve_relative_paths;
+pub use schema_version::{SchemaVersion, SchemaVersionError, VersionedSchema};
 
 pub const READY_FILE_NAME: &str = ".ready";
 pub const READY_FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const HEARTBEAT_FILE_NAME: &str = ".heartbeat";
 pub const HEARTBEAT_FILE_TIMEOUT: Duration = Duration::from_secs(90);
+
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// JSON array of `{query:}` variable names the channel's current playout
 /// references, published by the worker next to its ready file. The server

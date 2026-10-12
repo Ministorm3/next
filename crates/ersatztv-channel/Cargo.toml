@@ -1,12 +1,12 @@
 [package]
 name = "ersatztv-channel"
-version = "0.1.0"
+version.workspace = true
+publish.workspace = true
 edition = "2024"
 
 [dependencies]
 axum = { workspace = true }
 clap = { workspace = true }
-env_logger = { workspace = true }
 ersatztv-core = { workspace = true }
 ersatztv-playout = { workspace = true }
 ffpipeline = { workspace = true }
@@ -14,6 +14,7 @@ filetime = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
@@ -25,6 +26,8 @@ time = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [[bin]]

@@ -24,6 +24,7 @@ use ersatztv_core::variant_request::{
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::composer::{ComposedEntry, SEGMENT_SECONDS, SessionPlaylist, parse_pdt};
 use crate::slate::{SlateFile, read_slate_file};
@@ -851,7 +852,7 @@ async fn spawn_missing_variants(
             pipeline.duration_ms
         );
 
-        let spawned = tokio::process::Command::new(&channel.channel_binary)
+        let spawned = ersatztv_core::process::command(&channel.channel_binary)
             .arg("variant")
             .arg("--output-folder")
             .arg(&session.folder)
@@ -882,42 +883,45 @@ async fn spawn_missing_variants(
                 let config_json = channel.config_json.clone();
                 let stdin = child.stdin.take();
 
-                tokio::spawn(async move {
-                    // the child blocks reading its configuration until stdin
-                    // closes, so the handle has to be dropped, not just written
-                    if let Some(mut stdin) = stdin {
-                        let piped = async {
-                            stdin.write_all(config_json.as_bytes()).await?;
-                            stdin.shutdown().await
-                        }
-                        .await;
-                        if let Err(e) = piped {
-                            log::warn!(
-                                "cannot pipe the channel config to the variant worker \
+                tokio::spawn(
+                    async move {
+                        // the child blocks reading its configuration until stdin
+                        // closes, so the handle has to be dropped, not just written
+                        if let Some(mut stdin) = stdin {
+                            let piped = async {
+                                stdin.write_all(config_json.as_bytes()).await?;
+                                stdin.shutdown().await
+                            }
+                            .await;
+                            if let Err(e) = piped {
+                                log::warn!(
+                                    "cannot pipe the channel config to the variant worker \
                                  for item {item_id}: {e}; the worker will fail its \
                                  config parse and exit"
-                            );
+                                );
+                            }
                         }
-                    }
 
-                    match child.wait().await {
-                        Ok(status) if status.success() => {
-                            log::debug!("variant worker for item {item_id} exited: {status:?}");
-                        }
-                        // there is no respawn: a failed variant means the
-                        // composer pins shared at the decision deadline, and
-                        // this line is the only durable trace of why
-                        Ok(status) => log::warn!(
-                            "variant worker for item {item_id} (cohort '{cohort_query}', \
+                        match child.wait().await {
+                            Ok(status) if status.success() => {
+                                log::debug!("variant worker for item {item_id} exited: {status:?}");
+                            }
+                            // there is no respawn: a failed variant means the
+                            // composer pins shared at the decision deadline, and
+                            // this line is the only durable trace of why
+                            Ok(status) => log::warn!(
+                                "variant worker for item {item_id} (cohort '{cohort_query}', \
                              channel {number}) exited {status}; no respawn, the cohort \
                              serves shared for this window"
-                        ),
-                        Err(e) => log::warn!(
-                            "cannot reap the variant worker for item {item_id} (cohort \
+                            ),
+                            Err(e) => log::warn!(
+                                "cannot reap the variant worker for item {item_id} (cohort \
                              '{cohort_query}', channel {number}): {e}"
-                        ),
+                            ),
+                        }
                     }
-                });
+                    .in_current_span(),
+                );
             }
             Err(e) => log::error!(
                 "cannot spawn the variant worker {} for item {}: {e}; this window \

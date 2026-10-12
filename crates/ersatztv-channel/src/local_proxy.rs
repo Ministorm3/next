@@ -13,9 +13,10 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ersatztv_channel::error::{ChannelError, IoContext};
+use ersatztv_core::process;
 use futures_core::Stream;
 use tokio::net::TcpListener;
-use tokio::process::Command;
+use tracing::Instrument;
 
 #[derive(Clone, Hash)]
 pub struct ScriptCommand {
@@ -42,25 +43,25 @@ impl Drop for LocalProxyServer {
 
 impl LocalProxyServer {
     pub async fn start() -> Result<Self, ChannelError> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .io_context_named("bind the local script proxy to", "127.0.0.1:0")?;
-        let port = listener
-            .local_addr()
-            .io_context_named(
-                "read the local address of the script proxy bound to",
-                "127.0.0.1:0",
-            )?
-            .port();
+        let (listener, port) = async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            Ok((listener, port))
+        }
+        .await
+        .io_context_named("start the local script proxy on", "127.0.0.1:0")?;
         let state = ServerState {
             registry: Default::default(),
         };
         let app = Router::new()
             .route("/{token}", get(handle))
             .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let task = tokio::spawn(
+            async move {
+                let _ = axum::serve(listener, app).await;
+            }
+            .in_current_span(),
+        );
         Ok(Self {
             base: format!("http://127.0.0.1:{port}"),
             state,
@@ -111,12 +112,11 @@ async fn handle(State(st): State<ServerState>, Path(token): Path<String>) -> Res
         cmd
     };
 
-    let mut child = match Command::new(&cmd.command)
+    let mut child = match process::command(&cmd.command)
         .args(&cmd.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
         .spawn()
     {
         Ok(c) => c,
